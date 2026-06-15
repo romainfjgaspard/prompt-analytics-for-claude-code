@@ -16,5 +16,10 @@ dist/
 *.egg-info/
 .venv/
 build/
+# Not committed: Streamlit Community Cloud prioritizes uv.lock over
+# requirements.txt and `uv sync` skips the `dashboard` extra, so the hosted demo
+# would miss streamlit-echarts. Cloud uses requirements.txt (.[dashboard]); CI
+# and local dev resolve from pyproject.toml.
+uv.lock
 .streamlit/secrets.toml
 scripts/reconcile_dump.json
