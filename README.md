@@ -45,6 +45,8 @@ uv tool install prompt-analytics-for-claude-code
 prompt-analytics summary
 ```
 
+Or with pip: `pip install prompt-analytics-for-claude-code`, then `prompt-analytics summary`.
+
 The summary is a live parse of your logs — no `extract` step required (that one is just an export, see below). Running on the bundled demo dataset, the output looks like this; on your machine the source line reads `live parse of ~/.claude/projects`:
 
 ```text

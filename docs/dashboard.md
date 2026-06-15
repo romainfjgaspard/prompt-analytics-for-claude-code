@@ -3,7 +3,7 @@
 The dashboard is an interactive Streamlit view over your extracted data: cost
 breakdowns, the session-depth meta-analysis, per-model and per-category charts,
 and quota trends. Charts are **Apache ECharts** (via `streamlit-echarts`) on a
-dark-by-default theme with a native light/dark toggle, and most charts
+dark theme, and most charts
 **cross-filter the whole board on click** (and the time trend on a date brush).
 It is an **optional extra** (it pulls in Streamlit, Apache ECharts, pandas and
 NumPy), so it is not installed by the core tool.
@@ -77,7 +77,7 @@ All charts share one visual identity: color *semantics* live in
 `dashboard/theme.py` (stable colors per token type, per model family — opus =
 purples, sonnet = blues, haiku = greens, fable = warm — and per category) and
 the ECharts render layer in `dashboard/echarts.py` (a theme-aware base so every
-chart follows the light/dark toggle on its own). Pages price everything on the
+chart's chrome matches the app's dark theme). Pages price everything on the
 **primary provider** (the first in `pricing.yml`, anthropic by default); the
 multi-provider grid is still in `pricing.yml` and the CLI.
 

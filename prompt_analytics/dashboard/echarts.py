@@ -76,11 +76,16 @@ def model_tooltip_js(mapping: dict[str, str], *, money: bool = False) -> JsCode:
 
 
 def is_dark() -> bool:
-    """True when the active Streamlit theme is dark (defaults to dark)."""
-    try:
-        return st.context.theme.type == "dark"
-    except Exception:
-        return True
+    """Always True: the dashboard theme is forced dark (``config.toml`` defines a
+    single dark theme — no light variant, no toggle), so chart chrome must use
+    dark-theme colors from the very first paint.
+
+    Reading ``st.context.theme.type`` instead lagged on the first paint of a
+    session (it briefly reports the browser's *light* preference before the forced
+    dark theme applies), which drew axis / legend / label text in the light
+    theme's near-black color — invisible on the navy background until a rerun.
+    """
+    return True
 
 
 def _theme_key(key: str) -> str:
@@ -94,6 +99,7 @@ def _theme_key(key: str) -> str:
 
     The separator is a single ``-`` on purpose: the bidirectional-component id
     system reserves the ``__`` delimiter and raises if a key contains it.
+
     """
     return f"{key}-{'dark' if is_dark() else 'light'}"
 

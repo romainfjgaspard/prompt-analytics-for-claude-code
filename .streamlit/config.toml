@@ -1,10 +1,9 @@
-# Dashboard theme — dark by default.
+# Dashboard theme — dark, forced (no light/dark toggle).
 #
-# A single dark theme (deep navy, Anthropic coral accent, Space Grotesk), NOT a
-# [theme.light]/[theme.dark] pair: defining both makes Streamlit follow the
-# visitor's OS setting, which showed the deployed app in light. The Settings menu
-# (top-right) still offers a light/dark switch — light falls back to Streamlit's
-# built-in light theme.
+# A single dark theme (deep navy, Anthropic coral accent, Space Grotesk). Defining
+# only [theme] (no [theme.light]/[theme.dark] pair) forces dark for every visitor
+# and removes the in-app theme switch — deliberate: this is a dark-first showcase
+# (a [theme.light]/[theme.dark] pair would instead follow the visitor's OS).
 [theme]
 base = "dark"
 primaryColor = "#D97757"

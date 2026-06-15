@@ -330,9 +330,8 @@ def render_sidebar(frames: dict[str, pd.DataFrame]) -> None:
     _multiselect_filter("Project", KEY_PROJECTS, opts["projects"])
     _multiselect_filter("Category", KEY_CATEGORIES, opts["categories"])  # (5.4)
 
-    # Theme hint + demo banner at the very bottom of the sidebar: generic chrome
-    # that would only steal vertical space from the first chart in the main column.
-    st.sidebar.caption("🎨 Light/dark: **⋮ menu (top-right) → Settings**")
+    # Demo banner at the very bottom of the sidebar (generic chrome that would
+    # otherwise steal vertical space from the first chart in the main column).
     from prompt_analytics.dashboard import data
 
     data.render_demo_banner()
