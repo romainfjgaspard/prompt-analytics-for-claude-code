@@ -72,6 +72,18 @@ Usage summary
 
 **Prerequisites:** Python 3.10+ and Claude Code with at least one recorded session under `~/.claude/projects/`. No organization or Admin API key required (unlike the official Claude Code Analytics API, which needs both).
 
+### Dashboard
+
+Prefer a UI? Install with the `dashboard` extra and point it at your own data:
+
+```bash
+uv tool install "prompt-analytics-for-claude-code[dashboard]"
+prompt-analytics extract       # write the CSVs the dashboard reads (./output)
+prompt-analytics dashboard     # launches Streamlit on http://localhost:8501
+```
+
+No data yet, or just curious? The [**live demo**](https://prompt-analytics-demo.streamlit.app) runs the same dashboard on synthetic data. More in [docs/dashboard.md](docs/dashboard.md).
+
 ## What it can tell you
 
 Per-prompt rows turn into answers a daily total can't give. Every block below is real output from the bundled demo dataset (`--from-csv demo_data`); on your machine the source line reads `live parse of ~/.claude/projects`.

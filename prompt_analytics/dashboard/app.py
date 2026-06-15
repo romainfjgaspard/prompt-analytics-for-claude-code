@@ -344,6 +344,13 @@ def _run() -> None:
     here, so it sits below the filters instead of in each page's main column.
     """
     st.set_page_config(layout="wide", page_title="Prompt Analytics for Claude Code")
+    # Trim Streamlit's large default top padding (~6rem) so the page title sits
+    # close to the top toolbar instead of floating below a gap. Applied on every
+    # page (entry script runs on each load); `.block-container` is the main area.
+    st.markdown(
+        "<style>.block-container{padding-top:2.5rem;}</style>",
+        unsafe_allow_html=True,
+    )
     pages = [
         st.Page(_home, title="Home", icon="🏠", default=True),
         st.Page("pages/1_overview.py", title="Usage", icon="📊"),
