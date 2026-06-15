@@ -1694,6 +1694,7 @@ wheels = [
 
 [[package]]
 name = "prompt-analytics-for-claude-code"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "python-dotenv" },

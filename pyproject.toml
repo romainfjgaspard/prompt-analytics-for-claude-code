@@ -4,7 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prompt-analytics-for-claude-code"
-dynamic = ["version"]
+# Keep in sync with prompt_analytics/__init__.py:__version__ on each release.
+# (Static, not hatch-dynamic: a dynamic version omits the `version` field from
+# uv.lock for the editable root, which Streamlit Cloud's stricter uv rejects.)
+version = "0.3.0"
 description = "Prompt-level analytics for Claude Code — tokens, costs, and session insights from your local JSONL files"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -70,9 +73,6 @@ Issues = "https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/is
 
 [project.scripts]
 prompt-analytics = "prompt_analytics.cli:main"
-
-[tool.hatch.version]
-path = "prompt_analytics/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["prompt_analytics"]
