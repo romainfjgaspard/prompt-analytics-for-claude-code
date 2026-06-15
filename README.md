@@ -3,8 +3,8 @@
 > **Unofficial — not affiliated with Anthropic.** This is a community tool that reads Claude Code's local log files. "Claude" and "Claude Code" are trademarks of Anthropic.
 
 [![CI](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/actions/workflows/ci.yml/badge.svg)](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/prompt-analytics-for-claude-code.svg)](https://pypi.org/project/prompt-analytics-for-claude-code/)
-[![Python](https://img.shields.io/pypi/pyversions/prompt-analytics-for-claude-code.svg)](https://pypi.org/project/prompt-analytics-for-claude-code/)
+[![PyPI](https://img.shields.io/pypi/v/prompt-analytics-for-claude-code)](https://pypi.org/project/prompt-analytics-for-claude-code/)
+[![Python](https://img.shields.io/pypi/pyversions/prompt-analytics-for-claude-code)](https://pypi.org/project/prompt-analytics-for-claude-code/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Live demo](https://img.shields.io/badge/live-demo-brightgreen.svg)](https://prompt-analytics-demo.streamlit.app)
 
@@ -22,13 +22,13 @@ It validates its token totals against [ccusage](https://github.com/ryoppippi/ccu
 
 Every CLI command is a single line over your local logs. For example, `by-category` auto-labels each prompt and scores its *observed* complexity 1–5 — a local heuristic, no LLM required:
 
-![`prompt-analytics by-category` in the terminal](docs/screenshots/cli-by-category.png)
+![`prompt-analytics by-category` in the terminal](https://raw.githubusercontent.com/romainfjgaspard/prompt-analytics-for-claude-code/main/docs/screenshots/cli-by-category.png)
 
 And a live Streamlit demo runs on a synthetic dataset (no real prompts), so you can explore the dashboard before installing — **the image below links to the live demo:**
 
 **▶ Live demo: [prompt-analytics-demo.streamlit.app](https://prompt-analytics-demo.streamlit.app)**
 
-[![The prompt-analytics Streamlit dashboard — KPI cards, cost by token type, and daily cost by model](docs/screenshots/dashboard-home.png)](https://prompt-analytics-demo.streamlit.app)
+[![The prompt-analytics Streamlit dashboard — KPI cards, cost by token type, and daily cost by model](https://raw.githubusercontent.com/romainfjgaspard/prompt-analytics-for-claude-code/main/docs/screenshots/dashboard-home.png)](https://prompt-analytics-demo.streamlit.app)
 
 ## Quick start
 

@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — kept a
 `0.x` on purpose: the upstream Claude Code JSONL format is unstable, so parsing
 breakage is treated as expected and reflected in the version.
 
+## [0.3.1] — 2026-06-15
+
+### Fixed
+- README screenshots and the PyPI / Python badges now use absolute URLs, so they
+  render on the PyPI project page (relative paths only resolve on GitHub).
+
 ## [0.3.0] — 2026-06-15 — Initial public release
 
 Prompt-level analytics for Claude Code: every prompt in your local
