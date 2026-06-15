@@ -1,0 +1,13 @@
+# Lock line endings to LF in the repository regardless of each contributor's
+# core.autocrlf: fixtures (.jsonl) and demo CSVs are test *data* whose bytes
+# must be stable across checkouts (cross-platform audit 2026-06-11, M1).
+* text=auto eol=lf
+*.py    text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
+*.jsonl text eol=lf
+*.csv   text eol=lf
+*.png   binary

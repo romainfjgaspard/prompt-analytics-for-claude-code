@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }} · ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install project (all extras)
+        run: uv sync --all-extras --frozen
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Type check (package + dashboard + tests)
+        run: uv run mypy prompt_analytics tests
+
+      - name: Tests with coverage (fails under 85%)
+        run: uv run pytest tests/ -q
+
+  package:
+    name: build · twine check · clean-venv smoke test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: twine check
+        run: uvx twine check dist/*
+
+      - name: Install the wheel into a clean virtualenv and smoke-test it
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m venv clean
+          # bin/ on POSIX, Scripts/ on Windows (Git Bash on the Windows runner)
+          if [ -d clean/bin ]; then BIN=clean/bin; else BIN=clean/Scripts; fi
+          "$BIN/pip" install dist/*.whl
+          "$BIN/prompt-analytics" --help
+          # Analysis commands must not crash on an empty history; exit 1 = "no
+          # data" is expected here.  Assert the exact code: exit 2 would be a
+          # traceback, which is a bug.
+          rc=0
+          "$BIN/prompt-analytics" summary --output-dir empty_out || rc=$?
+          if [ "$rc" -ne 1 ]; then
+            echo "Expected exit 1 from summary on empty dir, got $rc" >&2
+            exit 1
+          fi
+          # Timezone canary: tzdata must resolve Europe/Paris on the bare wheel
+          # (m5 — the Windows runner needs tzdata bundled as a dep).
+          # Exit 0 (empty data written) or 1 (no data) are both OK; exit 2
+          # means a ValueError / ImportError and is a bug.
+          tz=0
+          "$BIN/prompt-analytics" extract --timezone Europe/Paris --output-dir tz_out || tz=$?
+          if [ "$tz" -eq 2 ]; then
+            echo "extract --timezone Europe/Paris exited 2 (timezone not found on bare wheel)" >&2
+            exit 1
+          fi

@@ -1,0 +1,130 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prompt-analytics-for-claude-code"
+dynamic = ["version"]
+description = "Prompt-level analytics for Claude Code — tokens, costs, and session insights from your local JSONL files"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Romain Gaspard", email = "romain.fj.gaspard@gmail.com"},
+]
+keywords = ["claude-code", "analytics", "cli", "streamlit", "llm", "cost"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    # Windows has no system IANA database; without this, --timezone fails there.
+    "tzdata; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+categorize = [
+    "anthropic>=0.40",
+    "openai>=1.0",
+]
+dashboard = [
+    # width="stretch" on st.dataframe/st.button needs >=1.49 (the string width
+    # API that replaced use_container_width); cross-filter selection events on
+    # st_echarts need a recent Streamlit too.
+    "streamlit>=1.49",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    # Apache ECharts -- the only chart engine (the board moved off Plotly, see
+    # docs/MIGRATION-ECHARTS.md). Registers its frontend only under a real
+    # `streamlit run`; a bare import / AppTest sees an empty component registry.
+    "streamlit-echarts>=0.7",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.9",
+    "mypy>=1.10",
+    "build>=1.0",
+    "twine>=5.0",
+    "pandas-stubs>=2.0",
+    "types-PyYAML>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/romainfjgaspard/prompt-analytics-for-claude-code"
+Repository = "https://github.com/romainfjgaspard/prompt-analytics-for-claude-code"
+Issues = "https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/issues"
+
+[project.scripts]
+prompt-analytics = "prompt_analytics.cli:main"
+
+[tool.hatch.version]
+path = "prompt_analytics/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["prompt_analytics"]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = ["docs/"]
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+# No global ignore_missing_imports (A1a): silence only the third-party
+# libraries that genuinely ship no type information, module by module.
+[[tool.mypy.overrides]]
+module = [
+    "streamlit.*",
+    "streamlit_echarts.*",
+]
+ignore_missing_imports = true
+
+# Tests are type-checked (real type errors are still caught), but we do not
+# force an annotation on every test function/fixture.
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=prompt_analytics --cov-report=term-missing --cov-fail-under=85"
+
+[tool.coverage.run]
+source = ["prompt_analytics"]
+omit = [
+    # Page scripts are Streamlit-rendered; unit-testable logic lives in
+    # filters.py / data.py / theme.py which are covered by test_dashboard.py.
+    "prompt_analytics/dashboard/pages/*",
+    "prompt_analytics/dashboard/app.py",
+    "prompt_analytics/dashboard/theme.py",
+]
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

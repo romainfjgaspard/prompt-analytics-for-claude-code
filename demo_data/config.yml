@@ -1,0 +1,4 @@
+features:
+  categorization: true
+  prompt_text: false
+  quota_snapshot: true

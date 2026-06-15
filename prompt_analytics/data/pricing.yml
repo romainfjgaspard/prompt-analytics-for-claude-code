@@ -1,0 +1,270 @@
+# Pricing in USD per 1,000,000 tokens.
+#
+# Multi-provider format — add a new key under `providers:` for your own grid
+# (e.g. enterprise internal rates, AWS Bedrock custom tier).
+#
+# Sources:
+#   anthropic : https://docs.anthropic.com/en/docs/about-claude/pricing
+#               verified 2026-06-11
+#   copilot   : scripts/fetch_copilot_pricing.py (scrapes GitHub docs)
+#               seeded 2026-06-11 from
+#               https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing
+#
+# Cache keys:
+#   cache_read      — prompt-cache hit       (0.10× base input)
+#   cache_write_5m  — 5-minute cache write   (1.25× base input)
+#   cache_write_1h  — 1-hour cache write     (2.00× base input)
+#
+# Decision §4.2 (PLAN.md): Copilot publishes a single cache_write tier (1.25×).
+# It is mapped to both cache_write_5m and cache_write_1h with the same value;
+# no 1-hour distinction is published on the Copilot pricing page.
+
+updated_at: "2026-06-11"
+
+# Flat-rate subscription plans (3.1), for the `break-even` analysis:
+# "your usage is worth $X of API for $Y/month of subscription". These are
+# subscription LIST prices in USD/month, not API token rates -- a different
+# kind of provider ("forfait/mois"). Edit `monthly_usd` to match your own plan.
+# Source: anthropic.com/pricing (consumer plans), verified 2026-06-12.
+plans_source: "https://www.anthropic.com/pricing"
+plans:
+  claude_pro:
+    label: "Claude Pro"
+    monthly_usd: 20.00
+  claude_max_5x:
+    label: "Claude Max 5x"
+    monthly_usd: 100.00
+  claude_max_20x:
+    label: "Claude Max 20x"
+    monthly_usd: 200.00
+
+# GitHub Copilot subscription tiers (usage-based billing since 2026-06-01).
+# Each tier bundles a monthly GitHub AI Credits allowance (1 credit = $0.01 USD);
+# usage beyond `included_usd` is per-token overage on the `copilot` grid below.
+# This is a *different* axis from `plans:` (Claude flat-rate, compared on the
+# primary provider) -- here a subscription includes a dollar usage allowance.
+# Source: https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals
+#         https://docs.github.com/en/copilot/get-started/plans
+#         https://docs.github.com/en/copilot/concepts/billing/organizations-and-enterprises
+#         verified 2026-06-15.
+copilot_plans_source: "https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals"
+copilot_plans:
+  copilot_pro:
+    label: "Copilot Pro"
+    monthly_usd: 10.00
+    included_usd: 15.00   # 1,500 AI credits x $0.01
+  copilot_pro_plus:
+    label: "Copilot Pro+"
+    monthly_usd: 39.00
+    included_usd: 70.00   # 7,000 AI credits
+  copilot_max:
+    label: "Copilot Max"
+    monthly_usd: 100.00
+    included_usd: 200.00  # 20,000 AI credits
+  copilot_business:
+    label: "Copilot Business"
+    monthly_usd: 19.00
+    included_usd: 19.00   # 1,900 AI credits / seat
+  copilot_enterprise:
+    label: "Copilot Enterprise"
+    monthly_usd: 39.00
+    included_usd: 39.00   # 3,900 AI credits / seat
+
+providers:
+  anthropic:
+    source: "https://docs.anthropic.com/en/docs/about-claude/pricing"
+    # Per-request charges for server-side tools billed per request, not per
+    # token (3.3). `server_tool_use` counts web-search requests; Anthropic bills
+    # web search at $10 / 1,000 searches = $0.01 per request.
+    # Source: anthropic.com/pricing (tool use), verified 2026-06-12.
+    per_request:
+      server_tool_use: 0.01
+    models:
+      claude-fable-5:
+        input: 10.00
+        output: 50.00
+        cache_read: 1.00
+        cache_write_5m: 12.50
+        cache_write_1h: 20.00
+      claude-opus-4-8:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 10.00
+      claude-opus-4-7:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 10.00
+      claude-opus-4-6:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 10.00
+      claude-opus-4-5:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 10.00
+      claude-sonnet-4-6:
+        input: 3.00
+        output: 15.00
+        cache_read: 0.30
+        cache_write_5m: 3.75
+        cache_write_1h: 6.00
+      claude-sonnet-4-5:
+        input: 3.00
+        output: 15.00
+        cache_read: 0.30
+        cache_write_5m: 3.75
+        cache_write_1h: 6.00
+      claude-sonnet-4:
+        input: 3.00
+        output: 15.00
+        cache_read: 0.30
+        cache_write_5m: 3.75
+        cache_write_1h: 6.00
+      claude-haiku-4-5:
+        input: 1.00
+        output: 5.00
+        cache_read: 0.10
+        cache_write_5m: 1.25
+        cache_write_1h: 2.00
+      claude-haiku-4-5-20251001:
+        input: 1.00
+        output: 5.00
+        cache_read: 0.10
+        cache_write_5m: 1.25
+        cache_write_1h: 2.00
+    fallbacks:
+      claude-fable:
+        input: 10.00
+        output: 50.00
+        cache_read: 1.00
+        cache_write_5m: 12.50
+        cache_write_1h: 20.00
+      claude-mythos:
+        input: 10.00
+        output: 50.00
+        cache_read: 1.00
+        cache_write_5m: 12.50
+        cache_write_1h: 20.00
+      claude-opus:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 10.00
+      claude-sonnet:
+        input: 3.00
+        output: 15.00
+        cache_read: 0.30
+        cache_write_5m: 3.75
+        cache_write_1h: 6.00
+      claude-haiku:
+        input: 1.00
+        output: 5.00
+        cache_read: 0.10
+        cache_write_5m: 1.25
+        cache_write_1h: 2.00
+  copilot:
+    source: "https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing"
+    # Seeded 2026-06-11 via scripts/fetch_copilot_pricing.py.
+    # Re-run the script to refresh; wired into the CI drift job (pricing-drift.yml).
+    # Decision §4.2: Copilot single cache_write (1.25×) mapped to both _5m and _1h.
+    models:
+      claude-fable-5:
+        input: 10.00
+        output: 50.00
+        cache_read: 1.00
+        cache_write_5m: 12.50
+        cache_write_1h: 12.50
+      claude-opus-4-8:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 6.25
+      claude-opus-4-7:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 6.25
+      claude-opus-4-6:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 6.25
+      claude-opus-4-5:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 6.25
+      claude-sonnet-4-6:
+        input: 3.00
+        output: 15.00
+        cache_read: 0.30
+        cache_write_5m: 3.75
+        cache_write_1h: 3.75
+      claude-sonnet-4-5:
+        input: 3.00
+        output: 15.00
+        cache_read: 0.30
+        cache_write_5m: 3.75
+        cache_write_1h: 3.75
+      claude-sonnet-4:
+        input: 3.00
+        output: 15.00
+        cache_read: 0.30
+        cache_write_5m: 3.75
+        cache_write_1h: 3.75
+      claude-haiku-4-5:
+        input: 1.00
+        output: 5.00
+        cache_read: 0.10
+        cache_write_5m: 1.25
+        cache_write_1h: 1.25
+      claude-haiku-4-5-20251001:
+        input: 1.00
+        output: 5.00
+        cache_read: 0.10
+        cache_write_5m: 1.25
+        cache_write_1h: 1.25
+    fallbacks:
+      claude-fable:
+        input: 10.00
+        output: 50.00
+        cache_read: 1.00
+        cache_write_5m: 12.50
+        cache_write_1h: 12.50
+      claude-mythos:
+        input: 10.00
+        output: 50.00
+        cache_read: 1.00
+        cache_write_5m: 12.50
+        cache_write_1h: 12.50
+      claude-opus:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 6.25
+      claude-sonnet:
+        input: 3.00
+        output: 15.00
+        cache_read: 0.30
+        cache_write_5m: 3.75
+        cache_write_1h: 3.75
+      claude-haiku:
+        input: 1.00
+        output: 5.00
+        cache_read: 0.10
+        cache_write_5m: 1.25
+        cache_write_1h: 1.25

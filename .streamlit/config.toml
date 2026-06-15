@@ -1,0 +1,29 @@
+# Dashboard theme.
+#
+# Foundation palette follows the design brief (docs/streamlit_design_system_claude.md):
+# a Datadog/Vercel-style deep navy in dark, a clean slate-white in light, both
+# keeping the Anthropic coral as the primary accent and Space Grotesk as the
+# type. Dark is the default; the native light/dark switch (top-right menu)
+# toggles between the two custom themes (Streamlit 1.58 [theme.dark]/[theme.light]).
+[theme]
+base = "dark"
+primaryColor = "#D97757"
+font = "'Space Grotesk':https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300..700&display=swap"
+headingFont = "Space Grotesk"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400..600&display=swap"
+baseFontSize = 14
+showWidgetBorder = true
+
+# backgroundColor = main canvas (brief "Background"); secondaryBackgroundColor =
+# sidebar + widget fills (brief "Sidebar"/"Panel"). Text/border from the brief.
+[theme.dark]
+backgroundColor = "#0B1220"
+secondaryBackgroundColor = "#111827"
+textColor = "#F8FAFC"
+borderColor = "#2B3954"
+
+[theme.light]
+backgroundColor = "#F8FAFC"
+secondaryBackgroundColor = "#EEF2F7"
+textColor = "#0F172A"
+borderColor = "#CBD5E1"

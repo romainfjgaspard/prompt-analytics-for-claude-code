@@ -1,0 +1,692 @@
+"""Tests for the extraction pipeline (counting rules, robustness, report)."""
+
+from __future__ import annotations
+
+import csv
+import os
+
+import pytest
+
+from prompt_analytics.extract import run_extract
+
+
+def _read_csv(path):
+    with path.open(encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _tokens_by_prompt(out):
+    """{prompt_id: {token_type: count}} from tokens.csv (summed across models)."""
+    result: dict[str, dict[str, int]] = {}
+    for row in _read_csv(out / "tokens.csv"):
+        counts = result.setdefault(row["prompt_id"], {})
+        counts[row["token_type"]] = counts.get(row["token_type"], 0) + int(row["token_count"])
+    return result
+
+
+def _user(pid, ts, text, sid="sess-w", uuid=None, parent=None, **extra):
+    event = {
+        "type": "user",
+        "promptId": pid,
+        "uuid": uuid or f"u-{pid}",
+        "parentUuid": parent,
+        "timestamp": ts,
+        "cwd": "/home/fake/projects/written",
+        "gitBranch": "main",
+        "entrypoint": "cli",
+        "version": "2.1.169",
+        "sessionId": sid,
+        "message": {"role": "user", "content": text},
+    }
+    event.update(extra)
+    return event
+
+
+def _assistant(req, ts, sid="sess-w", uuid=None, parent=None, model="claude-sonnet-4-6", **usage):
+    tokens = {
+        "input_tokens": usage.pop("inp", 0),
+        "output_tokens": usage.pop("out", 0),
+        "cache_read_input_tokens": usage.pop("cache_read", 0),
+        "cache_creation_input_tokens": usage.pop("cache_write", 0),
+    }
+    event = {
+        "type": "assistant",
+        "uuid": uuid or f"u-{req}",
+        "parentUuid": parent,
+        "requestId": req,
+        "timestamp": ts,
+        "sessionId": sid,
+        "cwd": "/home/fake/projects/written",
+        "message": {
+            "id": f"m-{req}",
+            "role": "assistant",
+            "model": model,
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": tokens,
+        },
+    }
+    event.update(usage)
+    return event
+
+
+# ---------------------------------------------------------------------------
+# Happy path + legacy-format fixtures.
+# ---------------------------------------------------------------------------
+
+
+def test_full_extract_produces_all_csvs(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    fake_claude.add("session_beta.jsonl", project="beta")
+    fake_claude.add("session_gamma.jsonl", project="gamma")
+
+    report = run_extract(fake_claude.out)
+
+    out = fake_claude.out
+    for name in (
+        "sessions.csv",
+        "prompts.csv",
+        "tokens.csv",
+        "requests.csv",
+        "token_types.csv",
+        "prompts_text.csv",
+        "extract_meta.json",
+    ):
+        assert (out / name).exists(), f"missing {name}"
+
+    assert len(_read_csv(out / "sessions.csv")) == 3
+    assert len(_read_csv(out / "prompts.csv")) == 5
+    # Only non-zero (prompt, token_type) pairs are written.
+    assert len(_read_csv(out / "tokens.csv")) == 16
+    assert report.sessions == 3
+    assert report.prompts == 5
+    assert report.exit_code() == 0
+
+
+def test_requestid_deduplication_keeps_latest_snapshot(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    report = run_extract(fake_claude.out)
+
+    pa1 = _tokens_by_prompt(fake_claude.out)["pA1"]
+    # rA1a is written twice with progressive usage (out 50 then 60): the
+    # message is counted once, with its LATEST snapshot.
+    assert pa1["input"] == 130
+    assert pa1["output"] == 100
+    assert pa1["cache_read"] == 210
+    # Legacy total falls back to the 5m bucket.
+    assert pa1["cache_write_5m"] == 25
+    assert report.deduplicated_records == 1
+
+
+def test_growing_session_between_runs(fake_claude):
+    """A session file that gains prompts between two runs is fully re-read.
+
+    Anti-regression for B1: the old incremental mode froze any session it had
+    already seen, silently losing every later prompt.
+    """
+    events = [
+        _user("pG1", "2026-06-03T10:00:00.000Z", "first prompt"),
+        _assistant("rG1", "2026-06-03T10:00:05.000Z", parent="u-pG1", inp=10, out=20),
+    ]
+    path = fake_claude.write("grow.jsonl", events)
+    run_extract(fake_claude.out)
+    assert [r["prompt_id"] for r in _read_csv(fake_claude.out / "prompts.csv")] == ["pG1"]
+
+    events += [
+        _user("pG2", "2026-06-03T11:00:00.000Z", "second prompt", parent="u-rG1"),
+        _assistant("rG2", "2026-06-03T11:00:05.000Z", parent="u-pG2", inp=30, out=40),
+    ]
+    path = fake_claude.write("grow.jsonl", events)
+    os.utime(path, (path.stat().st_atime + 10, path.stat().st_mtime + 10))
+
+    run_extract(fake_claude.out)
+    prompts = _read_csv(fake_claude.out / "prompts.csv")
+    assert [r["prompt_id"] for r in prompts] == ["pG1", "pG2"]
+    tokens = _tokens_by_prompt(fake_claude.out)
+    # No double counting of the replayed first turn either.
+    assert tokens["pG1"] == {"input": 10, "output": 20}
+    assert tokens["pG2"] == {"input": 30, "output": 40}
+
+
+def test_parse_cache_hit_and_invalidation(fake_claude):
+    path = fake_claude.add("session_alpha.jsonl", project="alpha")
+
+    first = run_extract(fake_claude.out)
+    assert first.files_cached == 0
+
+    second = run_extract(fake_claude.out)
+    assert second.files_cached == second.files_read == 1
+    assert second.prompts == first.prompts
+
+    os.utime(path, (path.stat().st_atime + 60, path.stat().st_mtime + 60))
+    third = run_extract(fake_claude.out)
+    assert third.files_cached == 0
+    assert third.prompts == first.prompts
+
+    fourth = run_extract(fake_claude.out, use_cache=False)
+    assert fourth.files_cached == 0
+
+
+# ---------------------------------------------------------------------------
+# Counting correctness (3.3 - 3.8).
+# ---------------------------------------------------------------------------
+
+
+def test_cross_file_dedup_resumed_session(fake_claude):
+    """A resumed session replays records into a new file; count them once."""
+    fake_claude.add("session_delta.jsonl", project="delta")
+    fake_claude.add("session_delta_resumed.jsonl", project="delta")
+
+    report = run_extract(fake_claude.out)
+
+    prompts = _read_csv(fake_claude.out / "prompts.csv")
+    by_id = {r["prompt_id"]: r for r in prompts}
+    # pD5 belongs to the original session; the replayed copy is not a new prompt.
+    assert sorted(by_id) == ["pD1", "pD5", "pE1"]
+    assert by_id["pD5"]["session_id"] == "sess-ddd"
+    assert by_id["pE1"]["session_id"] == "sess-eee"
+    assert report.deduplicated_records == 1
+
+    tokens = _tokens_by_prompt(fake_claude.out)
+    # Replayed rD5/mD5 not double counted (40 input + 11 from the inline sidechain).
+    assert tokens["pD5"]["input"] == 51
+    assert tokens["pE1"] == {
+        "input": 30,
+        "output": 90,
+        "cache_read": 50,
+        "cache_write_5m": 20,
+    }
+    session_ids = {r["session_id"] for r in _read_csv(fake_claude.out / "sessions.csv")}
+    assert session_ids == {"sess-ddd", "sess-eee"}
+
+
+def test_attribution_by_prompt_id_chaining(fake_claude):
+    """Usage is attributed via promptId / parentUuid chain, across tool results."""
+    fake_claude.add("session_delta.jsonl", project="delta")
+    run_extract(fake_claude.out)
+
+    tokens = _tokens_by_prompt(fake_claude.out)
+    assert tokens["pD1"] == {
+        "input": 120,
+        "output": 80,
+        "cache_read": 600,
+        "cache_write_5m": 30,
+        "cache_write_1h": 70,
+    }
+    prompts = {r["prompt_id"]: r for r in _read_csv(fake_claude.out / "prompts.csv")}
+    assert prompts["pD1"]["assistant_turns"] == "2"
+    assert prompts["pD1"]["tool_calls"] == "1"
+    assert prompts["pD1"]["final_stop_reason"] == "end_turn"
+    assert prompts["pD1"]["model"] == "claude-opus-4-8"
+    assert prompts["pD1"]["mode"] == "plan"
+    assert prompts["pD5"]["mode"] == "normal"
+
+
+def test_fake_prompts_filtered_but_usage_counted(fake_claude):
+    """isMeta / command tags / interruptions / compaction are not prompts (3.5)."""
+    fake_claude.add("session_delta.jsonl", project="delta")
+    report = run_extract(fake_claude.out)
+
+    prompt_ids = {r["prompt_id"] for r in _read_csv(fake_claude.out / "prompts.csv")}
+    assert prompt_ids == {"pD1", "pD5"}
+    assert report.filtered_prompts == {
+        "meta": 1,
+        "interrupted": 1,
+        "local_command": 1,
+        "compact_continuation": 1,
+        "sidechain": 1,
+    }
+
+    # Their token usage is still counted, attached to the session.
+    tokens = _tokens_by_prompt(fake_claude.out)
+    assert tokens["pD0"] == {"input": 10, "output": 5, "cache_write_5m": 7}
+    assert tokens["pD4"] == {"input": 5, "output": 7, "cache_write_5m": 1000}
+    by_session = {
+        r["prompt_id"]: r["session_id"] for r in _read_csv(fake_claude.out / "tokens.csv")
+    }
+    assert by_session["pD0"] == "sess-ddd"
+    assert by_session["pD4"] == "sess-ddd"
+
+
+def test_sidechain_inline_and_subagent_files(fake_claude):
+    """Sidechain/subagent cost goes to the parent prompt; turns/tools do not (3.6)."""
+    fake_claude.add("session_delta.jsonl", project="delta")
+    fake_claude.add_subagent("agent_delta.jsonl", project="delta", parent_session="sess-ddd")
+
+    report = run_extract(fake_claude.out)
+    assert report.files_read == 2
+
+    tokens = _tokens_by_prompt(fake_claude.out)
+    # pD1 = main turns (120/80) + separate subagent file (200/100, 5m 50).
+    assert tokens["pD1"] == {
+        "input": 320,
+        "output": 180,
+        "cache_read": 600,
+        "cache_write_5m": 80,
+        "cache_write_1h": 70,
+    }
+    # pD5 = own turn (40/60) + inline sidechain (11/13).
+    assert tokens["pD5"]["input"] == 51
+    assert tokens["pD5"]["output"] == 73
+
+    prompts = {r["prompt_id"]: r for r in _read_csv(fake_claude.out / "prompts.csv")}
+    # Sidechain activity never inflates assistant_turns / tool_calls.
+    assert prompts["pD1"]["assistant_turns"] == "2"
+    assert prompts["pD1"]["tool_calls"] == "1"
+    assert prompts["pD5"]["assistant_turns"] == "1"
+    # The subagent's own "prompt" is not a human prompt.
+    assert set(prompts) == {"pD1", "pD5"}
+    # No extra session was invented for the subagent file.
+    session_ids = {r["session_id"] for r in _read_csv(fake_claude.out / "sessions.csv")}
+    assert session_ids == {"sess-ddd"}
+
+
+def test_cache_ttl_granularity_and_server_tool_use(fake_claude):
+    fake_claude.add("session_delta.jsonl", project="delta")
+    run_extract(fake_claude.out)
+
+    tokens = _tokens_by_prompt(fake_claude.out)
+    # 5m and 1h buckets are kept distinct (billed 1.25x vs 2x).
+    assert tokens["pD1"]["cache_write_5m"] == 30
+    assert tokens["pD1"]["cache_write_1h"] == 70
+    # Server-side tool requests are tracked as their own type.
+    assert tokens["pD5"]["server_tool_use"] == 2
+
+
+def test_legacy_cache_total_falls_back_to_5m(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    run_extract(fake_claude.out)
+    tokens = _tokens_by_prompt(fake_claude.out)
+    assert tokens["pA1"]["cache_write_5m"] == 25
+    assert "cache_write_1h" not in tokens["pA1"]
+
+
+def test_orphan_usage_goes_to_continuation_pseudo_prompt(fake_claude):
+    events = [
+        _assistant("rX0", "2026-06-03T10:00:00.000Z", sid="sess-x", inp=9, out=4),
+        _user("pX1", "2026-06-03T10:01:00.000Z", "real prompt", sid="sess-x"),
+        _assistant("rX1", "2026-06-03T10:01:05.000Z", sid="sess-x", parent="u-pX1", inp=1, out=2),
+    ]
+    fake_claude.write("orphan.jsonl", events)
+    run_extract(fake_claude.out)
+
+    tokens = _tokens_by_prompt(fake_claude.out)
+    assert tokens["sess-x:_continuation"] == {"input": 9, "output": 4}
+    assert tokens["pX1"] == {"input": 1, "output": 2}
+    prompt_ids = {r["prompt_id"] for r in _read_csv(fake_claude.out / "prompts.csv")}
+    assert prompt_ids == {"pX1"}
+
+
+# ---------------------------------------------------------------------------
+# Request grain (1.1, V10) + sidechain dimension (1.2) + compaction (1.4).
+# ---------------------------------------------------------------------------
+
+
+def test_requests_csv_one_row_per_deduplicated_request(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    report = run_extract(fake_claude.out)
+
+    rows = _read_csv(fake_claude.out / "requests.csv")
+    # rA1a is written twice (progressive snapshots): ONE request row, carrying
+    # the largest snapshot; rA1b and rA2a follow.
+    assert [r["prompt_id"] for r in rows] == ["pA1", "pA1", "pA2"]
+    assert [r["request_index"] for r in rows] == ["1", "2", "1"]
+    assert report.request_rows == 3
+
+    first = rows[0]
+    assert first["input_tokens"] == "100"
+    assert first["output_tokens"] == "60"  # the largest snapshot, not the first
+    assert first["cache_write_5m_tokens"] == "20"  # legacy total -> 5m bucket
+    assert first["model"] == "claude-opus-4-8"
+    assert first["stop_reason"] == "tool_use"
+    assert first["timestamp"]  # chronologically sortable ISO timestamp
+    assert rows[1]["stop_reason"] == "end_turn"
+
+
+def test_requests_sums_match_tokens_per_prompt_to_the_token(fake_claude):
+    """V7: per prompt (pseudo-prompts included), requests.csv column sums
+    reproduce tokens.csv exactly -- the request grain refines, never drifts."""
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    fake_claude.add("session_delta.jsonl", project="delta")
+    fake_claude.add("session_delta_resumed.jsonl", project="delta")
+    fake_claude.add_subagent("agent_delta.jsonl", project="delta", parent_session="sess-ddd")
+    run_extract(fake_claude.out)
+
+    col_of = {
+        "input": "input_tokens",
+        "output": "output_tokens",
+        "cache_read": "cache_read_tokens",
+        "cache_write_5m": "cache_write_5m_tokens",
+        "cache_write_1h": "cache_write_1h_tokens",
+        "server_tool_use": "server_tool_use_requests",
+    }
+    request_sums: dict[str, dict[str, int]] = {}
+    for row in _read_csv(fake_claude.out / "requests.csv"):
+        sums = request_sums.setdefault(row["prompt_id"], dict.fromkeys(col_of, 0))
+        for token_type, col in col_of.items():
+            sums[token_type] += int(row[col])
+
+    tokens = _tokens_by_prompt(fake_claude.out)
+    assert set(request_sums) == set(tokens)
+    for pid, counts in tokens.items():
+        for token_type, count in counts.items():
+            assert request_sums[pid][token_type] == count, (pid, token_type)
+
+
+def test_tokens_csv_splits_sidechain_as_a_dimension(fake_claude):
+    """is_sidechain is first-class in tokens.csv; summing over it reproduces
+    the per-prompt totals (V7)."""
+    fake_claude.add("session_delta.jsonl", project="delta")
+    fake_claude.add_subagent("agent_delta.jsonl", project="delta", parent_session="sess-ddd")
+    run_extract(fake_claude.out)
+
+    token_rows = _read_csv(fake_claude.out / "tokens.csv")
+    pd1_input = {
+        (r["is_sidechain"], r["model"]): int(r["token_count"])
+        for r in token_rows
+        if r["prompt_id"] == "pD1" and r["token_type"] == "input"
+    }
+    # Main turns on opus, the subagent file's usage on haiku, kept apart.
+    assert pd1_input == {("0", "claude-opus-4-8"): 120, ("1", "claude-haiku-4-5"): 200}
+    assert _tokens_by_prompt(fake_claude.out)["pD1"]["input"] == 320
+
+    requests = _read_csv(fake_claude.out / "requests.csv")
+    sidechain_pids = {r["prompt_id"] for r in requests if r["is_sidechain"] == "1"}
+    # Inline sidechain (pD5) and separate subagent file (pD1).
+    assert sidechain_pids == {"pD1", "pD5"}
+
+
+def test_post_compact_continuation_requests_are_marked(fake_claude):
+    """The synthetic post-compaction continuation's usage is flagged (1.4)."""
+    fake_claude.add("session_delta.jsonl", project="delta")
+    run_extract(fake_claude.out)
+
+    rows = _read_csv(fake_claude.out / "requests.csv")
+    flags = {r["prompt_id"]: r["post_compact"] for r in rows}
+    # rD4 answers the isCompactSummary message (filtered prompt pD4).
+    assert flags["pD4"] == "1"
+    # The next real human prompt (pD5) breaks the chain; pD0/pD1 predate it.
+    assert flags["pD5"] == "0"
+    assert flags["pD0"] == "0"
+    assert flags["pD1"] == "0"
+
+
+# ---------------------------------------------------------------------------
+# Idiomatic paths: CLAUDE_CONFIG_DIR + parse-cache GC (1.6, 08 m1/m2).
+# ---------------------------------------------------------------------------
+
+
+def test_claude_config_dir_env_is_honored(fake_claude, tmp_path, monkeypatch):
+    """A relocated Claude dir must feed extract too, not just snapshot (m2)."""
+    import shutil
+    from pathlib import Path
+
+    fixtures = Path(__file__).parent / "fixtures"
+    moved = tmp_path / "moved-claude"
+    dest = moved / "projects" / "alpha"
+    dest.mkdir(parents=True)
+    shutil.copy(fixtures / "session_alpha.jsonl", dest / "session_alpha.jsonl")
+
+    # The default ~/.claude/projects (fake_claude's sandbox) stays empty.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(moved))
+    report = run_extract(fake_claude.out)
+    assert report.prompts == 2
+
+
+def test_parse_cache_gc_removes_orphan_entries(fake_claude):
+    """Cache entries of deleted JSONL files are dropped, not kept forever."""
+    from prompt_analytics import paths
+
+    removed = fake_claude.add("session_alpha.jsonl", project="alpha")
+    fake_claude.add("session_beta.jsonl", project="beta")
+    run_extract(fake_claude.out)
+    cache = paths.parse_cache_dir()
+    assert len(list(cache.glob("*.json"))) == 2
+
+    removed.unlink()
+    run_extract(fake_claude.out)
+    assert len(list(cache.glob("*.json"))) == 1
+
+
+# ---------------------------------------------------------------------------
+# Date filters (3.9).
+# ---------------------------------------------------------------------------
+
+
+def test_date_filter_since_until(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    fake_claude.add("session_beta.jsonl", project="beta")
+    fake_claude.add("session_gamma.jsonl", project="gamma")
+
+    report = run_extract(
+        fake_claude.out,
+        since="2026-05-10",
+        until="2026-05-31",
+        timezone_name="UTC",
+    )
+
+    sessions = _read_csv(fake_claude.out / "sessions.csv")
+    assert len(sessions) == 1
+    assert sessions[0]["session_id"] == "sess-bbb"
+
+    prompts = _read_csv(fake_claude.out / "prompts.csv")
+    assert sorted(r["prompt_id"] for r in prompts) == ["pB1", "pB2"]
+    assert "kept 2 of 5 prompts" in report.window_note
+
+
+def test_date_filter_applies_at_prompt_grain(fake_claude):
+    """A session straddling the bound keeps its in-window prompts (anti-R3)."""
+    events = [
+        _user("p1", "2026-05-01T10:00:00.000Z", "early prompt"),
+        _assistant("r1", "2026-05-01T10:00:05.000Z", parent="u-p1", inp=1, out=1),
+        _user("p2", "2026-05-20T10:00:00.000Z", "late prompt", parent="u-r1"),
+        _assistant("r2", "2026-05-20T10:00:05.000Z", parent="u-p2", inp=2, out=2),
+    ]
+    fake_claude.write("straddle.jsonl", events)
+
+    run_extract(fake_claude.out, since="2026-05-10", timezone_name="UTC")
+
+    prompts = _read_csv(fake_claude.out / "prompts.csv")
+    assert [r["prompt_id"] for r in prompts] == ["p2"]
+    # prompt_index reflects the position in the full session, not the window.
+    assert prompts[0]["prompt_index"] == "2"
+    assert len(_read_csv(fake_claude.out / "sessions.csv")) == 1
+
+
+def test_until_bound_includes_last_millisecond(fake_claude):
+    events = [
+        _user("p1", "2026-05-31T23:59:59.500Z", "last-moment prompt"),
+        _assistant("r1", "2026-05-31T23:59:59.900Z", parent="u-p1", inp=1, out=1),
+    ]
+    fake_claude.write("midnight.jsonl", events)
+
+    run_extract(fake_claude.out, until="2026-05-31", timezone_name="UTC")
+    assert [r["prompt_id"] for r in _read_csv(fake_claude.out / "prompts.csv")] == ["p1"]
+
+
+def test_timezone_shifts_the_window(fake_claude):
+    events = [
+        _user("p1", "2026-05-31T23:30:00.000Z", "late UTC prompt"),
+        _assistant("r1", "2026-05-31T23:30:05.000Z", parent="u-p1", inp=1, out=1),
+    ]
+    fake_claude.write("tz.jsonl", events)
+
+    run_extract(fake_claude.out, until="2026-05-31", timezone_name="UTC")
+    assert len(_read_csv(fake_claude.out / "prompts.csv")) == 1
+
+    # In Tokyo (UTC+9) the prompt happened on June 1st.
+    run_extract(fake_claude.out, until="2026-05-31", timezone_name="Asia/Tokyo")
+    assert len(_read_csv(fake_claude.out / "prompts.csv")) == 0
+
+
+def test_invalid_timezone_or_date_raises(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    with pytest.raises(ValueError, match="timezone"):
+        run_extract(fake_claude.out, timezone_name="Mars/Olympus")
+    with pytest.raises(ValueError, match="since"):
+        run_extract(fake_claude.out, since="31/05/2026")
+
+
+# ---------------------------------------------------------------------------
+# Input robustness (3.10).
+# ---------------------------------------------------------------------------
+
+
+def test_bom_file_is_parsed_from_first_line(fake_claude):
+    events = [
+        _user("pB", "2026-06-01T10:00:00.000Z", "prompt behind a BOM"),
+        _assistant("rB", "2026-06-01T10:00:05.000Z", parent="u-pB", inp=3, out=4),
+    ]
+    fake_claude.write("bom.jsonl", events, encoding="utf-8-sig")
+
+    report = run_extract(fake_claude.out)
+    # The first line (the prompt!) is not lost to the BOM.
+    assert report.prompts == 1
+    assert report.lines_invalid == 0
+
+
+def test_corrupt_binary_file_is_skipped_not_fatal(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    bad = fake_claude.projects / "alpha" / "corrupt.jsonl"
+    bad.write_bytes(b"\xff\xfe\x00garbage\x00binary")
+
+    report = run_extract(fake_claude.out)
+    assert report.prompts == 2  # alpha still extracted
+    assert len(report.files_skipped) == 1
+    assert "corrupt.jsonl" in report.files_skipped[0][0]
+    assert report.exit_code() == 0
+    assert report.exit_code(strict=True) == 1  # skipped file is a warning
+
+
+def test_unreadable_path_is_skipped_not_fatal(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    # A directory matching *.jsonl: open() raises OSError, like a locked file.
+    (fake_claude.projects / "alpha" / "locked.jsonl").mkdir()
+
+    report = run_extract(fake_claude.out)
+    assert report.prompts == 2
+    assert len(report.files_skipped) == 1
+
+
+def test_empty_and_invalid_json_lines(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    (fake_claude.projects / "alpha" / "empty.jsonl").write_text("", encoding="utf-8")
+    (fake_claude.projects / "alpha" / "junk.jsonl").write_text(
+        'not json at all\n{"type":"user"}\n', encoding="utf-8"
+    )
+
+    report = run_extract(fake_claude.out)
+    assert report.prompts == 2
+    assert report.files_read == 3
+    assert report.lines_invalid == 1
+
+
+# ---------------------------------------------------------------------------
+# Extraction report (3.16 / 3.17).
+# ---------------------------------------------------------------------------
+
+
+def test_unpriced_model_is_reported(fake_claude):
+    events = [
+        _user("pM", "2026-06-01T10:00:00.000Z", "who are you"),
+        _assistant(
+            "rM", "2026-06-01T10:00:05.000Z", parent="u-pM", model="mystery-model-9", inp=5, out=5
+        ),
+    ]
+    fake_claude.write("mystery.jsonl", events)
+
+    report = run_extract(fake_claude.out)
+    assert report.unpriced_models == ["mystery-model-9"]
+    assert any("mystery-model-9" in w for w in report.warnings)
+    assert report.exit_code() == 0
+    assert report.exit_code(strict=True) == 1
+
+
+def test_unknown_event_type_is_reported(fake_claude):
+    fake_claude.add("session_delta.jsonl", project="delta")
+    report = run_extract(fake_claude.out)
+    assert report.unknown_event_types == {"flux-capacitor": 1}
+    assert any("flux-capacitor" in w for w in report.warnings)
+
+
+def test_zero_prompts_canary_fails_loudly(fake_claude):
+    events = [_assistant("rZ", "2026-06-01T10:00:00.000Z", inp=5, out=5)]
+    fake_claude.write("noprompts.jsonl", events)
+
+    report = run_extract(fake_claude.out)
+    assert report.files_read == 1
+    assert report.prompts_total == 0
+    assert report.exit_code() == 1
+    assert any("0 prompts" in w for w in report.warnings)
+
+
+def test_report_format_lines_mention_key_numbers(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    report = run_extract(fake_claude.out)
+    text = "\n".join(report.format_lines())
+    assert "Files read:      1" in text
+    assert "Prompts:         2" in text
+    assert "Request rows:    3" in text
+    assert "duplicate(s) removed" in text
+    assert "claude-opus-4-8" in text
+    assert "versions 2.1.0" in text
+
+
+# ---------------------------------------------------------------------------
+# Output behaviour.
+# ---------------------------------------------------------------------------
+
+
+def test_no_text_omits_and_removes_text_file(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+
+    run_extract(fake_claude.out)
+    assert (fake_claude.out / "prompts_text.csv").exists()
+
+    # With text, the preview column is populated.
+    with_text = _read_csv(fake_claude.out / "prompts.csv")
+    assert any(r["prompt_preview"] for r in with_text)
+
+    run_extract(fake_claude.out, no_text=True)
+    # A stale text file from a previous run is removed, not left behind.
+    assert not (fake_claude.out / "prompts_text.csv").exists()
+    # --no-text is honest: prompt_preview is blanked out too (10.1).
+    no_text = _read_csv(fake_claude.out / "prompts.csv")
+    assert no_text  # same prompts are still emitted
+    assert all(r["prompt_preview"] == "" for r in no_text)
+
+
+def test_token_types_meta_uses_machine_keys(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    run_extract(fake_claude.out)
+    rows = _read_csv(fake_claude.out / "token_types.csv")
+    keys = [r["token_type"] for r in rows]
+    assert keys == [
+        "input",
+        "output",
+        "cache_read",
+        "cache_write_5m",
+        "cache_write_1h",
+        "server_tool_use",
+    ]
+    labels = {r["token_type"]: r["label"] for r in rows}
+    assert labels["cache_write_1h"] == "Cache write (1h)"
+
+
+def test_extract_never_touches_categories_csv(fake_claude):
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    categories = fake_claude.out
+    categories.mkdir(parents=True, exist_ok=True)
+    sentinel = categories / "categories.csv"
+    sentinel.write_text(
+        "prompt_id,category,complexity,classifier_model,classified_at\n"
+        "pA1,debug,2,test-model,2026-06-01T00:00:00+00:00\n",
+        encoding="utf-8",
+    )
+
+    run_extract(fake_claude.out)
+    rows = _read_csv(sentinel)
+    assert rows[0]["category"] == "debug"
+    # And prompts.csv no longer carries category columns at all.
+    prompts = _read_csv(fake_claude.out / "prompts.csv")
+    assert "category" not in prompts[0]

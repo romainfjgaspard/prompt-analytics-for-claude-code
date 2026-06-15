@@ -1,0 +1,9 @@
+# Streamlit Community Cloud reads this to build the demo deployment.
+# Installing the project with its `dashboard` extra makes `prompt_analytics`
+# importable and pulls the dashboard-only deps (streamlit-echarts, etc.) that
+# the base install omits. The app entry point on Cloud is
+# `prompt_analytics/dashboard/app.py` with a `CCA_DEMO = "1"` secret.
+#
+# This file is ONLY for the hosted demo; local installs use pyproject.toml
+# (`uv sync --all-extras` or `pip install -e .[dashboard]`).
+.[dashboard]

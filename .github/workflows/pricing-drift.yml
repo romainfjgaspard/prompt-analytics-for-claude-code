@@ -1,0 +1,157 @@
+name: Pricing drift check
+
+on:
+  schedule:
+    # Every Monday at 08:00 UTC
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml requests
+
+      - name: Fetch LiteLLM model prices
+        run: |
+          python - << 'EOF'
+          import json, urllib.request, sys, yaml, pathlib
+
+          LITELLM_URL = (
+              "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+              "model_prices_and_context_window.json"
+          )
+          with urllib.request.urlopen(LITELLM_URL, timeout=30) as r:
+              litellm: dict = json.loads(r.read().decode())
+
+          # Claude model keys in LiteLLM use the form "claude/claude-opus-4-8" or
+          # just "claude-opus-4-8"; we normalise to the bare model ID.
+          def price_per_mtok(v, key):
+              val = v.get(key)
+              return round(float(val) * 1_000_000, 6) if val is not None else None
+
+          drift = []
+          pricing_yml = pathlib.Path("prompt_analytics/data/pricing.yml")
+          data = yaml.safe_load(pricing_yml.read_text(encoding="utf-8"))
+          embedded = data.get("providers", {}).get("anthropic", {}).get("models", {})
+
+          for model_id, entry in embedded.items():
+              # Try common LiteLLM key forms
+              candidates = [model_id, f"claude/{model_id}", f"anthropic/{model_id}"]
+              litellm_entry = None
+              for c in candidates:
+                  if c in litellm:
+                      litellm_entry = litellm[c]
+                      break
+              if litellm_entry is None:
+                  print(f"  skip {model_id}: not in LiteLLM", flush=True)
+                  continue
+
+              checks = [
+                  ("input",          "input_cost_per_token"),
+                  ("output",         "output_cost_per_token"),
+                  ("cache_read",     "cache_read_input_token_cost"),
+                  ("cache_write_5m", "cache_creation_input_token_cost"),
+              ]
+              for our_key, ll_key in checks:
+                  ll_val = price_per_mtok(litellm_entry, ll_key)
+                  if ll_val is None:
+                      continue
+                  our_val = entry.get(our_key)
+                  if our_val is None:
+                      continue
+                  # Allow 1 % tolerance for rounding
+                  if abs(ll_val - our_val) / max(abs(ll_val), 1e-9) > 0.01:
+                      drift.append(
+                          f"  {model_id}/{our_key}: ours={our_val}, LiteLLM={ll_val}"
+                      )
+
+          if drift:
+              print("DRIFT DETECTED (Anthropic vs LiteLLM):", flush=True)
+              for line in drift:
+                  print(line, flush=True)
+              pathlib.Path("drift_litellm.txt").write_text("\n".join(drift) + "\n", encoding="utf-8")
+          else:
+              print("No drift vs LiteLLM.", flush=True)
+          EOF
+
+      - name: Fetch Copilot pricing
+        run: |
+          pip install pyyaml  # already installed but be explicit
+          python scripts/fetch_copilot_pricing.py --output /tmp/copilot_fresh.yml
+
+      - name: Compare Copilot pricing
+        run: |
+          python - << 'EOF'
+          import yaml, pathlib, sys
+
+          fresh = yaml.safe_load(
+              pathlib.Path("/tmp/copilot_fresh.yml").read_text(encoding="utf-8")
+          )
+          pricing_yml = pathlib.Path("prompt_analytics/data/pricing.yml")
+          data = yaml.safe_load(pricing_yml.read_text(encoding="utf-8"))
+          embedded = data.get("providers", {}).get("copilot", {}).get("models", {})
+          fresh_claude = fresh.get("vendors", {}).get("anthropic", {})
+
+          drift = []
+          for model_id, fresh_entry in fresh_claude.items():
+              our_entry = embedded.get(model_id)
+              if our_entry is None:
+                  drift.append(f"  NEW model {model_id}: not in embedded copilot grid")
+                  continue
+              for key in ("input", "output", "cache_read"):
+                  fv = fresh_entry.get(key)
+                  ov = our_entry.get(key)
+                  if fv is None or ov is None:
+                      continue
+                  if abs(fv - ov) / max(abs(fv), 1e-9) > 0.01:
+                      drift.append(f"  {model_id}/{key}: ours={ov}, Copilot page={fv}")
+              # cache_write in fresh → compare against cache_write_5m
+              fw = fresh_entry.get("cache_write")
+              ow = our_entry.get("cache_write_5m")
+              if fw is not None and ow is not None:
+                  if abs(fw - ow) / max(abs(fw), 1e-9) > 0.01:
+                      drift.append(f"  {model_id}/cache_write_5m: ours={ow}, Copilot page={fw}")
+
+          if drift:
+              print("DRIFT DETECTED (Copilot):", flush=True)
+              for line in drift:
+                  print(line, flush=True)
+              with open("drift_litellm.txt", "a", encoding="utf-8") as f:
+                  f.write("\n".join(drift) + "\n")
+          else:
+              print("No drift vs Copilot page.", flush=True)
+          EOF
+
+      - name: Open PR if drift detected
+        if: ${{ hashFiles('drift_litellm.txt') != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="pricing-drift-$(date +%Y%m%d)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "chore: pricing drift detected $(date +%Y-%m-%d)" --allow-empty
+          git push origin "$BRANCH"
+          DRIFT=$(cat drift_litellm.txt)
+          gh pr create \
+            --title "Pricing drift detected $(date +%Y-%m-%d)" \
+            --body "$(printf '## Pricing drift\n\nThe weekly pricing check found the following differences between \`pricing.yml\` and the upstream sources (LiteLLM / Copilot page).\n\n```\n%s\n```\n\nPlease update \`prompt_analytics/data/pricing.yml\` accordingly.' "$DRIFT")" \
+            --base main \
+            --head "$BRANCH"
