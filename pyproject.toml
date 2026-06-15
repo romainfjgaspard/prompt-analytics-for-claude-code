@@ -7,7 +7,7 @@ name = "prompt-analytics-for-claude-code"
 # Keep in sync with prompt_analytics/__init__.py:__version__ on each release.
 # (Static, not hatch-dynamic: a dynamic version omits the `version` field from
 # uv.lock for the editable root, which Streamlit Cloud's stricter uv rejects.)
-version = "0.3.0"
+version = "0.3.1"
 description = "Prompt-level analytics for Claude Code — tokens, costs, and session insights from your local JSONL files"
 readme = "README.md"
 requires-python = ">=3.10"
