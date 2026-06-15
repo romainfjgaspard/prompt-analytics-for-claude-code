@@ -344,6 +344,14 @@ def _run() -> None:
     here, so it sits below the filters instead of in each page's main column.
     """
     st.set_page_config(layout="wide", page_title="Prompt Analytics for Claude Code")
+    # First load of a session: streamlit-echarts can mis-size on the very first
+    # paint (it measures a container width that fonts/layout have not settled
+    # yet), so the landing charts render wrong until the user switches tabs. One
+    # immediate rerun reproduces that "switch tabs" re-mount so the showcase looks
+    # right on arrival. Guarded so it fires once per session, not every rerun.
+    if not st.session_state.get("_booted"):
+        st.session_state["_booted"] = True
+        st.rerun()
     # Trim Streamlit's large default top padding (~6rem) so the page title sits
     # close to the top toolbar instead of floating below a gap. Applied on every
     # page (entry script runs on each load); `.block-container` is the main area.

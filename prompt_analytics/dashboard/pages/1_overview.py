@@ -361,19 +361,15 @@ def main() -> None:
         st.info("No data for the current filters.")
         st.stop()
 
-    # Headline number for this page: how much of the API-equivalent cost is spent
-    # re-sending context rather than generating answers. The cost-by-token-type
-    # trend right below is its direct support.
+    # Headline number for this page, compact (a metric, not a full hero — the
+    # 4rem hero ate the whole viewport): how much of the API-equivalent cost is
+    # context rent. The cost-by-token-type trend below is its support.
     rent = data._context_rent_share(tokens, primary)
     if rent is not None:
-        st.markdown(
-            theme.hero(
-                f"{rent:.0f}%",
-                "of your API-equivalent cost is context rent",
-                "cache reads + cache writes: money spent re-sending context "
-                "at every turn, not generating answers.",
-            ),
-            unsafe_allow_html=True,
+        st.metric(
+            "Context rent (cache reads + writes)",
+            f"{rent:.0f}% of API-equivalent cost",
+            help="Money spent re-sending context at every turn, not generating answers.",
         )
 
     theme.section("Where the money goes")
