@@ -40,8 +40,10 @@ _SYNTHETIC = frozenset({"(session overhead)", "(unknown)", ""})
 def _per_session_cost(tokens: pd.DataFrame, primary: str) -> pd.DataFrame:
     """Sum the primary provider's cost per session_id."""
     col = data.cost_col(primary)
+    # ``[[col]]`` (not ``[col]``): with as_index=False both return a DataFrame at
+    # runtime, but pandas-stubs only types the list form as DataFrame.
     result: pd.DataFrame = (
-        tokens.dropna(subset=["session_id"]).groupby("session_id", as_index=False)[col].sum()
+        tokens.dropna(subset=["session_id"]).groupby("session_id", as_index=False)[[col]].sum()
     )
     return result
 
@@ -69,7 +71,7 @@ def _project_pareto_option(
         return None
     work = tokens.copy()
     work["project"] = work["project"].fillna("(session overhead)").replace("", "(unknown)")
-    agg = work.groupby("project", as_index=False)[col].sum().sort_values(col, ascending=False)
+    agg = work.groupby("project", as_index=False)[[col]].sum().sort_values(col, ascending=False)
     agg = agg[agg[col] > 0]
     total = float(agg[col].sum())
     if not total:

@@ -70,7 +70,7 @@ def _cost_by_token_type_option(
         daily = daily.assign(_x=pd.to_datetime(daily["date"], utc=True).dt.strftime("%Y-%m-%d"))
         grain = "day"
 
-    daily = daily.groupby(["_x", "token_type_label"], as_index=False)[col].sum()
+    daily = daily.groupby(["_x", "token_type_label"], as_index=False)[[col]].sum()
     labels = sorted(daily["_x"].unique().tolist())
     pivot = daily.pivot_table(
         index="_x", columns="token_type_label", values=col, aggfunc="sum", fill_value=0.0

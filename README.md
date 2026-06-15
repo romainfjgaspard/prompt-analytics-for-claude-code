@@ -1,4 +1,4 @@
-# prompt-analytics-for-claude-code
+# Prompt-level analytics for Claude Code
 
 > **Unofficial — not affiliated with Anthropic.** This is a community tool that reads Claude Code's local log files. "Claude" and "Claude Code" are trademarks of Anthropic.
 
@@ -7,8 +7,6 @@
 [![Python](https://img.shields.io/pypi/pyversions/prompt-analytics-for-claude-code.svg)](https://pypi.org/project/prompt-analytics-for-claude-code/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 <!-- [![Live demo](https://img.shields.io/badge/live-demo-brightgreen.svg)](https://prompt-analytics-demo.streamlit.app) — enable once the demo is deployed (phase 12) -->
-
-# Prompt-level analytics for Claude Code
 
 Other tools tell you what you spent **per day** or **per session**. This one goes down to the **prompt**: every prompt you have ever sent becomes one row, priced from the raw token counts in your local `~/.claude/projects/**/*.jsonl` logs — no account, no API key, nothing leaves your machine.
 

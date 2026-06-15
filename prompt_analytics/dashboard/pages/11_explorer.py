@@ -16,6 +16,7 @@ other chart pages) and ``main()`` runs only under a real server.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pandas as pd
@@ -162,7 +163,7 @@ def _session_first_date(prompts: pd.DataFrame) -> pd.DataFrame:
     if prompts.empty or not {"session_id", "date"} <= set(prompts.columns):
         return pd.DataFrame(columns=["session_id", "day"])
     dated = prompts.dropna(subset=["session_id", "date"])
-    first = dated.groupby("session_id", as_index=False)["date"].min()
+    first = dated.groupby("session_id", as_index=False)[["date"]].min()
     first["day"] = pd.to_datetime(first["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     out: pd.DataFrame = first[["session_id", "day"]]
     return out
@@ -336,7 +337,11 @@ def main() -> None:
     )
     if "Model" in detail.columns:
         detail["Model"] = detail["Model"].map(lambda m: theme.model_label(m) if pd.notna(m) else m)
-    detail_fmt = {"Cost (USD)": "${:,.2f}"} if cost in sub.columns else {}
+    # Annotated to match Styler.format's formatter type exactly (dict value type
+    # is invariant, so a bare dict[str, str] is rejected by pandas-stubs).
+    detail_fmt: dict[Any, str | Callable[[object], str] | None] = (
+        {"Cost (USD)": "${:,.2f}"} if cost in sub.columns else {}
+    )
     event = st.dataframe(
         detail.style.format(detail_fmt),
         width="stretch",
