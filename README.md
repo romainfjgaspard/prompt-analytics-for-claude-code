@@ -6,7 +6,7 @@
 [![PyPI](https://img.shields.io/pypi/v/prompt-analytics-for-claude-code.svg)](https://pypi.org/project/prompt-analytics-for-claude-code/)
 [![Python](https://img.shields.io/pypi/pyversions/prompt-analytics-for-claude-code.svg)](https://pypi.org/project/prompt-analytics-for-claude-code/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-<!-- [![Live demo](https://img.shields.io/badge/live-demo-brightgreen.svg)](https://prompt-analytics-demo.streamlit.app) — enable once the demo is deployed (phase 12) -->
+[![Live demo](https://img.shields.io/badge/live-demo-brightgreen.svg)](https://prompt-analytics-demo.streamlit.app)
 
 Other tools tell you what you spent **per day** or **per session**. This one goes down to the **prompt**: every prompt you have ever sent becomes one row, priced from the raw token counts in your local `~/.claude/projects/**/*.jsonl` logs — no account, no API key, nothing leaves your machine.
 
@@ -26,7 +26,7 @@ Every CLI command is a single line over your local logs. For example, `by-catego
 
 And a live Streamlit demo runs on a synthetic dataset (no real prompts), so you can explore the dashboard before installing — **the image below links to the live demo:**
 
-**▶ Live demo:** _coming soon_ <!-- https://prompt-analytics-demo.streamlit.app — deploy in phase 12, then enable the badge above AND confirm this URL matches the deployed app -->
+**▶ Live demo: [prompt-analytics-demo.streamlit.app](https://prompt-analytics-demo.streamlit.app)**
 
 [![The prompt-analytics Streamlit dashboard — KPI cards, cost by token type, and daily cost by model](docs/screenshots/dashboard-home.png)](https://prompt-analytics-demo.streamlit.app)
 
@@ -76,28 +76,13 @@ Usage summary
 
 Per-prompt rows turn into answers a daily total can't give. Every block below is real output from the bundled demo dataset (`--from-csv demo_data`); on your machine the source line reads `live parse of ~/.claude/projects`.
 
-### Where the bill actually goes: context rent
+### What one prompt actually costs, by session depth
 
-Almost none of your spend is the text you type or the text the model writes. It is **context rent** — the cache reads and writes that re-send the conversation on every turn. `by-token-type` puts a number on it:
+This is the view the report-style tools don't give. Priced **per prompt** and bucketed by its position in the session: on this dataset the **median prompt at depth 21–50 carries ×2.71 the depth-1 context (≈344k tokens)** — and pays that cache rent on *every* turn until `/compact` or a new session resets it. `sessions --depth` prints the full distribution (median, box, p5–p95 tail, `n` per band); the dashboard's **Session depth** page draws it as a box plot.
 
-```text
-Cost by token type (anthropic)
-+-------------------------------------------------------------------------------+
-| Token type                         |      Tokens | Token % |    Cost | Cost % |
-|------------------------------------+-------------+---------+---------+--------|
-| Cache read                         | 497,973,616 |   94.0% | $198.81 |  46.0% |
-| Cache write (5m)                   |  22,683,667 |    4.3% | $120.30 |  27.9% |
-| Output                             |   2,961,653 |    0.6% |  $61.02 |  14.1% |
-| Cache write (1h)                   |   4,680,558 |    0.9% |  $40.97 |   9.5% |
-| Input                              |   1,729,726 |    0.3% |   $8.11 |   1.9% |
-| Server tool use (req, billed sep.) |         264 |       - |   $2.64 |   0.6% |
-| TOTAL                              | 530,029,220 |  100.0% | $431.85 | 100.0% |
-+-------------------------------------------------------------------------------+
-  Context rent (cache reads + writes): 83.4% of the bill;
-  generation (output): 14.1%; fresh input: 1.9%.
-```
+### Where the bill goes: context rent
 
-And it **grows with session depth**: `context` shows the context one turn re-reads by position in the session — on this dataset the median prompt at depth 21–50 carries ×2.71 the depth-1 context (≈344k tokens), and every turn pays that rent until `/compact` or a new session resets it.
+Almost none of your spend is the text you type or the model writes — on this dataset **83% of the bill is "context rent"**: the cache reads and writes that re-send the conversation every turn (`by-token-type` breaks it down — cache reads alone are 94% of *tokens* but 46% of *cost*). Those aggregate token-type totals overlap with the report-style tools; the difference here is that the same numbers are also available **per prompt**.
 
 ### TTL expiry and compaction: the hidden cache costs
 
@@ -128,8 +113,6 @@ Plan break-even: API-equivalent vs subscription (anthropic)
   API-equivalent is $74.03/month (x3.70 the price), an estimated $54.03/month
   cheaper than paying per token.
 ```
-
-With a `quota_log.csv` (written by `snapshot`), the notes also report the peak plan utilization seen in each window. Other "what to do" commands: `model-category --whatif MODEL` re-prices every prompt on another model, `recommend` estimates what compacting long sessions earlier would have saved, and `burn-rate` tracks $/day week over week.
 
 ## Commands
 
@@ -194,12 +177,10 @@ Every command also takes `--format json` (a `{title, rows, notes}` object with r
 
 ## Pricing providers
 
-Costs are computed at read time from a multi-provider pricing grid, [`prompt_analytics/data/pricing.yml`](prompt_analytics/data/pricing.yml). Two providers ship by default:
+Costs are computed at read time from a generic multi-provider grid ([`prompt_analytics/data/pricing.yml`](prompt_analytics/data/pricing.yml)). Two ship by default — **`anthropic`** (published API rates) and **`copilot`** (the GitHub Copilot equivalent) — so `compare` answers *"what would this usage cost billed through Copilot instead of the API?"*. Add any rate card under `providers:` (an internal plan, a Bedrock tier, a negotiated rate) or pass `--pricing ./my.yml`; the bundled grid is kept honest by a weekly CI drift job (LiteLLM + the live Copilot page). See [CONTRIBUTING.md](CONTRIBUTING.md) for the schema and lookup rules.
 
-- **`anthropic`** — Anthropic's published API rates (Opus / Sonnet / Haiku / Fable, with `cache_read` at 0.1×, `cache_write_5m` at 1.25×, `cache_write_1h` at 2× of base input).
-- **`copilot`** — the GitHub Copilot equivalent, so you can answer *"what would this usage cost billed through Copilot instead of the Anthropic API?"*
-
-That comparison is exactly what `compare` is for:
+<details>
+<summary><strong>Example: <code>compare</code> across providers</strong></summary>
 
 ```text
 Provider cost comparison
@@ -215,7 +196,7 @@ Provider cost comparison
   Total on copilot: x0.96 the anthropic total.
 ```
 
-The grid is **generic** — add a key under `providers:` to price the same usage on *any* rate card (an internal Copilot plan, an AWS Bedrock tier, a negotiated rate), then `compare --providers anthropic,my-company`, or pass your own with `--pricing ./my-pricing.yml`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the grid schema and lookup rules. The bundled grid is kept honest by a weekly CI drift job that diffs it against LiteLLM and the live Copilot pricing page.
+</details>
 
 ## Categorization
 
@@ -226,8 +207,7 @@ prompt-analytics categorize        # heuristic, writes categories.csv
 prompt-analytics by-category
 ```
 
-- **Category** — a weighted FR+EN regex classifier (`classifier_model = "heuristic-v2"`) labels each prompt one of eleven categories: `plan` / `implementation` / `debug` / `refactor` / `review` / `test` / `docs` / `ops` / `question` / `followup` / `other`. The French patterns tolerate missing accents, and the agentic categories (`review`, `test`, `docs`, `ops`) catch the long multi-step prompts the first six missed — on real history "other" drops from 60.8% to 17.6% of prompts. A heuristic re-run upgrades rows stamped by an older heuristic version; LLM-classified rows are never overwritten.
-- **Complexity 1–5** — *observed*, not guessed: derived from the effort the prompt actually triggered (quantiles over `assistant_turns`, `tool_calls`, `char_count`, and computed cost). A measurement, not an estimate.
+A weighted FR+EN regex classifier labels each prompt across eleven categories (plan / implementation / debug / refactor / review / test / docs / ops / question / followup / other), and an **observed** complexity 1–5 is derived from the effort it actually triggered (turns, tool calls, length, cost) — a measurement, not a guess.
 
 ```text
 Cost by category
@@ -251,7 +231,10 @@ Cost by category
 
 The `$/prompt (med)` column is the one to read alongside the total: a category can top the bill just by volume, but a high median per prompt is what flags work that is *intrinsically* expensive — here `debug` is costly both ways ($0.73/prompt) while `followup` stays cheap ($0.26). `Token %` and `Cost %` sit next to their own columns throughout, so volume and spend are never conflated.
 
-**LLM refinement (opt-in).** `categorize --llm` re-labels prompts with an LLM; it only overwrites heuristic rows, never the reverse. Providers:
+<details>
+<summary><strong>Optional LLM refinement</strong></summary>
+
+`categorize --llm` re-labels prompts with an LLM; it only overwrites heuristic rows, never the reverse. Providers:
 
 - `--provider anthropic` (default when `ANTHROPIC_API_KEY` is set; `--batch` uses the Message Batches API, −50% cost).
 - `--provider openrouter` — **a third party.** Up to ~2000 characters of each prompt are sent to OpenRouter; the command warns you at runtime before sending.
@@ -259,11 +242,7 @@ The `$/prompt (med)` column is the one to read alongside the total: a category c
 
 Set keys in a `.env` file (see [`.env.example`](.env.example)). Most Claude Code Pro/Max subscribers have no Console API key — that is exactly why the heuristic is the default.
 
-## Quota snapshot
-
-`snapshot` records your current plan utilization into `quota_log.csv` so you can chart it over time (the real-time tools show it but don't keep history).
-
-> **Disclaimer.** `snapshot` reads an **undocumented** OAuth endpoint (`https://api.anthropic.com/api/oauth/usage`), reusing the OAuth token Claude Code already stored in `~/.claude/.credentials.json`. That token grants access to your account; this command sends it to Anthropic's own endpoint and nothing else. The endpoint is not part of any public API and may change or break without notice — the command fails gracefully if it does. The endpoint was discovered by [usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude); we send an honest `prompt-analytics-for-claude-code/<version>` User-Agent (no spoofing).
+</details>
 
 ## How the numbers stay accurate
 
@@ -290,12 +269,12 @@ This tool reads your entire Claude Code prompt history, so it is explicit about 
 - `--no-text` is honest: it skips `prompts_text.csv` **and** blanks the `prompt_preview` column.
 - Free-text cells starting with `=`, `+`, `-`, or `@` are prefixed with `'` so a crafted prompt can't execute as a spreadsheet formula.
 
-**Network:** **nothing by default.** `extract` and every analysis command are fully local. `snapshot` calls Anthropic's OAuth usage endpoint with your token (see disclaimer). `categorize --llm` sends prompt excerpts to the provider you choose — and OpenRouter is a third party.
+**Network:** **nothing by default.** `extract` and every analysis command are fully local. `snapshot` reuses the token Claude Code stored in `~/.claude/.credentials.json` to call an **undocumented** Anthropic OAuth usage endpoint (sent to Anthropic only; it fails gracefully if the endpoint changes). `categorize --llm` sends prompt excerpts to the provider you choose — and OpenRouter is a third party.
 
 ## Related tools
 
 - **[ccusage](https://github.com/ryoppippi/ccusage)** — fast terminal usage reports (daily/session/blocks) and JSON output, 14+ CLIs supported. Complementary: it does aggregated reports, this does the per-prompt dataset. Token totals here are validated against it.
-- **[usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude)** — real-time quota tray app for Windows; source of the quota-endpoint discovery credited above.
+- **[usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude)** — real-time quota tray app for Windows; it discovered the undocumented quota endpoint this tool's `snapshot` reuses.
 - **[Claude-Code-Usage-Monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor)** — real-time 5-hour-block burn-rate monitor with P90 predictions.
 - **Claude Code Analytics API** — official, org-level analytics; requires an organization and an Admin API key.
 
