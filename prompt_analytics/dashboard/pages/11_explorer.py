@@ -232,9 +232,28 @@ def main() -> None:
         "sessions, then a session to see its prompts."
     )
 
+    # Resolve session focus up front so BOTH the day and session tables narrow to
+    # it. A focused session = deep-linked (Sessions treemap / Usage top-10) or
+    # selected below; its day becomes the day context, so the day table isn't left
+    # showing every date.
+    by_session = _by_session(prompts, tokens, sessions, cost)
+    drill = st.session_state.get(DRILL_SESSION)
+    focused = (
+        drill
+        if (drill and not by_session.empty and drill in set(by_session["session_id"]))
+        else None
+    )
+    focused_day: str | None = None
+    if focused and "day" in by_session.columns:
+        d = by_session.loc[by_session["session_id"] == focused, "day"]
+        if not d.empty and pd.notna(d.iloc[0]):
+            focused_day = str(d.iloc[0])
+
     # --- Day level ---------------------------------------------------------
-    day_filter = st.session_state.get(DRILL_DATE)
+    day_filter = focused_day or st.session_state.get(DRILL_DATE)
     by_day = _by_day(prompts, tokens, cost)
+    if focused_day and not by_day.empty and "day" in by_day.columns:
+        by_day = by_day[by_day["day"] == focused_day].reset_index(drop=True)
     st.subheader("By day")
     if by_day.empty:
         st.info("No dated activity.")
@@ -258,11 +277,12 @@ def main() -> None:
         rows = list(event.get("selection", {}).get("rows", []))
         if rows:
             picked = str(by_day.iloc[rows[0]]["day"])
-            if picked != day_filter:
+            if picked != st.session_state.get(DRILL_DATE):
                 st.session_state[DRILL_DATE] = picked
-                st.session_state.pop(DRILL_SESSION, None)  # day changed -> reset session
+                st.session_state.pop(DRILL_SESSION, None)  # day picked -> leave session focus
                 st.rerun()
-        if day_filter:
+        # "Clear day" only for an explicit day pick (a session focus owns its day).
+        if day_filter and not focused:
             left, right = st.columns([5, 1])
             left.caption(f"Filtered to **{day_filter}** — sessions below are limited to that day.")
             if right.button("Clear day", width="stretch"):
@@ -270,17 +290,27 @@ def main() -> None:
                 st.rerun()
 
     # --- Session level -----------------------------------------------------
-    by_session = _by_session(prompts, tokens, sessions, cost)
     if day_filter and not by_session.empty and "day" in by_session.columns:
         by_session = by_session[by_session["day"] == day_filter].reset_index(drop=True)
     st.subheader("Sessions" + (f" on {day_filter}" if day_filter else ""))
     if by_session.empty:
         st.info("No sessions for the current selection.")
         return
-    cols = [
-        c for c in ["session_id", "project", "model", "day", "prompts", cost] if c in by_session
-    ]
-    view = by_session[cols].rename(
+    # The focused session (resolved above) narrows the table to that one session,
+    # so the page is clearly filtered to it; "← All sessions" returns to the list.
+    if focused:
+        fcol = st.columns([5, 1])
+        fcol[0].caption(f"🔎 Focused on session **{focused[:8]}…** — its prompts are below.")
+        if fcol[1].button("← All sessions", width="stretch", key="clear_drill_session"):
+            st.session_state.pop(DRILL_SESSION, None)
+            st.rerun()
+    table_src = (
+        by_session[by_session["session_id"] == focused].reset_index(drop=True)
+        if focused
+        else by_session
+    )
+    cols = [c for c in ["session_id", "project", "model", "day", "prompts", cost] if c in table_src]
+    view = table_src[cols].rename(
         columns={
             "session_id": "Session",
             "project": "Project",
@@ -302,7 +332,7 @@ def main() -> None:
     )
     rows = list(event.get("selection", {}).get("rows", []))
     if rows:
-        picked = str(by_session.iloc[rows[0]]["session_id"])
+        picked = str(table_src.iloc[rows[0]]["session_id"])
         if picked != st.session_state.get(DRILL_SESSION):
             st.session_state[DRILL_SESSION] = picked
             st.rerun()

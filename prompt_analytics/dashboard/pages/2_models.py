@@ -294,9 +294,11 @@ def main() -> None:
         ec.apply_click(clicked, filters.KEY_MODELS)
         st.caption(dist_caption)
 
-    # Cost split by model over time (Day / Week / Month).
+    # Cost split by model over time. Grain read from the toggle rendered *below*
+    # the chart (session_state), default span-appropriate — consistent with the
+    # Home and Overview charts.
     if "date" in tokens.columns:
-        grain = filters.granularity_control(tokens["date"], key="models_granularity")
+        grain = st.session_state.get("models_granularity", data.auto_granularity(tokens["date"]))
         daily_opt = _cost_by_model_option(tokens, primary, grain)
     else:
         daily_opt = None
@@ -307,6 +309,7 @@ def main() -> None:
             daily_opt, key="models_daily", height="420px", click=True, click_field="seriesName"
         )
         ec.apply_click(clicked, filters.KEY_MODELS)
+        filters.granularity_control(tokens["date"], key="models_granularity")
 
     st.caption(
         "Costs use the primary provider's grid. For the subscription-vs-usage "

@@ -57,6 +57,11 @@ def _drain_pending() -> None:
     if st.session_state.pop(_PENDING_RESET, False):
         for k in _FILTER_KEYS:
             st.session_state.pop(k, None)
+        # Also clear the Explorer's local drill (day / session focus): otherwise
+        # Reset leaves the Explorer stuck on the last drilled session while every
+        # other page clears.
+        for k in ("drill_date", "drill_session"):
+            st.session_state.pop(k, None)
     for k in _FILTER_KEYS:
         pending = k + _PENDING_SUFFIX
         if pending in st.session_state:

@@ -37,15 +37,14 @@ _ABBREV_JS = (
 
 
 def _cost_by_token_type_option(
-    tokens: pd.DataFrame, primary: str
-) -> tuple[dict[str, Any] | None, list[str], bool]:
-    """Stacked daily (or weekly) bar of cost by token type, + a date brush.
+    tokens: pd.DataFrame, primary: str, granularity: str
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Stacked bar of cost by token type, bucketed by ``granularity`` (Day / Week
+    / Month), + a date brush.
 
-    Aggregates to weekly when the date span exceeds 30 days, which avoids ~160
-    hairline bars that read as texture rather than data (6.7). Returns the
-    ECharts option, the ordered x-axis date labels (for the brush handler), and
-    whether weekly aggregation is active (so a selection can be widened to cover
-    the whole week).
+    Returns the ECharts option and the ordered x-axis **period-start** labels (ISO
+    ``YYYY-MM-DD``: the day, the Monday, or the first-of-month) used by the brush
+    handler and the click→date-range mapping (:func:`_expand_period`).
     """
     col = data.cost_col(primary)
     daily = (
@@ -55,20 +54,17 @@ def _cost_by_token_type_option(
         .sort_values("date")
     )
     if daily.empty:
-        return None, [], False
+        return None, []
 
     dates = pd.to_datetime(daily["date"], utc=True)
-    date_span = int((dates.max() - dates.min()).total_seconds() / 86400) if len(dates) > 1 else 0
-    weekly = date_span > 30
-
-    if weekly:
-        # Floor each date to the Monday of its ISO week.
-        dow = dates.dt.dayofweek  # Monday = 0
-        daily = daily.assign(_x=(dates - pd.to_timedelta(dow, unit="D")).dt.strftime("%Y-%m-%d"))
-        grain = "week"
-    else:
-        daily = daily.assign(_x=pd.to_datetime(daily["date"], utc=True).dt.strftime("%Y-%m-%d"))
-        grain = "day"
+    if granularity == "Week":
+        # Floor to the Monday of the ISO week.
+        starts = (dates - pd.to_timedelta(dates.dt.dayofweek, unit="D")).dt.strftime("%Y-%m-%d")
+    elif granularity == "Month":
+        starts = dates.dt.strftime("%Y-%m-01")
+    else:  # Day
+        starts = dates.dt.strftime("%Y-%m-%d")
+    daily = daily.assign(_x=starts)
 
     daily = daily.groupby(["_x", "token_type_label"], as_index=False)[[col]].sum()
     labels = sorted(daily["_x"].unique().tolist())
@@ -89,35 +85,44 @@ def _cost_by_token_type_option(
     c = echarts.colors()
     option = echarts.base_option()
     option["title"] = {
-        "text": f"Cost by token type per {grain} ({primary})",
+        "text": f"Cost by token type per {granularity.lower()} ({primary})",
         "left": 0,
         "textStyle": {"color": c["text"], "fontSize": 16, "fontWeight": 600},
     }
     option["grid"] = {"left": 56, "right": 24, "top": 48, "bottom": 72, "containLabel": True}
     option["tooltip"].update({"trigger": "axis", "axisPointer": {"type": "shadow"}})
-    option["xAxis"] = echarts.category_axis(labels)
+    xaxis = echarts.category_axis(labels)
+    if granularity == "Month":
+        # Show YYYY-MM, not the YYYY-MM-01 period-start key.
+        xaxis["axisLabel"] = {
+            **xaxis.get("axisLabel", {}),
+            "formatter": echarts.js("function(v){return v.slice(0,7);}"),
+        }
+    option["xAxis"] = xaxis
     option["yAxis"] = echarts.value_axis(money=True)
     option["series"] = series
     echarts.brush_toolbox(option)
-    return option, labels, weekly
+    return option, labels
 
 
-def _expand_weekly(value: Any) -> Any:
-    """Widen a week-Monday label to its inclusive 7-day span (``+6`` days).
+def _expand_period(value: Any, granularity: str) -> Any:
+    """Widen a clicked/brushed period-start label to its inclusive date range.
 
-    The trend's x labels are week-start Mondays when aggregated weekly; a click
-    or brush returns those Mondays, so without this the inclusive date filter
-    would drop the last six days of the selected week.
+    The x-axis categories are period *start* dates (day / Monday / first-of-month);
+    a click returns one, a brush returns ``[start, end]``. This expands the end to
+    the period's last day so the date filter covers the whole bucket(s).
     """
-
-    def plus6(d: str) -> str:
-        return str((pd.to_datetime(d) + pd.Timedelta(days=6)).strftime("%Y-%m-%d"))
-
     if isinstance(value, str):
-        return [value, plus6(value)]
-    if isinstance(value, (list, tuple)) and len(value) == 2:
-        return [str(value[0]), plus6(str(value[1]))]
-    return value
+        start = end = value
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        start, end = str(value[0]), str(value[1])
+    else:
+        return value
+    if granularity == "Week":
+        end = str((pd.Timestamp(end) + pd.Timedelta(days=6)).strftime("%Y-%m-%d"))
+    elif granularity == "Month":
+        end = str((pd.Timestamp(end) + pd.offsets.MonthEnd(0)).strftime("%Y-%m-%d"))
+    return [start, end]
 
 
 def _render_token_volume_section(tokens: pd.DataFrame) -> None:
@@ -375,7 +380,13 @@ def main() -> None:
     theme.section("Where the money goes")
     left, right = st.columns([3, 2])
     with left:
-        option, labels, weekly = _cost_by_token_type_option(tokens, primary)
+        # Grain read from the toggle rendered *below* the chart (session_state);
+        # defaults to a span-appropriate grain on first load. Aligns this chart
+        # with the Day/Week/Month toggle on Home and Models.
+        grain = st.session_state.get(
+            "overview_cost_granularity", data.auto_granularity(tokens["date"])
+        )
+        option, labels = _cost_by_token_type_option(tokens, primary, grain)
         if option is None:
             st.info("No dated cost for the current filters.")
         else:
@@ -389,14 +400,15 @@ def main() -> None:
                 },
             )
             value = result.get("chart_event")
-            if value is not None and weekly:
-                value = _expand_weekly(value)
+            if value is not None:
+                value = _expand_period(value, grain)
             echarts.apply_date_range(value, filters.KEY_DATE_RANGE)
             st.caption(
-                "👆 Click a bar to focus that day. "
+                "👆 Click a bar to filter to that period. "
                 "Or click the **brush** icon (top-right) and drag across the bars "
-                "to filter the whole dashboard to that date range."
+                "to filter the whole dashboard to that range."
             )
+            filters.granularity_control(tokens["date"], key="overview_cost_granularity")
     with right:
         _render_token_volume_section(tokens)
         _render_subagents_section(tokens, primary)
