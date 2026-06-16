@@ -23,9 +23,11 @@ uv run pytest                       # coverage gate: 85%
 ```
 
 Architecture and the data flow (`extract → analytics → {cli, dashboard, csv}`)
-are documented in [`docs/architecture.md`](docs/architecture.md). The CSV column
-contract lives in one place, [`prompt_analytics/schema.py`](prompt_analytics/schema.py)
-— change a column there and every writer/reader follows.
+are documented in the [Architecture](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Architecture)
+and [Codebase Guide](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Codebase-Guide)
+wiki pages. The CSV column contract lives in one place,
+[`prompt_analytics/schema.py`](prompt_analytics/schema.py) — change a column
+there and every writer/reader follows.
 
 A few ground rules:
 

@@ -1,4 +1,4 @@
-"""Overview dashboard page: cost breakdown and spend rhythm.
+"""Usage dashboard page: cost breakdown and spend rhythm.
 
 The pilot page of the Plotly -> ECharts migration (``docs/MIGRATION-ECHARTS.md``).
 It validates the **date-range cross-filter** here first, on the cost-by-token-type
@@ -352,8 +352,8 @@ def _js_array(values: list[str]) -> str:
 
 
 def main() -> None:
-    """Render the Overview page."""
-    st.title("Overview")
+    """Render the Usage page."""
+    st.title("Usage")
 
     frames_all = data.load_all()
     filters.render_sidebar(frames_all)
