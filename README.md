@@ -82,8 +82,8 @@ Prefer a UI? Install with the `dashboard` extra and point it at your own data:
 
 ```bash
 uv tool install "prompt-analytics-for-claude-code[dashboard]"
-prompt-analytics extract       # write the CSVs the dashboard reads (./output)
-prompt-analytics dashboard     # launches Streamlit on http://localhost:8501
+prompt-analytics run --categorize   # extract + snapshot + local categorize → ./output
+prompt-analytics dashboard          # launches Streamlit on http://localhost:8501
 ```
 
 No data yet, or just curious? The [**live demo**](https://prompt-analytics-demo.streamlit.app) runs the same dashboard on synthetic data. Install, data-dir resolution, and a tour of every page are in the wiki ([Dashboard](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Dashboard)).
@@ -94,7 +94,7 @@ Per-prompt rows answer questions a daily total can't. Every block below is real 
 
 ### What one prompt actually costs, by session depth
 
-The view report-style tools don't give: cost **per prompt**, bucketed by its position in the session. Here the **median prompt at depth 21–50 carries ×2.71 the depth-1 context (≈344k tokens)** — paid as cache rent on *every* turn until `/compact` resets it. `sessions --depth` prints the full distribution; the dashboard draws it as a box plot.
+The view report-style tools don't give: cost **per prompt**, bucketed by its position in the session. The mechanism is context rent — at depth 21–50 the **median request re-reads ×2.71 the depth-1 context (≈344k tokens)**, paid on *every* turn until `/compact` resets it (`context`). `sessions --depth` and the dashboard box plot then show how that translates into the per-prompt cost distribution.
 
 ### Where the bill goes: context rent
 
@@ -121,11 +121,16 @@ Plan break-even: API-equivalent vs subscription (anthropic)
 | Claude Max 5x  |   $100.00 |        $74.03 |   x0.74 |     $-25.97 |
 | Claude Max 20x |   $200.00 |        $74.03 |   x0.37 |    $-125.97 |
 +--------------------------------------------------------------------+
+  Source: demo_data CSVs.
   Over the 175-day window your usage is worth $431.85 of anthropic API
   ($74.03/month projected at this rate).
   At this rate the Claude Pro plan ($20.00/mo) pays for itself: your
-  API-equivalent is $74.03/month (x3.70 the price), an estimated $54.03/month
+  API-equivalent is $74.03/month (x3.7 the price), an estimated $54.03/month
   cheaper than paying per token.
+  Quota windows (peak utilization seen via `snapshot`): five_hour 100%,
+  seven_day 84%, seven_day_sonnet 39%. High utilization means you are
+  extracting most of the plan's allowance; low utilization means headroom
+  (or a smaller plan would do).
 ```
 
 ## Commands
@@ -153,7 +158,7 @@ Run `prompt-analytics <command> --help` for the full flag list. `extract` and `r
 
 ## Exporting data
 
-`extract` writes the canonical, inspectable, zero-dependency format: relational CSVs keyed by `prompt_id` / `session_id` (`sessions`, `prompts`, `prompts_text`, `tokens`, `token_types`, plus `quota_log` from `snapshot`) into `./output` (gitignored). `tokens.csv` holds **raw counts only** — prices are computed at read time, so a pricing change never needs a re-extract. The exact column layout is the single source of truth in [`prompt_analytics/schema.py`](prompt_analytics/schema.py); the full data flow and CSV contract are in the wiki ([Architecture → the data model](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Architecture#the-data-model-csv-contract)).
+`extract` writes the canonical, inspectable, zero-dependency format: relational CSVs keyed by `prompt_id` / `session_id` (`sessions`, `prompts`, `prompts_text`, `tokens`, `requests`, `token_types`, plus `quota_log` from `snapshot`) into `./output` (gitignored). `tokens.csv` holds **raw counts only** — prices are computed at read time, so a pricing change never needs a re-extract. The exact column layout is the single source of truth in [`prompt_analytics/schema.py`](prompt_analytics/schema.py); the full data flow and CSV contract are in the wiki ([Architecture → the data model](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Architecture#the-data-model-csv-contract)).
 
 For spreadsheets and BI tools that want one flat table, `export --flat` writes a single denormalized CSV — one row per prompt, token columns pivoted (`input_tokens`, `output_tokens`, `cache_read_tokens`, …), a `cost_<provider>_usd` column per provider, and the session fields duplicated in:
 
@@ -220,7 +225,7 @@ Cost by category
   Source: demo_data CSVs.
 ```
 
-`Token %` and `Cost %` sit next to their own columns throughout, so volume and spend are never conflated.
+`Prompt %` and `Cost %` sit next to their own columns, so volume and spend are never conflated.
 
 </details>
 
