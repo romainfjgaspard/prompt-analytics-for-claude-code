@@ -16,6 +16,8 @@ Other tools tell you what you spent **per day** or **per session**. This one goe
 
 It validates its token totals against [ccusage](https://github.com/ryoppippi/ccusage) (see [How the numbers stay accurate](#how-the-numbers-stay-accurate)). Think of it as the per-prompt dataset layer that sits alongside the report-style tools.
 
+> 📖 **Full documentation is in the [project wiki](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki)** — [Architecture](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Architecture), a [Codebase Guide](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Codebase-Guide), the complete [CLI reference](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/CLI-Commands), the [Dashboard](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Dashboard) pages, and [how the numbers stay accurate](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Accuracy-and-Pricing). This README is the quick tour.
+
 ## See it without installing anything
 
 **Two surfaces on the same data — a terminal CLI and a Streamlit dashboard.**
@@ -84,7 +86,7 @@ prompt-analytics extract       # write the CSVs the dashboard reads (./output)
 prompt-analytics dashboard     # launches Streamlit on http://localhost:8501
 ```
 
-No data yet, or just curious? The [**live demo**](https://prompt-analytics-demo.streamlit.app) runs the same dashboard on synthetic data. More in [docs/dashboard.md](docs/dashboard.md).
+No data yet, or just curious? The [**live demo**](https://prompt-analytics-demo.streamlit.app) runs the same dashboard on synthetic data. Install, data-dir resolution, and a tour of every page are in the wiki ([Dashboard](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Dashboard)).
 
 ## What it can tell you
 
@@ -144,42 +146,16 @@ Every analysis command works **on the fly** — it parses your JSONL in memory (
 | `prompts` | `--top N` `--provider` | The N most expensive prompts, with a preview. |
 | `sessions` | `--depth` \| `--top N`, `--project NAME` | Sessions ranked by cost, or `--depth` for the marginal-cost-by-depth meta-analysis; `--project` restricts to one. |
 
-<details>
-<summary><strong>More commands</strong> — power-user analyses, pricing, export &amp; pipeline</summary>
+Beyond these, there are **power-user analyses** on the request grain (`context`, `ttl`, `compactions`, `overhead`, `model-category`, `recommend`, `burn-rate`, `break-even`) and the **pricing / export / pipeline** commands (`compare`, `export`, `extract`, `snapshot`, `categorize`, `run`, `dashboard`, `config init`). The full reference, grouped by purpose with every flag, is in the wiki:
 
-**Power-user analyses** (request grain — see [What it can tell you](#what-it-can-tell-you))
-
-| Command | Key flags | What it shows |
-| --- | --- | --- |
-| `context` | `--provider` | Accumulated context per turn by session depth — the "time to `/compact`" signal. |
-| `ttl` | `--provider` | Cache-TTL expiry losses: what inter-prompt pauses cost in cache re-writes. |
-| `compactions` | `--provider` | Each `/compact` event: context before/after and the cache-rebuild cost. |
-| `overhead` | `--provider` | Fixed per-session overhead (system prompt + CLAUDE.md + MCP tools). |
-| `model-category` | `--whatif MODEL` `--provider` | Cost by model × category; `--whatif` re-prices every cell on another model. |
-| `recommend` | `--min-prompts N` `--compact-at K` | Prescriptive: what compacting long sessions earlier would have saved. |
-| `burn-rate` | `--weeks N` `--provider` | Spend trend: $/day and week over week. |
-| `break-even` | `--provider` | Plan break-even: your API-equivalent value vs a Pro/Max subscription. |
-
-**Pricing, export and pipeline**
-
-| Command | Key flags | What it shows |
-| --- | --- | --- |
-| `compare` | `--providers A,B` | The same usage priced on several grids side by side. |
-| `export` | `--flat` `--out PATH` | Denormalized export for Excel/BI (see below). |
-| `extract` | `--no-text` `--since` `--until` `--timezone` `--strict` | Write the normalized CSVs to `--output-dir`. |
-| `snapshot` | | Append current quota utilization to `quota_log.csv`. |
-| `categorize` | `--llm` `--provider` `--batch` `--model` `--limit` | Label prompts — heuristic by default, LLM opt-in. |
-| `run` | `--categorize` (+ `--llm` `--provider` `--batch` `--model`) `--no-text` `--since` … | Pipeline: extract (+ optional categorize, with full LLM passthrough) + snapshot. |
-| `dashboard` | `--output-dir` | Launch the Streamlit dashboard — **reads an extract**, so run `extract` first (needs the `dashboard` extra). |
-| `config init` | | Write a default `config.yml` into the output directory. |
-
-</details>
+- 📖 [**CLI Commands** — power-user analyses](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/CLI-Commands#power-user-analyses-request-grain)
+- 📖 [**CLI Commands** — pricing, export & pipeline](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/CLI-Commands#pricing-export-and-pipeline)
 
 Run `prompt-analytics <command> --help` for the full flag list. `extract` and `run` always regenerate the whole output atomically — there is no incremental mode to misuse, and changing the pricing never requires a re-extract (costs are computed at read time from raw counts).
 
 ## Exporting data
 
-`extract` writes the canonical, inspectable, zero-dependency format: relational CSVs keyed by `prompt_id` / `session_id` (`sessions`, `prompts`, `prompts_text`, `tokens`, `token_types`, plus `quota_log` from `snapshot`) into `./output` (gitignored). `tokens.csv` holds **raw counts only** — prices are computed at read time, so a pricing change never needs a re-extract. The exact column layout is the single source of truth in [`prompt_analytics/schema.py`](prompt_analytics/schema.py); the full data flow is documented in [`docs/architecture.md`](docs/architecture.md).
+`extract` writes the canonical, inspectable, zero-dependency format: relational CSVs keyed by `prompt_id` / `session_id` (`sessions`, `prompts`, `prompts_text`, `tokens`, `token_types`, plus `quota_log` from `snapshot`) into `./output` (gitignored). `tokens.csv` holds **raw counts only** — prices are computed at read time, so a pricing change never needs a re-extract. The exact column layout is the single source of truth in [`prompt_analytics/schema.py`](prompt_analytics/schema.py); the full data flow and CSV contract are in the wiki ([Architecture → the data model](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Architecture#the-data-model-csv-contract)).
 
 For spreadsheets and BI tools that want one flat table, `export --flat` writes a single denormalized CSV — one row per prompt, token columns pivoted (`input_tokens`, `output_tokens`, `cache_read_tokens`, …), a `cost_<provider>_usd` column per provider, and the session fields duplicated in:
 
@@ -191,7 +167,7 @@ Every command also takes `--format json` (a `{title, rows, notes}` object with r
 
 ## Pricing providers
 
-Costs are computed at read time from a generic multi-provider grid ([`prompt_analytics/data/pricing.yml`](prompt_analytics/data/pricing.yml)). Two ship by default — **`anthropic`** (published API rates) and **`copilot`** (the GitHub Copilot equivalent) — so `compare` answers *"what would this usage cost billed through Copilot instead of the API?"*. Add any rate card under `providers:` (an internal plan, a Bedrock tier, a negotiated rate) or pass `--pricing ./my.yml`; the bundled grid is kept honest by a weekly CI drift job (LiteLLM + the live Copilot page). See [CONTRIBUTING.md](CONTRIBUTING.md) for the schema and lookup rules.
+Costs are computed at read time from a generic multi-provider grid ([`prompt_analytics/data/pricing.yml`](prompt_analytics/data/pricing.yml)). Two ship by default — **`anthropic`** (published API rates) and **`copilot`** (the GitHub Copilot equivalent) — so `compare` answers *"what would this usage cost billed through Copilot instead of the API?"*. Add any rate card under `providers:` (an internal plan, a Bedrock tier, a negotiated rate) or pass `--pricing ./my.yml`; the bundled grid is kept honest by a weekly CI drift job (LiteLLM + the live Copilot page). See [CONTRIBUTING.md](CONTRIBUTING.md) for the schema, or the wiki for [how pricing works](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Accuracy-and-Pricing#how-pricing-works) (lookup rules, drift job).
 
 <details>
 <summary><strong>Example: <code>compare</code> across providers</strong></summary>
@@ -264,13 +240,11 @@ Claude Code writes a single assistant message as **several JSONL lines carrying 
 
 The parser counts each response exactly once: for a given `message.id + requestId` it keeps the **largest** usage snapshot (ties broken by the first line, so a message straddling midnight belongs to its start day). Deduplication is **global across all files**, not per session — that is what corrects resumed / `--resume` sessions, where the same records are replayed into a new file.
 
-On top of dedup, the extractor also:
+On top of dedup, the extractor filters fake prompts (`isMeta`, `<command-*>` blocks, interruptions, the post-compaction notice — kept out of `prompts.csv` but still counted against the session), rolls **sub-agent** (`isSidechain`) cost into the parent prompt, and splits cache writes by TTL (`cache_write_5m` 1.25× vs `cache_write_1h` 2×).
 
-- **Filters fake prompts** — `isMeta` entries, `<command-name>` / `<local-command-stdout>` blocks, `[Request interrupted by user]`, and the synthetic post-compaction "continuation" message are kept out of `prompts.csv` and out of categorization, while their token usage is still counted against the session.
-- **Has an explicit sidechain / sub-agent policy** — inline `isSidechain` events and separate `subagents/*.jsonl` files are parsed and their cost is rolled into the parent prompt (so nothing is silently under-counted), but they are excluded from the parent's `assistant_turns` / `tool_calls`.
-- **Splits cache writes by TTL** — `cache_write_5m` (1.25×) vs `cache_write_1h` (2×), and counts `server_tool_use` requests separately (billed per request, not per token).
+These totals reconcile **bucket-for-bucket with `bunx ccusage --json`** (day × model) on real history — the reconciliation is scripted in `scripts/reconcile_ccusage.py`. Each command prints its data source, and `extract` ends with a loud report so a silent format break surfaces immediately.
 
-These totals reconcile **bucket-for-bucket with `bunx ccusage --json`** (day × model) on real history — the reconciliation is scripted in `scripts/reconcile_ccusage.py`. Each command also prints its data source, and `extract` ends with a loud report (files read / skipped, unknown event types, unpriced models, Claude Code versions seen) so a silent format break surfaces immediately.
+- 📖 Full detail: [**Accuracy and Pricing**](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Accuracy-and-Pricing) — [why the counts are right](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Accuracy-and-Pricing#why-the-token-counts-are-right), [ccusage reconciliation](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Accuracy-and-Pricing#reconciliation-against-ccusage), and the [V7 invariant](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Accuracy-and-Pricing#the-v7-invariant).
 
 ## Privacy
 
