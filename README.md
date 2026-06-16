@@ -90,29 +90,27 @@ No data yet, or just curious? The [**live demo**](https://prompt-analytics-demo.
 
 ## What it can tell you
 
-Per-prompt rows turn into answers a daily total can't give. Every block below is real output from the bundled demo dataset (`--from-csv demo_data`); on your machine the source line reads `live parse of ~/.claude/projects`.
+Per-prompt rows answer questions a daily total can't. Every block below is real output from the bundled demo dataset (`--from-csv demo_data`); on your machine the source line reads `live parse of ~/.claude/projects`.
 
 ### What one prompt actually costs, by session depth
 
-This is the view the report-style tools don't give. Priced **per prompt** and bucketed by its position in the session: on this dataset the **median prompt at depth 21–50 carries ×2.71 the depth-1 context (≈344k tokens)** — and pays that cache rent on *every* turn until `/compact` or a new session resets it. `sessions --depth` prints the full distribution (median, box, p5–p95 tail, `n` per band); the dashboard's **Session depth** page draws it as a box plot.
+The view report-style tools don't give: cost **per prompt**, bucketed by its position in the session. Here the **median prompt at depth 21–50 carries ×2.71 the depth-1 context (≈344k tokens)** — paid as cache rent on *every* turn until `/compact` resets it. `sessions --depth` prints the full distribution; the dashboard draws it as a box plot.
 
 ### Where the bill goes: context rent
 
-Almost none of your spend is the text you type or the model writes — on this dataset **83% of the bill is "context rent"**: the cache reads and writes that re-send the conversation every turn (`by-token-type` breaks it down — cache reads alone are 94% of *tokens* but 46% of *cost*). Those aggregate token-type totals overlap with the report-style tools; the difference here is that the same numbers are also available **per prompt**.
+Almost none of your spend is the text you type or the model writes — **83% of the bill is "context rent"**, the cache reads and writes that re-send the conversation every turn (`by-token-type`: cache reads alone are 94% of *tokens* but 46% of *cost*). The same numbers are now also available **per prompt**.
 
-### TTL expiry and compaction: the hidden cache costs
+### The hidden cache costs: TTL expiry, compaction, overhead
 
-Cache entries expire (5-minute or 1-hour TTL); pause longer and the next turn pays to **re-write** the whole context. `ttl` attributes those re-writes to the pause that caused them — here ≈$36 of re-writes across pauses of 5m–1h, plus a little more after longer ones.
-
-`compactions` does the mirror analysis for `/compact`: context before/after and the cache-rebuild cost of the first post-compaction turn (on this dataset, 3 events, a median 266,598 → 85,905 tokens, −67.8%, rebuilt for $0.43 total). `overhead` isolates the fixed per-session cost (system prompt + CLAUDE.md + MCP tools ≈ 118,949 tokens here, $0.69 median per session).
+Cache entries expire (5m / 1h TTL); pause longer and the next turn pays to **re-write** the whole context. `ttl` blames those re-writes on the pause that caused them (≈$36 here). `compactions` does the mirror for `/compact` (context before/after + the rebuild cost), and `overhead` isolates the fixed per-session cost (system prompt + CLAUDE.md + MCP tools).
 
 ### Subagents, billed back to the prompt that spawned them
 
-Sub-agent (`isSidechain`) work is parsed and its cost rolled into the parent prompt, so nothing is under-counted. `summary` calls it out (`Subagents: $6.19 (1.4% of anthropic cost)`) and `by-model` adds a per-model Subagents column.
+Sub-agent (`isSidechain`) work is parsed and rolled into the parent prompt, so nothing is under-counted — `summary` calls it out (`Subagents: $6.19`) and `by-model` adds a per-model column.
 
 ### Is a Pro/Max plan worth it vs the API?
 
-`break-even` prices your whole history on the per-token grid (the API-equivalent), projects it to a month, and compares it to each flat-rate plan:
+`break-even` prices your whole history on the per-token grid, projects it to a month, and compares each flat-rate plan:
 
 ```text
 Plan break-even: API-equivalent vs subscription (anthropic)
@@ -197,7 +195,10 @@ prompt-analytics categorize        # heuristic, writes categories.csv
 prompt-analytics by-category
 ```
 
-A weighted FR+EN regex classifier labels each prompt across eleven categories (plan / implementation / debug / refactor / review / test / docs / ops / question / followup / other), and an **observed** complexity 1–5 is derived from the effort it actually triggered (turns, tool calls, length, cost) — a measurement, not a guess.
+A weighted FR+EN regex classifier labels each prompt across eleven categories (plan / implementation / debug / refactor / review / test / docs / ops / question / followup / other), and an **observed** complexity 1–5 is derived from the effort it actually triggered (turns, tool calls, length, cost) — a measurement, not a guess. Read `$/prompt (med)` alongside the total: a category can top the bill on volume alone, but a high median per prompt flags work that is *intrinsically* expensive (here `debug` is costly both ways at $0.73/prompt, while `followup` stays cheap at $0.26).
+
+<details>
+<summary><strong>Example: <code>by-category</code> output</strong></summary>
 
 ```text
 Cost by category
@@ -219,7 +220,9 @@ Cost by category
   Source: demo_data CSVs.
 ```
 
-The `$/prompt (med)` column is the one to read alongside the total: a category can top the bill just by volume, but a high median per prompt is what flags work that is *intrinsically* expensive — here `debug` is costly both ways ($0.73/prompt) while `followup` stays cheap ($0.26). `Token %` and `Cost %` sit next to their own columns throughout, so volume and spend are never conflated.
+`Token %` and `Cost %` sit next to their own columns throughout, so volume and spend are never conflated.
+
+</details>
 
 <details>
 <summary><strong>Optional LLM refinement</strong></summary>
