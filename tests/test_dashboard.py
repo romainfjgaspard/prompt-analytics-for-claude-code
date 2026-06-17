@@ -213,6 +213,40 @@ def test_apply_filters_by_model(no_session_state: None) -> None:
     assert set(out["sessions"]["session_id"]) == {"s1", "s2"}
 
 
+def test_apply_filters_all_models_selected_keeps_model_less_prompt(
+    no_session_state: None,
+) -> None:
+    """Selecting every model is "all", not a filter: a prompt with a blank model
+    (no billed assistant turn) must still be counted, so the KPI total matches the
+    extract total. A proper subset, however, drops it."""
+    from prompt_analytics.dashboard import filters
+
+    frames = _frames()
+    prompts = pd.concat(
+        [
+            frames["prompts"],
+            pd.DataFrame(
+                {
+                    "prompt_id": ["p4"],
+                    "session_id": ["s1"],
+                    "model": [""],  # model-less: stripped from the filter chips
+                    "project": ["alpha"],
+                    "timestamp": pd.to_datetime(["2026-05-04T10:00:00Z"], utc=True),
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+    frames["prompts"] = prompts
+    all_models = ["claude-opus-4-8", "claude-haiku-4-5"]
+
+    kept = filters.apply_filters(frames, models=all_models)
+    assert set(kept["prompts"]["prompt_id"]) == {"p1", "p2", "p3", "p4"}
+
+    narrowed = filters.apply_filters(frames, models=["claude-opus-4-8"])
+    assert set(narrowed["prompts"]["prompt_id"]) == {"p1", "p3"}
+
+
 def test_apply_filters_by_project(no_session_state: None) -> None:
     from prompt_analytics.dashboard import filters
 

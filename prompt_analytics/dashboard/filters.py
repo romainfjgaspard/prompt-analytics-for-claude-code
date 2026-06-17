@@ -137,6 +137,21 @@ def _to_date(value: object) -> _dt.date | None:
     return ts.date()
 
 
+def _restricts(selected: list[Any] | None, available: list[Any]) -> bool:
+    """Whether a multiselect selection actually narrows the data.
+
+    A selection that covers *every* available value (or is empty) means "all":
+    applying it as a filter would needlessly drop rows whose value is blank/NaN
+    and therefore absent from ``available`` -- e.g. a model-less prompt with no
+    billed assistant turn, which ``_options`` strips from the chips. Counting it
+    out of the totals on a default (everything-selected) view is exactly the
+    KPI/extract mismatch we want to avoid, so only a *proper* subset filters.
+    """
+    if not selected:
+        return False
+    return not set(available) <= set(selected)
+
+
 def apply_filters(
     frames: dict[str, pd.DataFrame],
     *,
@@ -175,14 +190,15 @@ def apply_filters(
 
     if not prompts.empty:
         mask = pd.Series(True, index=prompts.index)
+        opts = _options(frames)
 
-        if models and "model" in prompts.columns:
+        if _restricts(models, opts["models"]) and "model" in prompts.columns:
             mask &= prompts["model"].isin(models)
 
-        if projects and "project" in prompts.columns:
+        if _restricts(projects, opts["projects"]) and "project" in prompts.columns:
             mask &= prompts["project"].isin(projects)
 
-        if categories and "category" in prompts.columns:
+        if _restricts(categories, opts["categories"]) and "category" in prompts.columns:
             mask &= prompts["category"].isin(categories)
 
         if date_range and "timestamp" in prompts.columns:
