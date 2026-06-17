@@ -44,6 +44,7 @@ __all__ = [
     "load_dataset",
     "dataset_from_csvs",
     "filter_project",
+    "filter_dates",
     "known_providers",
     "summary",
     "by_project",
@@ -60,6 +61,7 @@ __all__ = [
     "model_category",
     "recommendations",
     "burn_rate",
+    "timeline",
     "break_even",
     "compare_providers",
     "flat_export",
@@ -346,6 +348,52 @@ def filter_project(ds: Dataset, project: str) -> Dataset:
     )
 
 
+def filter_dates(ds: Dataset, since: str | None, until: str | None) -> Dataset:
+    """A view of ``ds`` restricted to prompts dated within ``[since, until]``.
+
+    ``since``/``until`` are inclusive ``YYYY-MM-DD`` strings (either may be
+    None). A real prompt is kept when the calendar day of its stored
+    ``timestamp`` falls in the range -- a lexical compare on the ``YYYY-MM-DD``
+    prefix, the same day convention as ``burn-rate``/``timeline`` (no timezone
+    re-interpretation at read time). Tokens and requests follow their prompt by
+    ``prompt_id``; pseudo-prompt rows (continuations, with no prompts.csv row
+    and no timestamp) ride along when their session keeps at least one prompt.
+    Sessions left with no kept prompt are dropped.
+    """
+    if not since and not until:
+        return ds
+
+    def _in_range(day: str) -> bool:
+        if not day:
+            return False
+        if since and day < since:
+            return False
+        return not (until and day > until)
+
+    kept_prompts = [row for row in ds.prompts if _in_range(_parse_day(row.get("timestamp", "")))]
+    kept_prompt_ids = {row["prompt_id"] for row in kept_prompts}
+    kept_session_ids = {row["session_id"] for row in kept_prompts}
+    real_prompt_ids = _real_prompt_ids(ds)
+
+    def _keep_usage(row: dict[str, Any]) -> bool:
+        pid = row.get("prompt_id", "")
+        if pid in real_prompt_ids:
+            return pid in kept_prompt_ids
+        # Pseudo-prompt (continuation) rows have no timestamp: keep them with
+        # their session so per-session costs stay coherent.
+        return row.get("session_id", "") in kept_session_ids
+
+    return Dataset(
+        sessions=[row for row in ds.sessions if row["session_id"] in kept_session_ids],
+        prompts=kept_prompts,
+        tokens=[row for row in ds.tokens if _keep_usage(row)],
+        categories=ds.categories,
+        source=ds.source,
+        pricing_path=ds.pricing_path,
+        requests=[row for row in ds.requests if _keep_usage(row)],
+    )
+
+
 def known_providers(pricing_path: Path | None = None) -> list[str]:
     """The provider keys available in the pricing file, in file order."""
     return list(load_pricing(pricing_path).get("providers", {}))
@@ -542,8 +590,8 @@ def summary(ds: Dataset, providers: list[str] | None = None) -> TableResult:
     )
 
 
-def by_project(ds: Dataset, provider: str, *, pareto: bool = False) -> TableResult:
-    """Cost/tokens/prompts per project, sorted by cost (optionally cumulative)."""
+def by_project(ds: Dataset, provider: str) -> TableResult:
+    """Cost/tokens/prompts per project, sorted by cost, with a cumulative %."""
     engine = CostEngine(provider, ds.pricing_path)
     prompt_project = _project_of(ds)
     session_project = _session_project(ds)
@@ -576,11 +624,8 @@ def by_project(ds: Dataset, provider: str, *, pareto: bool = False) -> TableResu
             ),
             "cost_usd": round(project_cost, 4),
             "share_pct": round(100 * project_cost / total_cost, 1) if total_cost else 0.0,
+            "cumulative_pct": round(100 * cumulative / total_cost, 1) if total_cost else 0.0,
         }
-        if pareto:
-            out_row["cumulative_pct"] = (
-                round(100 * cumulative / total_cost, 1) if total_cost else 0.0
-            )
         rows.append(out_row)
 
     columns = [
@@ -590,9 +635,8 @@ def by_project(ds: Dataset, provider: str, *, pareto: bool = False) -> TableResu
         Column("token_share_pct", "Token %", "pct"),
         Column("cost_usd", f"Cost ({provider})", "money"),
         Column("share_pct", "Cost %", "pct"),
+        Column("cumulative_pct", "Cumulative", "pct"),
     ]
-    if pareto:
-        columns.append(Column("cumulative_pct", "Cumulative", "pct"))
     notes = [_source_note(ds)]
     if (note := engine.note()) is not None:
         notes.append(note)
@@ -1800,6 +1844,81 @@ def burn_rate(ds: Dataset, provider: str, *, weeks: int = 8) -> TableResult:
             Column("cost_usd", "Cost", "money"),
             Column("per_day_usd", "$/day", "money"),
             Column("vs_prev_pct", "vs prev week", "pct"),
+        ],
+        rows,
+        notes,
+    )
+
+
+TIMELINE_PERIODS: tuple[str, ...] = ("day", "week", "month")
+
+_PERIOD_LABEL = {"day": "Day", "week": "Week of", "month": "Month"}
+
+
+def _period_bucket(day: str, by: str) -> str:
+    """Bucket a ``YYYY-MM-DD`` day into its day / ISO-week-Monday / month key."""
+    if by == "week":
+        return _monday(day)
+    if by == "month":
+        return day[:7]
+    return day
+
+
+def timeline(ds: Dataset, provider: str, *, by: str = "day") -> TableResult:
+    """Cost, prompts and tokens grouped by calendar period.
+
+    ``by`` is one of ``day`` / ``week`` / ``month``. Each real prompt's cost and
+    tokens are attributed to the period of its ``timestamp`` and summed; periods
+    are listed chronologically, each with its share of the total cost. Like
+    ``burn-rate``, undated usage (continuation pseudo-prompts) is left out -- it
+    is small and not attributable to a day.
+    """
+    if by not in TIMELINE_PERIODS:
+        raise ValueError(f"Unknown period {by!r}; expected one of {', '.join(TIMELINE_PERIODS)}.")
+    engine = CostEngine(provider, ds.pricing_path)
+    prompt_costs = _prompt_costs(ds, engine)
+    token_counts = _prompt_token_counts(ds)
+
+    cost: defaultdict[str, float] = defaultdict(float)
+    prompts: Counter[str] = Counter()
+    tokens: Counter[str] = Counter()
+    for row in ds.prompts:
+        day = _parse_day(row.get("timestamp", ""))
+        if not day:
+            continue
+        bucket = _period_bucket(day, by)
+        pid = row["prompt_id"]
+        cost[bucket] += prompt_costs.get(pid, 0.0)
+        prompts[bucket] += 1
+        tokens[bucket] += _token_total(token_counts.get(pid, Counter()))
+
+    total_cost = sum(cost.values())
+    rows: list[dict[str, Any]] = [
+        {
+            "period": bucket,
+            "prompts": prompts[bucket],
+            "tokens": tokens[bucket],
+            "cost_usd": round(cost[bucket], 4),
+            "share_pct": round(100 * cost[bucket] / total_cost, 1) if total_cost else 0.0,
+        }
+        for bucket in sorted(cost)
+    ]
+
+    notes = [_source_note(ds)]
+    if not rows:
+        notes.append("No dated prompts to group.")
+    if (note := engine.note()) is not None:
+        notes.append(note)
+    if (lc_note := engine.long_context_note()) is not None:
+        notes.append(lc_note)
+    return TableResult(
+        f"Cost by {by}",
+        [
+            Column("period", _PERIOD_LABEL[by]),
+            Column("prompts", "Prompts", "int"),
+            Column("tokens", "Tokens", "int"),
+            Column("cost_usd", f"Cost ({provider})", "money"),
+            Column("share_pct", "Cost %", "pct"),
         ],
         rows,
         notes,

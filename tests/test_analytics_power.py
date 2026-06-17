@@ -277,6 +277,51 @@ def test_burn_rate_no_dated_prompts():
 
 
 # ---------------------------------------------------------------------------
+# Timeline: cost/prompts/tokens grouped by day / week / month.
+# ---------------------------------------------------------------------------
+
+
+def test_timeline_by_day(burn_ds):
+    result = analytics.timeline(burn_ds, "anthropic", by="day")
+    assert result.title == "Cost by day"
+    assert [row["period"] for row in result.rows] == ["2026-05-04", "2026-05-05", "2026-05-11"]
+    by_day = _rows_by(result, "period")
+    assert by_day["2026-05-04"]["cost_usd"] == 0.025
+    assert by_day["2026-05-04"]["tokens"] == 1_000
+    assert by_day["2026-05-04"]["prompts"] == 1
+    assert by_day["2026-05-11"]["cost_usd"] == 0.1
+    # Shares are of the $0.175 total.
+    assert by_day["2026-05-11"]["share_pct"] == 57.1
+
+
+def test_timeline_by_week_matches_burn_rate_weeks(burn_ds):
+    result = analytics.timeline(burn_ds, "anthropic", by="week")
+    by_week = _rows_by(result, "period")
+    assert by_week["2026-05-04"]["cost_usd"] == 0.075
+    assert by_week["2026-05-11"]["cost_usd"] == 0.1
+
+
+def test_timeline_by_month(burn_ds):
+    result = analytics.timeline(burn_ds, "anthropic", by="month")
+    assert [row["period"] for row in result.rows] == ["2026-05"]
+    assert result.rows[0]["cost_usd"] == 0.175
+    assert result.rows[0]["tokens"] == 7_000
+    assert result.rows[0]["share_pct"] == 100.0
+
+
+def test_timeline_rejects_unknown_period(burn_ds):
+    with pytest.raises(ValueError, match="Unknown period"):
+        analytics.timeline(burn_ds, "anthropic", by="quarter")
+
+
+def test_timeline_no_dated_prompts():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test")
+    result = analytics.timeline(empty, "anthropic")
+    assert result.rows == []
+    assert any("No dated prompts" in note for note in result.notes)
+
+
+# ---------------------------------------------------------------------------
 # 3.1 Plan break-even: API-equivalent vs subscription.
 # ---------------------------------------------------------------------------
 

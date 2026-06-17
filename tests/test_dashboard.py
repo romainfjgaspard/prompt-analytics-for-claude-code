@@ -114,7 +114,7 @@ def test_demo_session_depth_opening_is_most_expensive() -> None:
 
 def test_demo_by_project_shares_sum_to_100() -> None:
     ds = analytics.dataset_from_csvs(DEMO_DIR)
-    rows = analytics.by_project(ds, "anthropic", pareto=True).rows
+    rows = analytics.by_project(ds, "anthropic").rows
     assert len(rows) == 5
     assert rows[-1]["cumulative_pct"] == pytest.approx(100.0, abs=0.2)
 

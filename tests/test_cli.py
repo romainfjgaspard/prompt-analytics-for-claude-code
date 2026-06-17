@@ -442,6 +442,8 @@ ANALYSIS_COMMANDS = [
     ("model-category",),
     ("model-category", "--whatif", "claude-sonnet-4-6"),
     ("burn-rate",),
+    ("timeline",),
+    ("timeline", "--by", "month"),
     ("prompts", "--top", "3"),
     ("sessions",),
     ("sessions", "--depth"),
@@ -473,10 +475,46 @@ def test_json_values_are_raw(data, capsys):
     assert isinstance(row["cost_usd"], float)
 
 
-def test_pareto_cumulative_reaches_100(data, capsys):
-    assert main(_args(data, "by-project", "--pareto", "--format", "json")) == 0
+def test_by_project_cumulative_reaches_100(data, capsys):
+    # The cumulative %% column is now shown by default (no --pareto needed).
+    assert main(_args(data, "by-project", "--format", "json")) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["rows"][-1]["cumulative_pct"] == 100.0
+
+
+def test_pareto_flag_still_accepted_as_noop(data, capsys):
+    # Deprecated but accepted, so published `by-project --pareto` keeps working.
+    assert main(_args(data, "by-project", "--pareto", "--format", "json")) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "cumulative_pct" in payload["rows"][0]
+
+
+def test_since_until_narrows_to_one_project(data, capsys):
+    # Fixtures: alpha 2026-05-01, beta 2026-05-15, gamma 2026-06-01.
+    assert main(_args(data, "by-project", "--since", "2026-06-01", "--format", "json")) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["project"] for row in payload["rows"]] == ["gamma-web"]
+
+
+def test_until_drops_later_projects(data, capsys):
+    assert main(_args(data, "by-project", "--until", "2026-05-10", "--format", "json")) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["project"] for row in payload["rows"]] == ["alpha-api"]
+
+
+def test_since_empty_range_exits_1(data, capsys):
+    assert main(_args(data, "summary", "--since", "2999-01-01")) == 1
+    assert "No data in the date range" in capsys.readouterr().err
+
+
+def test_until_invalid_date_exits_2(data, capsys):
+    assert main(_args(data, "summary", "--until", "2026-13-40")) == 2
+    assert "Invalid --until" in capsys.readouterr().err
+
+
+def test_timeline_dispatch(data, capsys):
+    assert main(_args(data, "timeline", "--by", "week")) == 0
+    assert "Cost by week" in capsys.readouterr().out
 
 
 def test_prompts_top_limits_row_count(data, capsys):
