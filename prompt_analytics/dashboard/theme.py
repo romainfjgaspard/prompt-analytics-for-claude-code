@@ -131,9 +131,15 @@ CATEGORY_COLORS = {
     "plan": "#6366F1",
     "review": "#0891B2",
     "followup": "#64748B",
+    # feedback = course-correction/steering: a slate kin to followup but warmer,
+    # so the two conversational buckets read as a family yet stay distinct.
+    "feedback": "#9F7AEA",
     # Support
     "docs": "#BE185D",
     "test": "#65A30D",
+    # notification = harness plumbing (background-task finished), not a prompt;
+    # a muted grey near "other" since it's normally hidden from the category view.
+    "notification": "#CBD5E1",
     "other": "#94A3B8",
     "(uncategorized)": "#D1D5DB",
 }

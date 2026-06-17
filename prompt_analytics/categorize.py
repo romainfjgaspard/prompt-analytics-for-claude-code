@@ -56,6 +56,8 @@ CATEGORIES = {
     "ops",
     "question",
     "followup",
+    "feedback",
+    "notification",
     "other",
 }
 COMPLEXITIES = {"1", "2", "3", "4", "5"}
@@ -63,7 +65,7 @@ COMPLEXITIES = {"1", "2", "3", "4", "5"}
 # Version stamp written to ``classifier_model`` by the heuristic classifier.
 # Bumping it makes the next heuristic run re-classify rows stamped with an
 # older heuristic version (LLM-classified rows are never touched).
-HEURISTIC_VERSION = "heuristic-v2"
+HEURISTIC_VERSION = "heuristic-v3"
 _HEURISTIC_PREFIX = "heuristic-"
 
 # Tie-break order for the heuristic classifier: on equal scores the more
@@ -81,6 +83,11 @@ _TIE_BREAK_ORDER = (
     "implementation",
     "question",
     "followup",
+    # feedback sits last before "other": it is low-weight discourse/steering, so
+    # on an equal score any concrete intent above (incl. question and the
+    # stuck-assistant followup) wins -- feedback only takes a prompt when nothing
+    # more specific fired.
+    "feedback",
     "other",
 )
 
@@ -99,6 +106,11 @@ Category (pick one):
 - ops: git operations (commit, push, merge, PR), deploys, running scripts or jobs
 - question: explanations, understanding
 - followup: short conversational steering ("yes", "ok", "continue", option picks)
+- feedback: reacting to or correcting the assistant's work without a new task -- \
+critique, course-correction, preferences ("no, rather like this", "almost, but the \
+order is wrong", "actually I changed my mind", "still the same", "not quite")
+- notification: a harness-injected task-notification block (background task / \
+sub-agent finished) -- not a human prompt
 - other: everything else
 
 Complexity (1-5):
@@ -113,6 +125,7 @@ Examples:
 "fix the null pointer in user.py" -> debug|2
 "commit and push the branch, then open a PR" -> ops|2
 "refactor the auth module to use the new token format" -> refactor|3
+"no, rather put the legend on the right, it overlaps the bars" -> feedback|2
 "analyze the project and propose an architecture for the distributed cache" -> plan|5"""
 
 
@@ -345,8 +358,9 @@ _HEURISTIC_RULES: list[tuple[str, list[str], float]] = [
         [
             # Nudges at a stalled assistant ("tu es bloqué?", "tu t'es encore
             # figé") and restart orders. Weighted above debug so the "planté"
-            # of a stuck *assistant* does not read as a code crash.
-            r"\btu (?:t'es|es|étais|avais l'air|as l'air)\b[^.?!\n]{0,24}"
+            # of a stuck *assistant* does not read as a code crash. Accent-
+            # tolerant ("tu etais bloque" is the common unaccented form).
+            r"\btu (?:t'es|es|[eé]tais|[eé]tait|avais l'air|as l'air)\b[^.?!\n]{0,24}"
             r"(?:bloqu|fig[eé]|plant[eé]|gel[eé])",
             r"\bencore (?:bloqu[eé]|fig[eé]|plant[eé])",
             r"^\s*reprend(?:s|re)?\b",
@@ -354,6 +368,56 @@ _HEURISTIC_RULES: list[tuple[str, list[str], float]] = [
             r"^\s*continue[rsz]?\b",
         ],
         1.5,
+    ),
+    (
+        # Reacting to / steering the assistant's work without a fresh task:
+        # critique, course-correction, preferences. Low weight on purpose -- a
+        # prompt that also carries a concrete intent (debug/test/impl...) scores
+        # higher and wins; feedback only takes the prompts that would otherwise
+        # fall through to "other" (the bulk of that bucket on real usage). The
+        # markers are accent-tolerant unaccented French + EN equivalents.
+        "feedback",
+        [
+            # Course-correction / discourse markers heading a steering turn.
+            r"\ben fait\b",
+            r"\bplut[oô]t\b",
+            r"\bpar contre\b",
+            r"\bdu coup\b",
+            r"\bfinalement\b",
+            r"\b[aà] la place\b",
+            r"\ben revanche\b",
+            # The user weighing in / preferences (not asking, not tasking).
+            r"\bje pense\b",
+            r"\b[aà] mon avis\b",
+            r"\bje trouve\b",
+            r"\bselon moi\b",
+            r"\bje pr[eé]f[eè]re\b|\bj'aurais pr[eé]f[eé]r[eé]\b",
+            r"\bj'ai chang[eé] d'avis\b",
+            r"\b(?:vaudrait|vaut) mieux\b|\bce serait mieux\b|\bmieux vaut\b",
+            r"\bpas convaincu\b",
+            r"\bj'?aime pas\b|\bje n'aime pas\b",
+            # Caveated approval / critique of the assistant's output.
+            r"\bc'?est pas mal\b|\bpas mal mais\b",
+            r"\btout est (?:bon|ok) (?:sauf|mais)\b",
+            r"\b[cç]a (?:me )?(?:semble|para[iî]t) (?:bien|bon|ok)\b",
+            # "the change didn't take" -- feedback on a non-effect.
+            r"\b[cç]a (?:ne )?change rien\b",
+            r"\btoujours pareil\b",
+            r"\bm[eê]me (?:probl[eè]me|chose|souci|qu'avant)\b",
+            r"\bpas de changement\b",
+            r"\brien (?:n'a |a )?chang[eé]\b",
+            # EN equivalents.
+            r"\binstead\b",
+            r"\bactually\b",
+            r"\bon second thought\b",
+            r"\bi (?:think|prefer|feel)\b|\bi'd (?:prefer|rather)\b",
+            r"\bchanged my mind\b",
+            r"\bnot convinced\b",
+            r"\b(?:looks|sounds) (?:good|fine) but\b|\bnot bad but\b",
+            r"\bstill the same\b|\bno change\b",
+            r"\balmost (?:there|right)\b|\bnot quite\b",
+        ],
+        0.5,
     ),
 ]
 
@@ -365,14 +429,30 @@ _ACK_TOKEN = (
     r"reprends?|reprendre|recommence[rsz]?|stop|attends?|wait|merci|thanks?|"
     r"thank you|parfait|nickel|super|top|g[eé]nial|d'?accord|les deux|both|"
     r"c'?est (?:bon|ok|parti|fait|good)|[çc]a marche|fais[- ]le|fais|fait|do it|"
-    r"done|good|great|perfect|proceed|sounds good|lgtm|approved|je valide|"
-    r"on continue|next|suite|la suite|[eé]tape suivante|pour|et|\d+[a-z]?)"
+    r"done|good|great|perfect|proceed|sounds good|lgtm|approved|je valides?|"
+    r"on continue|next|suite|la suite|[eé]tape suivante|valid[eé]s?|"
+    # Short option picks: "ok pour A", "ok pour l'option 1", "oui partons sur
+    # l'etape 2", "M7". A bare letter / letter-number ref counts only inside an
+    # otherwise all-ack short string (the whole-text match guard upstream).
+    r"option|l'?option|l'?[eé]tapes?|[eé]tapes?|phase|partons|sur|"
+    r"pour|et|[a-z]\d+|[a-z]|\d+[a-z]?)"
 )
 _ACK_RE = re.compile(
     rf"^\s*{_ACK_TOKEN}(?:[\s,.!?;:…\-]+{_ACK_TOKEN})*[\s,.!?;:…\-]*$",
     re.IGNORECASE,
 )
 _FOLLOWUP_MAX_CHARS = 40
+
+# Harness chrome the transcript injects into user turns: a ``<system-reminder>``
+# prefix (date stamps, context notes) or a whole ``<task-notification>`` block.
+# Stripped before classifying so the *real* instruction after a reminder is
+# scored on its own words (and a prompt that is nothing but chrome falls through
+# to "other" instead of being mis-scored on the tag soup).
+_NOISE_WRAPPER_RE = re.compile(
+    r"<(system-reminder|task-notification)\b[^>]*>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_TASK_NOTIFICATION_RE = re.compile(r"<task-notification\b", re.IGNORECASE)
 
 _compiled_rules: list[tuple[str, list[re.Pattern[str]], float]] | None = None
 
@@ -398,8 +478,19 @@ def _classify_heuristic(text: str) -> str:
     - when no rule fires at all, a prompt that *ends* with "?" is filed under
       ``question`` instead of ``other`` (the bare "?" is too weak to outvote a
       real keyword match, but alone it is the clearest signal there is).
+
+    Harness chrome (``<system-reminder>`` / ``<task-notification>`` blocks) is
+    stripped first so the classification reflects the user's actual words. A turn
+    that is *nothing but* a task-notification (background task / sub-agent
+    finished) carries no user intent, so it gets its own ``notification`` bucket
+    -- the category view can hide it while its token cost stays counted (cost is
+    derived from tokens, not the category).
     """
+    had_notification = _TASK_NOTIFICATION_RE.search(text) is not None
+    text = _NOISE_WRAPPER_RE.sub(" ", text)
     stripped = text.strip()
+    if had_notification and not stripped:
+        return "notification"
     if len(stripped) <= _FOLLOWUP_MAX_CHARS and _ACK_RE.match(stripped):
         return "followup"
     scores: dict[str, float] = dict.fromkeys(_TIE_BREAK_ORDER, 0.0)
