@@ -133,10 +133,27 @@ def test_heuristic_other_for_blank() -> None:
         "tu es bloqué?",
         "tu avais l'air bloqué depuis super longtemps...",
         "tu t'es encore figé",
+        # Short option picks (extended ack vocabulary).
+        "ok pour A",
+        "ok pour l'option 1.",
+        "oui partons sur l'etape 2",
     ],
 )
 def test_heuristic_followup_acks_and_nudges(text: str) -> None:
     assert _classify_heuristic(text) == "followup", f"'{text}' → expected followup"
+
+
+def test_heuristic_pure_task_notification_is_notification() -> None:
+    """A turn that is nothing but a harness task-notification gets its own bucket."""
+    block = (
+        "<task-notification><task-id>bh5</task-id>"
+        "<status>completed</status>"
+        "<summary>Background command finished</summary></task-notification>"
+    )
+    assert _classify_heuristic(block) == "notification"
+    # A real instruction that merely follows a notification is classified on its
+    # own words, not swallowed by the notification bucket.
+    assert _classify_heuristic(block + " commit et push") == "ops"
 
 
 def test_heuristic_ack_prefix_does_not_shortcircuit() -> None:
@@ -206,6 +223,56 @@ def test_heuristic_fr_conjugations(text: str, expected: str) -> None:
 )
 def test_heuristic_v2_agentic_categories(text: str, expected: str) -> None:
     assert _classify_heuristic(text) == expected, f"'{text}' → expected {expected}"
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        # v3 (4.x): the "feedback" category drains the biggest real-"other"
+        # cluster -- mid-length course-correction / critique / preferences that
+        # carry no concrete task keyword. FR (mostly unaccented) + EN.
+        (
+            "c'est pas mal mais l'ordre des modeles devrait etre du plus petit au plus gros",
+            "feedback",
+        ),
+        ("en fait j'ai change d'avis, on part sur dark force", "feedback"),
+        ("non plutot mets la legende a droite, elle chevauche les barres", "feedback"),
+        ("ca change rien, c'est toujours pareil", "feedback"),
+        ("je suis pas convaincu par cette approche", "feedback"),
+        ("actually, I'd prefer the legend on the right", "feedback"),
+        ("not quite, the order is still wrong", "feedback"),
+    ],
+)
+def test_heuristic_feedback_category(text: str, expected: str) -> None:
+    assert _classify_heuristic(text) == expected, f"'{text}' → expected {expected}"
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        # A concrete intent always out-scores a low-weight discourse marker, so
+        # feedback never steals a real task prompt.
+        ("en fait corrige le bug dans user.py", "debug"),
+        ("par contre ajoute un test pour le parser", "test"),
+        # Accent-tolerant stuck-assistant nudge stays followup over a feedback
+        # marker ("a mon avis" + the unaccented "tu etais bloque").
+        ("a mon avis tu etais bloque", "followup"),
+    ],
+)
+def test_heuristic_feedback_loses_to_concrete_intent(text: str, expected: str) -> None:
+    assert _classify_heuristic(text) == expected, f"'{text}' → expected {expected}"
+
+
+def test_heuristic_strips_harness_chrome() -> None:
+    """``<system-reminder>`` / ``<task-notification>`` wrappers are removed first."""
+    # A pure system-reminder block carries no user intent -> other.
+    assert _classify_heuristic("<system-reminder>just a note</system-reminder>") == "other"
+    # The reminder prefix must not mask the real instruction after it.
+    assert _classify_heuristic("<system-reminder>note</system-reminder> commit et push") == "ops"
+    assert (
+        _classify_heuristic("<system-reminder>sent at 10:00</system-reminder> oui c'est bon")
+        == "followup"
+    )
 
 
 # ── _parse_reply edge cases ───────────────────────────────────────────────────
