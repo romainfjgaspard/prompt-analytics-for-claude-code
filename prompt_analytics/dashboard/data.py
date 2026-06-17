@@ -332,6 +332,29 @@ def load_all() -> dict[str, pd.DataFrame]:
     return _load_cached(str(directory), _mtimes_key(directory))
 
 
+def refresh_data() -> str:
+    """Re-run extract -> snapshot -> categorize for the active data directory.
+
+    Backs the sidebar "Refresh data" button so a user never has to drop to a
+    terminal to pull in new prompts: it regenerates the CSVs the dashboard reads
+    from the local ``~/.claude`` logs, snapshots the current quota, and applies
+    the **heuristic** categorizer (local, no API key, no cost -- the LLM
+    classifier stays a deliberate terminal action). The caller clears the
+    mtime-keyed cache and reruns afterwards. Returns a one-line summary for a
+    toast. Refuses to run against the bundled demo dataset (no logs to extract,
+    and it must never overwrite the committed ``demo_data``).
+    """
+    if is_demo():
+        raise RuntimeError("Refresh is disabled on the demo dataset.")
+    from prompt_analytics import categorize, extract, snapshot
+
+    directory = data_dir()
+    report = extract.run_extract(directory)
+    snapshot.run_snapshot(directory)
+    categorize.run_categorize(output_dir=str(directory))
+    return f"Extracted {report.prompts:,} prompts across {report.sessions:,} sessions."
+
+
 @st.cache_data(show_spinner=False)
 def _load_prompt_texts_cached(path_str: str, mtime: int) -> dict[str, str]:
     """Read ``prompts_text.csv`` into ``{prompt_id: full text}`` (empty if absent)."""

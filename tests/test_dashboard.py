@@ -595,3 +595,61 @@ def test_active_parts_detects_restricted_model(no_session_state: None) -> None:
         filters.get_filter_state = original_get
 
     assert any("model" in p for p in parts)
+
+
+# ---------------------------------------------------------------------------
+# Refresh-data button pipeline (sidebar "Refresh data").
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_data_disabled_on_demo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """refresh_data must refuse to run against the bundled demo dataset."""
+    from prompt_analytics.dashboard import data as data_mod
+
+    monkeypatch.setenv("CCA_DEMO", "1")
+    with pytest.raises(RuntimeError, match="demo"):
+        data_mod.refresh_data()
+
+
+def test_refresh_data_runs_pipeline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """refresh_data runs extract -> snapshot -> heuristic categorize and summarizes."""
+    from dataclasses import dataclass
+
+    from prompt_analytics import categorize, extract, snapshot
+    from prompt_analytics.dashboard import data as data_mod
+
+    monkeypatch.delenv("CCA_DEMO", raising=False)
+    monkeypatch.setattr(data_mod, "data_dir", lambda: tmp_path)
+
+    @dataclass
+    class _Report:
+        prompts: int = 42
+        sessions: int = 7
+
+    calls: dict[str, object] = {}
+
+    def fake_extract(directory: Path, **_kwargs: object) -> _Report:
+        calls["extract"] = directory
+        return _Report()
+
+    def fake_snapshot(directory: Path) -> int:
+        calls["snapshot"] = directory
+        return 0
+
+    def fake_categorize(*, output_dir: str, **kwargs: object) -> int:
+        calls["categorize"] = output_dir
+        calls["use_llm"] = kwargs.get("use_llm", False)
+        return 42
+
+    monkeypatch.setattr(extract, "run_extract", fake_extract)
+    monkeypatch.setattr(snapshot, "run_snapshot", fake_snapshot)
+    monkeypatch.setattr(categorize, "run_categorize", fake_categorize)
+
+    summary = data_mod.refresh_data()
+
+    assert calls["extract"] == tmp_path
+    assert calls["snapshot"] == tmp_path
+    assert calls["categorize"] == str(tmp_path)
+    assert calls["use_llm"] is False  # heuristic only -- no API cost from the button
+    assert "42 prompts" in summary
+    assert "7 sessions" in summary
