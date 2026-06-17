@@ -280,6 +280,46 @@ def _options(frames: dict[str, pd.DataFrame]) -> dict[str, list[Any]]:
     return {"models": models, "projects": projects, "categories": categories}
 
 
+_REFRESH_MSG = "_refresh_msg"
+
+
+def render_refresh_button() -> None:
+    """A sidebar "Refresh data" button that re-runs the extract pipeline in place.
+
+    Saves the terminal round-trip: on click it re-extracts prompts from the local
+    ``~/.claude`` logs, snapshots the quota and re-categorizes (heuristic), clears
+    the mtime-keyed data cache, then reruns so the fresh CSVs load immediately.
+    Hidden on the demo dataset (no local logs, and it must never overwrite the
+    committed ``demo_data``). The success summary is stashed in session_state and
+    surfaced as a toast on the rerun (a toast shown right before ``st.rerun`` would
+    be discarded).
+    """
+    from prompt_analytics.dashboard import data
+
+    msg = st.session_state.pop(_REFRESH_MSG, None)
+    if msg:
+        st.toast(f"✅ {msg}")
+    if data.is_demo():
+        return
+    if st.sidebar.button(
+        "🔄 Refresh data",
+        width="stretch",
+        help="Re-extract prompts from ~/.claude and re-categorize, then reload",
+    ):
+        with st.spinner("Extracting & categorizing…"):
+            try:
+                summary = data.refresh_data()
+            except Exception as exc:  # surface the failure, don't crash the page
+                st.sidebar.error(f"Refresh failed: {exc}")
+                return
+        # mtimes change after extract, but clear the cache so the reload is
+        # unconditional (st.cache_data.clear() drops every @st.cache_data entry,
+        # i.e. both _load_cached and _load_prompt_texts_cached).
+        st.cache_data.clear()
+        st.session_state[_REFRESH_MSG] = summary
+        st.rerun()
+
+
 def render_sidebar(frames: dict[str, pd.DataFrame]) -> None:
     """Render the global filter bar and persist selections to session_state.
 
@@ -297,6 +337,7 @@ def render_sidebar(frames: dict[str, pd.DataFrame]) -> None:
     # Apply any staged cross-filter / reset writes before the widgets below are
     # instantiated (they own their keys and cannot be mutated afterwards).
     _drain_pending()
+    render_refresh_button()
     st.sidebar.header("Filters")
     _style_sidebar_tags()
     opts = _options(frames)
