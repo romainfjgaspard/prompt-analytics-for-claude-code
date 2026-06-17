@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — kept a
 `0.x` on purpose: the upstream Claude Code JSONL format is unstable, so parsing
 breakage is treated as expected and reflected in the version.
 
+## [Unreleased]
+
+### Added
+- `--since YYYY-MM-DD` / `--until YYYY-MM-DD` on every analysis command (inclusive
+  date range, e.g. `summary --since 2026-06-01`).
+- `timeline` command: cost / prompts / tokens grouped by `--by day|week|month`.
+
+### Changed
+- `by-project` now always shows the cumulative % column; the `--pareto` flag is
+  deprecated (still accepted as a no-op so existing invocations keep working).
+- `--provider` now documents its expected value (`--provider NAME`) and lists the
+  known providers (`anthropic`, `copilot`) in `--help`.
+
 ## [0.3.1] — 2026-06-15
 
 ### Fixed

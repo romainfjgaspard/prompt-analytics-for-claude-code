@@ -135,18 +135,21 @@ Plan break-even: API-equivalent vs subscription (anthropic)
 
 ## Commands
 
-Every analysis command works **on the fly** — it parses your JSONL in memory (~0.5 s) when there is no fresh `extract` to read, so you never have to run `extract` first. All of them accept `--output-dir DIR`, `--format table|csv|json`, `--pricing PATH`, `--no-cache`, and `--from-csv DIR` (analyze the CSVs in DIR as-is, with no live parse and no freshness check — the CLI counterpart of what the dashboard does, e.g. `summary --from-csv demo_data`).
+Every analysis command works **on the fly** — it parses your JSONL in memory (~0.5 s) when there is no fresh `extract` to read, so you never have to run `extract` first. All of them accept `--output-dir DIR`, `--format table|csv|json`, `--pricing PATH`, `--no-cache`, `--from-csv DIR` (analyze the CSVs in DIR as-is, with no live parse and no freshness check — the CLI counterpart of what the dashboard does, e.g. `summary --from-csv demo_data`), and `--since YYYY-MM-DD` / `--until YYYY-MM-DD` to restrict the analysis to a date range (inclusive, e.g. `summary --since 2026-06-01`).
+
+Commands that price tokens take `--provider NAME` to choose the rate card for the cost column (`NAME` is a provider key from the pricing grid — `anthropic` (default) or `copilot` ship by default; see [Pricing providers](#pricing-providers)).
 
 **Totals and breakdowns**
 
 | Command | Key flags | What it shows |
 | --- | --- | --- |
 | `summary` | | Sessions, prompts, tokens by type, cost per provider, period, subagent share. |
-| `by-project` | `--pareto` `--provider` | Cost / tokens / prompts per project, sorted; `--pareto` adds share + cumulative %. |
-| `by-model` | `--compact` `--provider` | Token and cost split per model (cache writes split by TTL, subagent column); `--compact` fits 80 columns. |
-| `by-token-type` | `--provider` | Cost split per token type — the **context-rent** share of the bill (cache vs generation vs input). |
-| `by-category` | `--provider` | Cost and observed complexity per category (needs `categorize`). |
-| `prompts` | `--top N` `--provider` | The N most expensive prompts, with a preview. |
+| `by-project` | `--provider NAME` | Cost / tokens / prompts per project, sorted by cost, with each project's share and the running cumulative %. |
+| `by-model` | `--compact` `--provider NAME` | Token and cost split per model (cache writes split by TTL, subagent column); `--compact` fits 80 columns. |
+| `by-token-type` | `--provider NAME` | Cost split per token type — the **context-rent** share of the bill (cache vs generation vs input). |
+| `by-category` | `--provider NAME` | Cost and observed complexity per category (needs `categorize`). |
+| `timeline` | `--by day\|week\|month` `--provider NAME` | Cost / prompts / tokens grouped by calendar period (chronological), each with its share of the total. |
+| `prompts` | `--top N` `--provider NAME` | The N most expensive prompts, with a preview. |
 | `sessions` | `--depth` \| `--top N`, `--project NAME` | Sessions ranked by cost, or `--depth` for the marginal-cost-by-depth meta-analysis; `--project` restricts to one. |
 
 Beyond these, there are **power-user analyses** on the request grain (`context`, `ttl`, `compactions`, `overhead`, `model-category`, `recommend`, `burn-rate`, `break-even`) and the **pricing / export / pipeline** commands (`compare`, `export`, `extract`, `snapshot`, `categorize`, `run`, `dashboard`, `config init`). The full reference, grouped by purpose with every flag, is in the wiki:

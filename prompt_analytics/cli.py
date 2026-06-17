@@ -32,7 +32,9 @@ OUTPUT_DIR_ENV = "PROMPT_ANALYTICS_OUTPUT_DIR"
 _EXAMPLES = """\
 examples:
   prompt-analytics summary                       totals, tokens and cost in the terminal
-  prompt-analytics by-project --pareto           where the money goes (cumulative %)
+  prompt-analytics by-project                    where the money goes (cumulative %)
+  prompt-analytics timeline --by month           cost per month
+  prompt-analytics summary --since 2026-06-01    analyze one period (any analysis command)
   prompt-analytics by-token-type                 context rent vs generation in the bill
   prompt-analytics sessions --depth              marginal prompt cost vs session depth
   prompt-analytics context                       accumulated context per turn (when to /compact)
@@ -87,14 +89,26 @@ def _analytics_parent() -> argparse.ArgumentParser:
         help="Analyze the CSVs in DIR as-is (no live parse, no freshness check "
         "against ~/.claude/projects) -- e.g. a demo dataset or an archived extract.",
     )
+    parent.add_argument(
+        "--since",
+        metavar="YYYY-MM-DD",
+        help="Only analyze prompts dated on or after this day (inclusive).",
+    )
+    parent.add_argument(
+        "--until",
+        metavar="YYYY-MM-DD",
+        help="Only analyze prompts dated on or before this day (inclusive).",
+    )
     return parent
 
 
 def _provider_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
+        metavar="NAME",
         default="anthropic",
-        help="Pricing provider used for the cost column (default: %(default)s).",
+        help="Pricing provider for the cost column, e.g. anthropic or copilot "
+        "(default: %(default)s).",
     )
 
 
@@ -123,10 +137,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cost/tokens/prompts per project, sorted by cost.",
     )
     _provider_arg(p_by_project)
+    # Deprecated: the cumulative %% column is now always shown. Kept as an
+    # accepted no-op so published `by-project --pareto` invocations don't break.
     p_by_project.add_argument(
         "--pareto",
         action="store_true",
-        help="Add a cumulative %% column (the pareto view).",
+        help=argparse.SUPPRESS,
     )
     p_by_project.set_defaults(func=_handle_by_project)
 
@@ -284,6 +300,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many recent weeks to list (default: %(default)s; 0 = all).",
     )
     p_burn.set_defaults(func=_handle_burn_rate)
+
+    p_timeline = subparsers.add_parser(
+        "timeline",
+        parents=[analytics_parent],
+        help="Cost, prompts and tokens grouped by day, week or month.",
+    )
+    _provider_arg(p_timeline)
+    p_timeline.add_argument(
+        "--by",
+        choices=("day", "week", "month"),
+        default="day",
+        help="Grouping granularity (default: %(default)s).",
+    )
+    p_timeline.set_defaults(func=_handle_timeline)
 
     p_break_even = subparsers.add_parser(
         "break-even",
@@ -545,6 +575,33 @@ def _load_dataset(args: argparse.Namespace) -> Dataset:
     )
 
 
+def _apply_date_window(args: argparse.Namespace, ds: Dataset) -> tuple[Dataset | None, int]:
+    """Narrow ``ds`` to --since/--until; validate the bounds (exit 2 on a bad date)."""
+    import sys
+
+    from . import analytics
+    from .extract import _parse_bound
+
+    since = getattr(args, "since", None)
+    until = getattr(args, "until", None)
+    if not since and not until:
+        return ds, 0
+    try:
+        if since:
+            _parse_bound(since, "since")
+        if until:
+            _parse_bound(until, "until")
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return None, 2
+    ds = analytics.filter_dates(ds, since, until)
+    if not ds.tokens and not ds.prompts:
+        window = " .. ".join(b or "..." for b in (since, until))
+        print(f"No data in the date range ({window}).", file=sys.stderr)
+        return None, 1
+    return ds, 0
+
+
 def _dataset_or_fail(args: argparse.Namespace) -> tuple[Dataset | None, int]:
     """Load the dataset; on empty data print a hint and return exit code 1."""
     import sys
@@ -567,7 +624,7 @@ def _dataset_or_fail(args: argparse.Namespace) -> tuple[Dataset | None, int]:
                 file=sys.stderr,
             )
         return None, 1
-    return ds, 0
+    return _apply_date_window(args, ds)
 
 
 def _check_providers(providers: list[str], pricing_path: Path | None) -> int:
@@ -615,7 +672,7 @@ def _handle_by_project(args: argparse.Namespace) -> int:
     ds, code = _dataset_or_fail(args)
     if ds is None:
         return code
-    render(analytics.by_project(ds, args.provider, pareto=args.pareto), args.format)
+    render(analytics.by_project(ds, args.provider), args.format)
     return 0
 
 
@@ -802,6 +859,19 @@ def _handle_burn_rate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_timeline(args: argparse.Namespace) -> int:
+    from . import analytics
+    from .render import render
+
+    if code := _check_providers([args.provider], _pricing_path(args)):
+        return code
+    ds, code = _dataset_or_fail(args)
+    if ds is None:
+        return code
+    render(analytics.timeline(ds, args.provider, by=args.by), args.format)
+    return 0
+
+
 def _read_quota_rows(args: argparse.Namespace) -> list[dict[str, str]]:
     """Read quota_log.csv from the data dir (3.1 enrichment), or []."""
     import csv
@@ -881,7 +951,8 @@ def _handle_export(args: argparse.Namespace) -> int:
 _NEXT_STEPS = """\
 Next steps:
   prompt-analytics summary              totals in the terminal
-  prompt-analytics by-project --pareto  where the money goes
+  prompt-analytics by-project           where the money goes
+  prompt-analytics timeline --by month  cost per month
   prompt-analytics sessions --depth     what a prompt costs deep into a session
   prompt-analytics dashboard            the full picture (install the [dashboard] extra)"""
 

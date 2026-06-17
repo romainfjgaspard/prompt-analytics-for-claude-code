@@ -236,8 +236,38 @@ def test_by_project_hand_computed(ds):
     assert beta["token_share_pct"] == 29.4  # 1.6M / 5.44M
 
 
-def test_by_project_pareto_cumulative(ds):
-    result = analytics.by_project(ds, "anthropic", pareto=True)
+def test_filter_dates_no_bounds_is_identity(ds):
+    assert analytics.filter_dates(ds, None, None) is ds
+
+
+def test_filter_dates_since_keeps_later_prompts(ds):
+    # p1/p2 are dated 2026-05-01, p3 is 2026-05-02 (session s2).
+    narrowed = analytics.filter_dates(ds, "2026-05-02", None)
+    assert [p["prompt_id"] for p in narrowed.prompts] == ["p3"]
+    assert {s["session_id"] for s in narrowed.sessions} == {"s2"}
+    # p3's tokens plus s2's continuation overhead (pseudo-prompt rides its session).
+    pids = {t["prompt_id"] for t in narrowed.tokens}
+    assert pids == {"p3", "s2:_continuation"}
+
+
+def test_filter_dates_until_drops_other_session(ds):
+    narrowed = analytics.filter_dates(ds, None, "2026-05-01")
+    assert {p["prompt_id"] for p in narrowed.prompts} == {"p1", "p2"}
+    assert {s["session_id"] for s in narrowed.sessions} == {"s1"}
+    # s2's continuation overhead is gone with its session.
+    assert all(t["session_id"] == "s1" for t in narrowed.tokens)
+
+
+def test_filter_dates_empty_range(ds):
+    narrowed = analytics.filter_dates(ds, "2030-01-01", None)
+    assert narrowed.prompts == []
+    assert narrowed.tokens == []
+    assert narrowed.sessions == []
+
+
+def test_by_project_cumulative_is_default(ds):
+    # The cumulative %% column is now always present (no --pareto flag needed).
+    result = analytics.by_project(ds, "anthropic")
     assert [row["cumulative_pct"] for row in result.rows] == [90.4, 100.0]
     assert result.columns[-1].key == "cumulative_pct"
 
