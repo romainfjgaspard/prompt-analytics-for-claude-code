@@ -52,9 +52,14 @@ _DATA_FILES = (
 )
 
 
-DEMO_BANNER = (
-    "🎭 **Demo data** — "
-    "[view on GitHub](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code)"
+REPO_URL = "https://github.com/romainfjgaspard/prompt-analytics-for-claude-code"
+# The full recipe to get *this* dashboard on the visitor's own logs, shown in the
+# "run it yourself" popover. `run --categorize` uses the local heuristic (no API
+# key); `dashboard` then reads the categorized CSVs. Kept in sync with the README.
+SELF_HOST_CMDS = (
+    'uv tool install "prompt-analytics-for-claude-code[dashboard]" # CLI + dashboard extra, on your PATH\n'
+    "prompt-analytics run --categorize # extract + snapshot + local categorize → ./output\n"
+    "prompt-analytics dashboard # open the dashboard at http://localhost:8501"
 )
 
 
@@ -76,14 +81,40 @@ def is_demo() -> bool:
 
 
 def render_demo_banner() -> None:
-    """Show the demo banner at the top of the sidebar when on the bundled dataset (9.2).
+    """Show the demo CTA at the top of the sidebar when on the bundled dataset (9.2).
+
+    Every launch channel (LinkedIn / HN / Reddit) drives traffic to this demo,
+    so the banner is the conversion funnel: it labels the dataset as synthetic,
+    asks for a GitHub star *explicitly* (an explicit ask converts far better than
+    a bare "view on GitHub" link), and shows the one-liner to run it on the
+    visitor's own logs. Streamlit Community Cloud has no public app star, so the
+    only star that matters -- and the metric best-of-streamlit / the gallery rank
+    by -- is the GitHub one; hence the CTA points there.
 
     Lives in the sidebar (not the main column) so it never pushes the page's
     first chart below the fold; every page calls this *before* ``render_sidebar``
     so it lands above the filters.
     """
-    if is_demo():
-        st.sidebar.info(DEMO_BANNER)
+    if not is_demo():
+        return
+    bar = st.sidebar
+    # Separate the CTA block from the filters above it (it's rendered at the very
+    # bottom of the sidebar, right after the Category filter).
+    bar.divider()
+    # Lead with an explicit, always-visible invitation (the real conversion
+    # goal), then the filled primary button that opens the commands. They live
+    # *inside* the popover, whose panel is wider than the sidebar, so the long
+    # install line isn't truncated the way an inline code block would be.
+    bar.markdown(
+        "**📊 Get this dashboard on your own usage** — same board, your real "
+        "Claude Code data, 100% local."
+    )
+    with bar.popover("▶ Show me how (3 commands)", width="stretch", type="primary"):
+        st.markdown("**Same dashboard, your real usage** — no API key:")
+        st.code(SELF_HOST_CMDS, language="bash")
+    bar.link_button("⭐ Star it on GitHub", REPO_URL, width="stretch")
+    bar.caption("🎭 Demo data")
+    bar.caption("_Not affiliated with Anthropic._")
 
 
 # Token types whose cost is context rent: money spent re-sending context, not
