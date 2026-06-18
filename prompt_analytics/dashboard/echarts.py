@@ -207,22 +207,18 @@ def apply_click(
     """Apply a single clicked category to a global multiselect filter key.
 
     Power-BI-style cross-filter: clicking a bar restricts the dashboard to that
-    category. Guards against the component's *sticky* value re-applying every
-    rerun (only acts when it actually changes the filter), and ignores synthetic
-    buckets like ``(session overhead)``. Triggers a rerun on a real change.
+    category *on top of* the persistent sidebar selection. The drill lands on a
+    dedicated cross-filter key (not the sidebar widget key), so it shows in the
+    "Filtered: …" badge and is undone by Reset without disturbing the sidebar.
+    Ignores synthetic buckets like ``(session overhead)``; reruns only on a real
+    change, so the component's sticky value cannot re-apply every rerun.
     """
     if not isinstance(value, str) or value in synthetic:
         return
-    if st.session_state.get(filter_key) == [value]:
-        return
-    # The filter key is a sidebar multiselect's widget key, which cannot be set
-    # directly after that widget is instantiated this run. Stage it; the sidebar
-    # applies it before its widgets render next run. (The guard above stops the
-    # component's sticky value from re-staging the same pick on every rerun.)
     from prompt_analytics.dashboard import filters
 
-    filters.stage_filter(filter_key, [value])
-    st.rerun()
+    if filters.set_cross_filter(filter_key, [value]):
+        st.rerun()
 
 
 def render_events(
@@ -304,11 +300,11 @@ def _norm_range(value: Any) -> tuple[str, str] | None:
 def apply_date_range(value: Any, filter_key: str) -> None:
     """Apply a clicked day (``str``) or brushed range (``list``) to a date filter.
 
-    Sister of :func:`apply_click` for the date dimension. Guards against the
-    component's *sticky* value re-applying every rerun by comparing **normalized
-    ISO strings**: the sidebar rewrites this key as ``datetime.date`` objects, so
-    a naive ``==`` between dates and the brush's string labels would never match
-    and would loop forever. Triggers a rerun only on a real change.
+    Sister of :func:`apply_click` for the date dimension. The brushed range lands
+    on the cross-filter twin of ``filter_key`` (the drill, not the persistent
+    sidebar date_input). Guards against the component's *sticky* value re-applying
+    every rerun by comparing **normalized ISO strings**, then reruns only on a
+    real change.
     """
     if isinstance(value, str):
         start = end = value
@@ -316,14 +312,12 @@ def apply_date_range(value: Any, filter_key: str) -> None:
         start, end = str(value[0]), str(value[1])
     else:
         return
-    if _norm_range(st.session_state.get(filter_key)) == (start[:10], end[:10]):
-        return
-    # ``filter_key`` is the sidebar date_input's widget key, which cannot be set
-    # directly after the widget is instantiated this run; stage it like the
-    # categorical cross-filters (the sidebar normalizes the strings to dates).
     from prompt_analytics.dashboard import filters
 
-    filters.stage_filter(filter_key, [start, end])
+    xf_key = filters.xf_key_for(filter_key)
+    if _norm_range(st.session_state.get(xf_key)) == (start[:10], end[:10]):
+        return
+    st.session_state[xf_key] = [start, end]
     st.rerun()
 
 

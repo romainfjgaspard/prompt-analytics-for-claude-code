@@ -606,29 +606,51 @@ def test_options_extracts_models_projects_categories(no_session_state: None) -> 
     assert opts["categories"] == ["debug", "refactor"]
 
 
-def test_active_parts_detects_restricted_model(no_session_state: None) -> None:
-    """_active_parts returns a summary when the model selection is a proper subset."""
+def _patch_state(monkeypatch: pytest.MonkeyPatch, **state: object) -> None:
+    """Override ``filters.get_filter_state`` with a fixed dict for the test."""
     from prompt_analytics.dashboard import filters
 
-    monkeypatched_state = {
+    base: dict[str, object] = {
         "date_range": None,
-        "models": ["claude-opus-4-8"],
+        "models": None,
         "projects": None,
         "categories": None,
+        "xf_date_range": None,
+        "xf_models": None,
+        "xf_projects": None,
+        "xf_categories": None,
     }
+    base.update(state)
+    monkeypatch.setattr(filters, "get_filter_state", lambda: base)
 
-    original_get = filters.get_filter_state
 
-    def patched_get():
-        return monkeypatched_state
+def test_xf_parts_reports_chart_click_drill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The badge summarizes only the chart-click drill (xf_*), not the sidebar."""
+    from prompt_analytics.dashboard import filters
 
-    filters.get_filter_state = patched_get
-    try:
-        parts = filters._active_parts(_frames())
-    finally:
-        filters.get_filter_state = original_get
+    _patch_state(monkeypatch, xf_projects=["beta"], xf_models=["claude-opus-4-8"])
+    parts = filters._xf_parts()
+    assert "beta" in parts
+    # Model drill renders through theme.model_label, not the raw id.
+    assert any(p != "claude-opus-4-8" and "Opus" in p for p in parts)
 
-    assert any("model" in p for p in parts)
+
+def test_xf_parts_ignores_persistent_sidebar_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sidebar selection (even a proper subset) must NOT raise the badge."""
+    from prompt_analytics.dashboard import filters
+
+    _patch_state(monkeypatch, models=["claude-opus-4-8"], projects=["beta"])
+    assert filters._xf_parts() == []
+
+
+def test_apply_filters_ands_drill_on_top_of_sidebar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The chart-click drill (xf_*) narrows on top of the sidebar selection."""
+    from prompt_analytics.dashboard import filters
+
+    # Sidebar leaves everything; a drill to project beta restricts to p3.
+    _patch_state(monkeypatch, xf_projects=["beta"])
+    out = filters.apply_filters(_frames())
+    assert set(out["prompts"]["prompt_id"]) == {"p3"}
 
 
 # ---------------------------------------------------------------------------
