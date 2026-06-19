@@ -154,8 +154,10 @@ def _token_evolution(tokens: pd.DataFrame) -> dict[str, pd.DataFrame]:
     prompts in the band -- a single summed line would hide the wide inter-session
     spread. The zero-fill is what makes the *decline* of cache writes visible: a
     deep prompt that no longer pays a cache write contributes a 0, not nothing.
-    Returns ``{component_label: band-indexed frame[med, p25, p75]}``, ``{}`` if
-    unavailable.
+    Returns ``{component_label: band-indexed frame[med, p25, p75, n]}``, ``{}`` if
+    unavailable. ``n`` is the prompt count behind each band's median (identical
+    across components, since every prompt is zero-filled into each one) so the
+    chart can show how many prompts each point summarizes.
     """
     if not {"prompt_id", "prompt_index", "token_type", "token_count"} <= set(tokens.columns):
         return {}
@@ -176,6 +178,7 @@ def _token_evolution(tokens: pd.DataFrame) -> dict[str, pd.DataFrame]:
     ).reset_index()
     bands = [b for b in _BAND_ORDER if b in set(per_prompt["band"])]
     grouped = per_prompt.groupby("band")
+    sizes = grouped.size()  # prompts per band, shared by every component
     out: dict[str, pd.DataFrame] = {}
     for comp in _COMPONENTS.values():
         if comp not in per_prompt.columns:
@@ -185,6 +188,7 @@ def _token_evolution(tokens: pd.DataFrame) -> dict[str, pd.DataFrame]:
                 "med": grouped[comp].median(),
                 "p25": grouped[comp].quantile(0.25),
                 "p75": grouped[comp].quantile(0.75),
+                "n": sizes,
             }
         ).reindex(bands)
         out[comp] = df
@@ -201,6 +205,9 @@ def _evolution_small_option(comp: str, df: pd.DataFrame, color: str) -> dict[str
 
     The band is drawn with the ECharts stacked-area trick: an invisible baseline
     at p25 plus a (p75-p25) area on top of it, both in their own stack group.
+
+    Like the box plot above, ``n`` (prompts behind each depth's median) rides in
+    the x-axis tick labels, so a median over a thin tail band reads as such.
     """
     bands = df.index.tolist()
     c = echarts.colors()
@@ -220,6 +227,10 @@ def _evolution_small_option(comp: str, df: pd.DataFrame, color: str) -> dict[str
     }
     xaxis = echarts.category_axis([str(b) for b in bands])
     xaxis["boundaryGap"] = False
+    n_by_band = {str(b): (0 if pd.isna(n) else int(n)) for b, n in zip(bands, df["n"], strict=True)}
+    xaxis["axisLabel"]["formatter"] = echarts.js(
+        "function(v){var N=" + json.dumps(n_by_band) + ";return v+'\\nn='+(N[v]||0);}"
+    )
     option["xAxis"] = xaxis
     option["yAxis"] = echarts.value_axis()
     delta = [
@@ -318,7 +329,8 @@ def main() -> None:
         st.caption(
             "Median input-side tokens per prompt at each depth; the shaded band "
             "is the p25–p75 spread (sessions vary a lot, so a single line would "
-            "mislead). Each panel has its own scale."
+            "mislead). Each panel has its own scale; **n** under each depth is "
+            "how many prompts that median summarizes."
         )
         comps = [comp for comp in _COMPONENTS.values() if comp in evo]
         grid = [st.columns(2), st.columns(2)]
