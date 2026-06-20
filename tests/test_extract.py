@@ -690,3 +690,108 @@ def test_extract_never_touches_categories_csv(fake_claude):
     # And prompts.csv no longer carries category columns at all.
     prompts = _read_csv(fake_claude.out / "prompts.csv")
     assert "category" not in prompts[0]
+
+
+# ---------------------------------------------------------------------------
+# Axe C: output composition metrics (output_files.csv + output_tokens.csv).
+# ---------------------------------------------------------------------------
+
+
+def _output_files_by_prompt(out):
+    """{prompt_id: {(language, kind): row}} from output_files.csv."""
+    result: dict[str, dict[tuple[str, str], dict[str, str]]] = {}
+    for row in _read_csv(out / "output_files.csv"):
+        result.setdefault(row["prompt_id"], {})[(row["language"], row["kind"])] = row
+    return result
+
+
+def test_output_files_language_kind_and_lines(fake_claude):
+    fake_claude.add("session_output.jsonl", project="out")
+    run_extract(fake_claude.out)
+
+    files = _output_files_by_prompt(fake_claude.out)
+    # pO1 writes then edits src/parser.py (one distinct Python code file).
+    po1 = files["pO1"][("Python", "code")]
+    assert po1["files"] == "1"
+    assert po1["lines_added"] == "7"  # Write 5 + Edit +2
+    assert po1["lines_deleted"] == "1"  # Edit -1
+    # pO2 writes tests/test_parser.py -> Python test.
+    po2 = files["pO2"][("Python", "test")]
+    assert po2["files"] == "1"
+    assert po2["lines_added"] == "3"
+    assert po2["lines_deleted"] == "0"
+    assert ("Python", "code") not in files["pO2"]
+
+
+def test_output_tokens_split_reconciles_with_total_output(fake_claude):
+    """prose + code per prompt equals that prompt's total output tokens."""
+    fake_claude.add("session_output.jsonl", project="out")
+    run_extract(fake_claude.out)
+
+    tokens = _tokens_by_prompt(fake_claude.out)
+    split = {
+        r["prompt_id"]: (int(r["output_prose_tokens"]), int(r["output_code_tokens"]))
+        for r in _read_csv(fake_claude.out / "output_tokens.csv")
+    }
+    for pid, (prose, code) in split.items():
+        assert prose + code == tokens[pid]["output"], pid
+        # Both blocks present in every assistant turn -> both sides non-zero.
+        assert prose > 0 and code > 0, pid
+    # pO1 = 50 + 40, pO2 = 60.
+    assert sum(split["pO1"]) == 90
+    assert sum(split["pO2"]) == 60
+
+
+def test_output_split_all_prose_when_no_tool_blocks(fake_claude):
+    """A pure-text answer (no tool_use) attributes all output to prose."""
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    run_extract(fake_claude.out)
+
+    split = {
+        r["prompt_id"]: (int(r["output_prose_tokens"]), int(r["output_code_tokens"]))
+        for r in _read_csv(fake_claude.out / "output_tokens.csv")
+    }
+    tokens = _tokens_by_prompt(fake_claude.out)
+    # session_alpha assistant lines carry no content blocks -> all prose.
+    assert split["pA1"] == (tokens["pA1"]["output"], 0)
+    assert split["pA2"] == (tokens["pA2"]["output"], 0)
+
+
+def test_output_csvs_carry_metrics_only_no_source_code(fake_claude):
+    """No file contents / edit strings / absolute paths ever reach the CSVs."""
+    fake_claude.add("session_output.jsonl", project="out")
+    run_extract(fake_claude.out)
+
+    files_text = (fake_claude.out / "output_files.csv").read_text(encoding="utf-8")
+    tokens_text = (fake_claude.out / "output_tokens.csv").read_text(encoding="utf-8")
+    blob = files_text + tokens_text
+    # Source fragments from the fixture must be absent.
+    for secret in ("def parse", "return int", "import mod", "assert parse"):
+        assert secret not in blob
+    # No path column at all in output_files.csv, and no leaked path string.
+    header = files_text.splitlines()[0]
+    assert header == "prompt_id,language,kind,files,lines_added,lines_deleted"
+    assert "parser.py" not in blob
+    assert "/home/fake" not in blob
+
+
+def test_output_files_dedup_across_resumed_replay(fake_claude):
+    """A replayed tool call is not double-counted (dedup by tool_use id)."""
+    fake_claude.add("session_output.jsonl", project="out")
+    # A second copy of the same session: resumed sessions replay identical
+    # lines; the edits must still count once.
+    fake_claude.add("session_output.jsonl", project="out2")
+    run_extract(fake_claude.out)
+
+    files = _output_files_by_prompt(fake_claude.out)
+    po1 = files["pO1"][("Python", "code")]
+    assert po1["lines_added"] == "7"  # not 14
+    assert po1["files"] == "1"
+
+
+def test_output_csvs_respect_date_window(fake_claude):
+    fake_claude.add("session_output.jsonl", project="out")
+    run_extract(fake_claude.out, since="2026-06-05", timezone_name="UTC")
+    # Both prompts predate the window -> empty (header-only) output CSVs.
+    assert _read_csv(fake_claude.out / "output_files.csv") == []
+    assert _read_csv(fake_claude.out / "output_tokens.csv") == []

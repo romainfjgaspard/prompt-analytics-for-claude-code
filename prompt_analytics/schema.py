@@ -34,6 +34,9 @@ __all__ = [
     "PROMPT_TEXT_COLS",
     "CATEGORIES_COLS",
     "QUOTA_LOG_COLS",
+    "OUTPUT_FILES_COLS",
+    "OUTPUT_TOKENS_COLS",
+    "ToolEdit",
     "ParsedPrompt",
     "UsageRecord",
     "ParsedFile",
@@ -41,6 +44,8 @@ __all__ = [
     "PromptRow",
     "TokenRow",
     "RequestRow",
+    "OutputFileRow",
+    "OutputTokenRow",
     "continuation_prompt_id",
 ]
 
@@ -152,6 +157,19 @@ CATEGORIES_COLS = [
 
 QUOTA_LOG_COLS = ["snapshot_at", "field", "utilization_pct", "resets_at"]
 
+# Output composition (Axe C). ``output_files.csv`` is long: one row per
+# ``(prompt_id, language, kind)`` so a multi-language prompt is preserved, in
+# the spirit of ``tokens.csv``. ``files`` counts distinct files touched in the
+# group; the line counts are exact LCS diffs. Metrics only -- no source code,
+# no file paths, ever reach this CSV.
+OUTPUT_FILES_COLS = ["prompt_id", "language", "kind", "files", "lines_added", "lines_deleted"]
+
+# Per-prompt prose/code split of the generated output tokens (Axe C). The real
+# ``output_tokens`` are prorated by the local-tokenizer weight of the message's
+# text vs tool_use blocks; per prompt the two columns sum to the prompt's total
+# output tokens in ``tokens.csv`` (estimate on the split, exact on the total).
+OUTPUT_TOKENS_COLS = ["prompt_id", "output_prose_tokens", "output_code_tokens"]
+
 
 def continuation_prompt_id(session_id: str) -> str:
     """Pseudo prompt_id gathering a session's unattributable usage.
@@ -185,6 +203,22 @@ class ParsedPrompt(TypedDict):
     text: str
 
 
+class ToolEdit(TypedDict):
+    """Metrics derived from one file-editing ``tool_use`` block (Axe C).
+
+    Carries no source code: only the derived language/kind, the exact line
+    diff, and a project-relative path kept solely to count *distinct* files
+    (never written to any CSV).
+    """
+
+    tool_id: str
+    path: str
+    language: str
+    kind: str
+    lines_added: int
+    lines_deleted: int
+
+
 class UsageRecord(TypedDict):
     """One assistant JSONL line carrying API usage.
 
@@ -200,6 +234,12 @@ class UsageRecord(TypedDict):
     ``post_compact`` is True when the record descends (via the
     ``uuid``/``parentUuid`` chain) from a synthetic post-compaction
     continuation message, until the next real human prompt breaks the chain.
+
+    ``prose_tokens``/``code_tokens`` are local-tokenizer weights of this
+    message's ``text`` vs ``tool_use`` blocks (Axe C); the aggregation prorates
+    the real ``output_tokens`` by them. ``file_edits`` holds the per-edit
+    metrics for any file-editing tool calls on this line (deduplicated by
+    ``tool_id`` at aggregation time, like ``tool_use_ids``).
     """
 
     prompt_id: str
@@ -211,6 +251,9 @@ class UsageRecord(TypedDict):
     post_compact: bool
     tokens: dict[str, int]
     tool_use_ids: list[str]
+    prose_tokens: int
+    code_tokens: int
+    file_edits: list[ToolEdit]
 
 
 class ParsedFile(TypedDict):
@@ -293,3 +336,22 @@ class RequestRow(TypedDict):
     cache_write_5m_tokens: int
     cache_write_1h_tokens: int
     server_tool_use_requests: int
+
+
+class OutputFileRow(TypedDict):
+    """One row of ``output_files.csv`` (Axe C, long by language/kind)."""
+
+    prompt_id: str
+    language: str
+    kind: str
+    files: int
+    lines_added: int
+    lines_deleted: int
+
+
+class OutputTokenRow(TypedDict):
+    """One row of ``output_tokens.csv`` (Axe C, prose/code split per prompt)."""
+
+    prompt_id: str
+    output_prose_tokens: int
+    output_code_tokens: int

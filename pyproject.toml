@@ -34,6 +34,10 @@ dependencies = [
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "rich>=13.0",
+    # Local tokenizer for the prose/code output split (Axe C). Light, at the
+    # core on purpose; extract degrades to an offline heuristic if it (or its
+    # vocabulary) is unavailable, so the split is always produced.
+    "tiktoken>=0.7",
     # Windows has no system IANA database; without this, --timezone fails there.
     "tzdata; sys_platform == 'win32'",
 ]

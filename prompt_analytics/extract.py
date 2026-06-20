@@ -51,8 +51,11 @@ from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from . import paths
+from .compose import aggregate_output_files, analyze_assistant_content
 from .pricing import get_model_pricing
 from .schema import (
+    OUTPUT_FILES_COLS,
+    OUTPUT_TOKENS_COLS,
     PROMPT_TEXT_COLS,
     PROMPTS_COLS,
     REQUESTS_COLS,
@@ -62,12 +65,15 @@ from .schema import (
     TOKEN_TYPES,
     TOKEN_TYPES_COLS,
     TOKENS_COLS,
+    OutputFileRow,
+    OutputTokenRow,
     ParsedFile,
     ParsedPrompt,
     PromptRow,
     RequestRow,
     SessionRow,
     TokenRow,
+    ToolEdit,
     UsageRecord,
     continuation_prompt_id,
 )
@@ -76,8 +82,9 @@ from .storage import atomic_write_csv, atomic_write_json
 __all__ = ["run_extract", "collect", "parse_file", "ExtractReport", "ExtractResult"]
 
 # Bump whenever parse_file's output shape or logic changes: invalidates the
-# on-disk parse cache.
-CACHE_VERSION = 2
+# on-disk parse cache. V3 adds the Axe C per-record fields (prose/code token
+# weights + file-edit metrics).
+CACHE_VERSION = 3
 
 PREVIEW_CHARS = 100
 
@@ -370,6 +377,12 @@ def parse_file(filepath: Path) -> ParsedFile:
                 key = _dedup_key(message, event)
                 if not tokens and not tool_use_ids and not key:
                     continue  # nothing countable (e.g. bare synthetic notices)
+                # Axe C: derive the output-composition metrics (prose/code token
+                # weights + file-edit line/language/kind) while the content is
+                # in hand. Only integers and a relative path identity are kept.
+                prose_tokens, code_tokens, file_edits = analyze_assistant_content(
+                    content, str(event.get("cwd") or session_cwd)
+                )
                 usage_records.append(
                     UsageRecord(
                         prompt_id=pid,
@@ -381,6 +394,9 @@ def parse_file(filepath: Path) -> ParsedFile:
                         post_compact=post_compact,
                         tokens=tokens,
                         tool_use_ids=tool_use_ids,
+                        prose_tokens=prose_tokens,
+                        code_tokens=code_tokens,
+                        file_edits=file_edits,
                     )
                 )
 
@@ -624,6 +640,10 @@ class _PromptAgg:
     tokens: Counter[tuple[str, str, int]] = field(default_factory=Counter)
     records: list[UsageRecord] = field(default_factory=list)  # non-sidechain
     tool_call_count: int = 0
+    # Axe C: real output tokens prorated into prose vs code/tool (their sum
+    # equals the prompt's total output tokens, summed across all its records).
+    output_prose: int = 0
+    output_code: int = 0
 
 
 def _request_rows(session_id: str, prompt_id: str, records: list[UsageRecord]) -> list[RequestRow]:
@@ -670,6 +690,8 @@ class ExtractResult:
     tokens: list[TokenRow]
     requests: list[RequestRow]
     texts: list[dict[str, str]]
+    output_files: list[OutputFileRow]
+    output_tokens: list[OutputTokenRow]
 
 
 def collect(
@@ -802,12 +824,20 @@ def collect(
     chosen: dict[str, tuple[str, UsageRecord]] = {}
     keyless: list[tuple[str, UsageRecord]] = []
     tool_ids_by_prompt: dict[str, list[str]] = defaultdict(list)
+    # Axe C: file-edit metrics, deduplicated by tool_use id like tool_use_ids
+    # (a tool call is replayed across resumed-session files / progressive lines).
+    seen_edit_ids: set[str] = set()
+    file_edits_by_prompt: dict[str, list[ToolEdit]] = defaultdict(list)
     for session_id, record in pending_usage:
         if not record["is_sidechain"] and record["prompt_id"] in prompt_aggs:
             for tool_id in record["tool_use_ids"]:
                 if tool_id not in seen_tool_ids:
                     seen_tool_ids.add(tool_id)
                     tool_ids_by_prompt[record["prompt_id"]].append(tool_id)
+            for edit in record["file_edits"]:
+                if edit["tool_id"] not in seen_edit_ids:
+                    seen_edit_ids.add(edit["tool_id"])
+                    file_edits_by_prompt[record["prompt_id"]].append(edit)
         key = record["dedup_key"]
         if not key:
             keyless.append((session_id, record))
@@ -838,6 +868,18 @@ def collect(
                 agg.records.append(record)
             if record["tokens"]:
                 request_records[(agg.session_id, pid)].append(record)
+            # Axe C: prorate this message's real output tokens into prose vs
+            # code by the local-tokenizer weight of its text vs tool_use blocks.
+            # Falls back to all-prose when there is no measurable content (the
+            # rounding makes the two parts sum back to the exact output total).
+            out_tokens = record["tokens"].get("output", 0)
+            if out_tokens:
+                weight = record["prose_tokens"] + record["code_tokens"]
+                prose = (
+                    round(out_tokens * record["prose_tokens"] / weight) if weight else out_tokens
+                )
+                agg.output_prose += prose
+                agg.output_code += out_tokens - prose
         else:
             # Session overhead: continuation tails (no prompt id) keep the
             # ``:_continuation`` pseudo id; filtered fake prompts keep theirs.
@@ -862,6 +904,8 @@ def collect(
     token_rows: list[TokenRow] = []
     request_rows: list[RequestRow] = []
     text_rows: list[dict[str, str]] = []
+    output_file_rows: list[OutputFileRow] = []
+    output_token_rows: list[OutputTokenRow] = []
     included_sessions: set[str] = set()
 
     for session_id, pids in prompts_by_session.items():
@@ -927,6 +971,18 @@ def collect(
             )
             if not no_text:
                 text_rows.append({"prompt_id": pid, "prompt_text": prompt["text"]})
+            # Axe C output composition (real prompts only; metrics only).
+            output_file_rows.extend(
+                aggregate_output_files(pid, file_edits_by_prompt.get(pid, []))
+            )
+            if agg.output_prose or agg.output_code:
+                output_token_rows.append(
+                    OutputTokenRow(
+                        prompt_id=pid,
+                        output_prose_tokens=agg.output_prose,
+                        output_code_tokens=agg.output_code,
+                    )
+                )
 
     for (session_id, pseudo), counts in overhead_tokens.items():
         if (session_id, pseudo) not in overhead_in_window:
@@ -970,6 +1026,8 @@ def collect(
         key=lambda r: (r["session_id"], r["timestamp"], r["prompt_id"], r["request_index"])
     )
     text_rows.sort(key=lambda r: r["prompt_id"])
+    output_file_rows.sort(key=lambda r: (r["prompt_id"], r["language"], r["kind"]))
+    output_token_rows.sort(key=lambda r: r["prompt_id"])
 
     # --- Finalize the report. ------------------------------------------------
     report.sessions = len(session_rows)
@@ -998,6 +1056,8 @@ def collect(
         tokens=token_rows,
         requests=request_rows,
         texts=text_rows,
+        output_files=output_file_rows,
+        output_tokens=output_token_rows,
     )
 
 
@@ -1051,6 +1111,9 @@ def run_extract(
     atomic_write_csv(output_dir / "prompts.csv", PROMPTS_COLS, result.prompts)
     atomic_write_csv(output_dir / "tokens.csv", TOKENS_COLS, result.tokens)
     atomic_write_csv(output_dir / "requests.csv", REQUESTS_COLS, result.requests)
+    # Axe C output composition (metrics only -- no source code, no file paths).
+    atomic_write_csv(output_dir / "output_files.csv", OUTPUT_FILES_COLS, result.output_files)
+    atomic_write_csv(output_dir / "output_tokens.csv", OUTPUT_TOKENS_COLS, result.output_tokens)
     # Window marker (1.5): a windowed extract must never be served later as if
     # it covered the full history -- readers append it to their Source line.
     atomic_write_json(
