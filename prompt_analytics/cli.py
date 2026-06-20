@@ -465,13 +465,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_categorize.add_argument(
         "--provider",
         default="auto",
-        choices=["auto", "anthropic", "openrouter", "ollama"],
+        choices=["auto", "anthropic", "openrouter", "ollama", "azure"],
         help="LLM provider (--llm only, default: auto).",
     )
     p_categorize.add_argument(
         "--model",
         default="",
         help="Override the default model for the chosen provider.",
+    )
+    p_categorize.add_argument(
+        "--tau",
+        type=float,
+        default=None,
+        metavar="T",
+        help="Semantic only: override the 'other' threshold (default: calibrated).",
+    )
+    p_categorize.add_argument(
+        "--prime-weight",
+        type=float,
+        default=None,
+        metavar="W",
+        help="Semantic only: override the lexical prime weight (default: calibrated).",
+    )
+    p_categorize.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Semantic only: prototypes averaged per category (1 = max; default: calibrated).",
     )
     p_categorize.add_argument(
         "--batch-size",
@@ -1125,6 +1146,9 @@ def _handle_categorize(args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         delay=args.delay,
         limit=args.limit,
+        tau=args.tau,
+        prime_weight=args.prime_weight,
+        top_k=args.top_k,
     )
     return 0 if count >= 0 else 1
 

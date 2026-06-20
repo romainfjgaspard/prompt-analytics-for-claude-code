@@ -1,0 +1,103 @@
+# Litmus set — hand-curated hard cases for the semantic classifier (Axe B1.3)
+#
+# These are the developer's *gold* judgments on deliberately hard prompts, used
+# by scripts/eval_semantic.py to (a) sanity-check both offline classifiers and
+# (b) calibrate the semantic τ / prime-weight. This is a DEV-TIME fixture,
+# committed once — it is NEVER shown to or filled in by an end user, who just
+# runs `categorize` and gets categories automatically.
+#
+# The anchor case is the real architect complaint: "lots of prompts land in
+# `test` when they are really `implementation`". Several cases below pin the
+# test↔implementation boundary in both directions so a regression shows up here.
+#
+# Honesty note: human agreement on prompt intent tops out around ~0.7
+# (Search Arena), so a perfect score is neither expected nor the goal — a few of
+# these are genuinely ambiguous and labelled with the dominant intent.
+
+cases:
+  # ── the test ↔ implementation boundary (the archi complaint) ────────────────
+  - text: "Ajoute des tests unitaires pour le nouveau parser de quotas"
+    gold: test
+    note: "Pure test work — adding tests is the whole ask."
+  - text: "Implémente la fonction de retry du client API, puis écris ses tests"
+    gold: implementation
+    note: "Dominant intent is implementation; the tests are a trailing rider. The archi complaint = do NOT file this under test."
+  - text: "Add a regression test for the null-pointer fix in user.py"
+    gold: test
+    note: "Test work even though it cites a fix — the deliverable is the test."
+  - text: "Crée le module src/export.py et le squelette de ses tests"
+    gold: implementation
+    note: "Creating the module leads; the test skeleton is secondary."
+  - text: "Raise the coverage of filters.py above 90%"
+    gold: test
+    note: "Coverage = test work, no 'test' verb."
+
+  # ── ops fused vs ops dominant ───────────────────────────────────────────────
+  - text: "Implémente l'endpoint CSV avec pagination puis commit et push la branche"
+    gold: implementation
+    note: "ops (commit/push) must NOT short-circuit a dominant implementation intent."
+  - text: "Commit, push, et ouvre la PR"
+    gold: ops
+    note: "Pure git plumbing, nothing else."
+
+  # ── feedback / steering vs fresh task ───────────────────────────────────────
+  - text: "En fait, mets plutôt la légende à droite, elle chevauche les barres"
+    gold: feedback
+    note: "Course-correction on the assistant's output, not a fresh task."
+  - text: "Ça change rien, c'est toujours le même problème qu'avant"
+    gold: feedback
+    note: "Steering on a non-effect — not a fresh debug request."
+  - text: "Looks good but the legend still overlaps the bars"
+    gold: feedback
+    note: "Caveated approval — EN equivalent of the steering case."
+
+  # ── debug ───────────────────────────────────────────────────────────────────
+  - text: "Ça marche pas, ça plante au démarrage avec une traceback"
+    gold: debug
+    note: "Unaccented FR failure report — the bread-and-butter debug case."
+  - text: "Why does the nightly job double-count rows?"
+    gold: debug
+    note: "Investigation of a wrong result."
+  - text: "Tests fail on Windows only — investigate the path handling"
+    gold: debug
+    note: "Cites 'tests' but the ask is to investigate a failure → debug, not test."
+
+  # ── plan / refactor / review / docs / question ──────────────────────────────
+  - text: "Comment structurer la migration multi-tenant ?"
+    gold: plan
+    note: "Design/strategy question about how to structure work."
+  - text: "Propose an architecture for the distributed cache"
+    gold: plan
+    note: "Architecture proposal."
+  - text: "Extrais la logique de coût dupliquée dans un seul helper"
+    gold: refactor
+    note: "Restructuring without behaviour change."
+  - text: "Relis le diff avant que j'ouvre la PR"
+    gold: review
+    note: "Asking for a read-over, not a change."
+  - text: "Audite la gestion d'erreurs du pipeline d'export"
+    gold: review
+    note: "Audit = review."
+  - text: "Mets à jour le README et le changelog pour la release"
+    gold: docs
+    note: "Documentation upkeep."
+  - text: "C'est quoi la différence entre cache_read et cache_write en facturation ?"
+    gold: question
+    note: "Pure knowledge question, no task."
+  - text: "Is there a way to stream large CSVs in pandas?"
+    gold: question
+    note: "EN knowledge question."
+
+  # ── short-circuits & other ──────────────────────────────────────────────────
+  - text: "ok go"
+    gold: followup
+    note: "Pure acknowledgement / steering token."
+  - text: "oui vas-y, continue"
+    gold: followup
+    note: "FR acknowledgement."
+  - text: "<task-notification>Background task 'lint' completed</task-notification>"
+    gold: notification
+    note: "A turn that is nothing but a task-notification block carries no user intent."
+  - text: "anglais"
+    gold: other
+    note: "A single bare word with no intent — must fall through to other, not be over-classified."

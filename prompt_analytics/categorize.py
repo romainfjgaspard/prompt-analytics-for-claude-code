@@ -52,8 +52,20 @@ OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
 OLLAMA_MODEL = "llama3"
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 
+# Azure OpenAI: the deployment name *is* the model id, so there is no default
+# here -- it is read from AZURE_OPENAI_DEPLOYMENT (or --model). The API version
+# is a sane recent default, overridable via AZURE_OPENAI_API_VERSION.
+AZURE_API_VERSION = "2024-12-01-preview"
+
 MAX_PROMPT_CHARS = 2000
 MAX_TOKENS = 16
+# Azure deployments are frequently reasoning models (gpt-5-class) that spend
+# completion tokens on hidden reasoning before the visible reply, so the
+# 16-token cap above would starve the "category|complexity" answer. Give the
+# Azure path a generous completion budget (only tokens actually produced are
+# billed; the visible reply stays tiny) and request it via
+# ``max_completion_tokens`` (reasoning models reject ``max_tokens``).
+AZURE_MAX_COMPLETION_TOKENS = 1024
 
 # Bound the batch poll (3.5): Anthropic Message Batches are documented to finish
 # within 24h, so a `while True` that never ends means something is wrong. Poll
@@ -612,11 +624,13 @@ def _classify_heuristic(text: str) -> str:
 SEMANTIC_VERSION = "semantic-st-v1"
 _SEMANTIC_PREFIX = "semantic-"
 
-# Calibrated defaults (B1.3 tunes these on the litmus + LLM-judge eval). They are
-# overridable per-user via a ``semantic:`` section in config.yml -- reproducible
-# and adjustable without touching code.
-DEFAULT_TAU = 0.30  # below this best score → "other" (drives the "other" volume)
-DEFAULT_PRIME_WEIGHT = 0.70  # scales the lexical prime onto the cosine scale
+# Calibrated defaults. Tuned by ``scripts/eval_semantic.py`` (B1.3) with a
+# grid search that maximises litmus accuracy, tie-broken by LLM-judge agreement,
+# on the demo corpus with the real static embedder. They are overridable per-user
+# via a ``semantic:`` section in config.yml or the ``--tau`` / ``--prime-weight``
+# / ``--top-k`` CLI flags -- reproducible and adjustable without touching code.
+DEFAULT_TAU = 0.325  # below this best score → "other" (drives the "other" volume)
+DEFAULT_PRIME_WEIGHT = 0.60  # scales the lexical prime onto the cosine scale
 DEFAULT_TOP_K = 1  # prototype aggregation: 1 = max, >1 = mean of the top-k
 
 
@@ -1023,7 +1037,80 @@ class _OllamaClassifier:
             return "", ""
 
 
+class _AzureOpenAIClassifier:
+    """Azure OpenAI classifier (OpenAI-compatible chat completions).
+
+    Added for the dev-time "silver" LLM judge of the semantic eval (B1.3), where
+    Azure OpenAI is the only reachable LLM. The ``model`` is the Azure
+    *deployment* name. Unlike the OpenRouter/Ollama paths, this one requests
+    :data:`AZURE_MAX_COMPLETION_TOKENS` via ``max_completion_tokens`` and never
+    sets ``temperature`` -- both are required by reasoning deployments
+    (gpt-5-class), which would otherwise reject the call or return an empty reply
+    after spending the tiny token cap on hidden reasoning.
+    """
+
+    def __init__(self, client: _OpenAIClient, model: str) -> None:
+        self._client = client
+        self.model = model
+
+    def _call(self, text: str) -> tuple[str, str]:
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": text[:MAX_PROMPT_CHARS]},
+                ],
+                max_completion_tokens=AZURE_MAX_COMPLETION_TOKENS,
+            )
+            return _parse_reply(response.choices[0].message.content or "")
+        except Exception as exc:
+            # Duck-typed by exception class name (same approach as OpenRouter):
+            # the Azure SDK shares OpenAI's error hierarchy but we avoid a hard
+            # import here.
+            name = type(exc).__name__
+            if "Authentication" in name or "Permission" in name:
+                raise _PermanentError(f"Invalid Azure key/endpoint: {exc}") from exc
+            if "RateLimit" in name:
+                raise _TransientError(f"Rate limit: {exc}") from exc
+            raise _TransientError(f"API error: {exc}") from exc
+
+    def classify(self, text: str) -> tuple[str, str]:
+        result = _call_with_retry(lambda: self._call(text))
+        return result if result is not None else ("", "")
+
+
 # ── client builder ────────────────────────────────────────────────────────────
+
+
+def _build_azure(model: str) -> _AzureOpenAIClassifier | None:
+    """Build an Azure OpenAI classifier, or ``None`` if its env is incomplete.
+
+    Returns ``None`` silently when the Azure keys are absent (so it can be tried
+    as a fallback in ``auto`` mode without noise); prints once when the keys are
+    present but the ``openai`` package is missing.
+    """
+    key = os.getenv("AZURE_OPENAI_API_KEY", "")
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+    if not key or not endpoint:
+        return None
+    print(
+        "PRIVACY WARNING: prompt excerpts will be sent to Azure OpenAI (third party).",
+        file=sys.stderr,
+    )
+    try:
+        from openai import AzureOpenAI
+    except ImportError:
+        print("openai package required for Azure (pip install openai).", file=sys.stderr)
+        return None
+    return _AzureOpenAIClassifier(
+        AzureOpenAI(
+            api_key=key,
+            azure_endpoint=endpoint,
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", AZURE_API_VERSION),
+        ),
+        model=model or os.getenv("AZURE_OPENAI_DEPLOYMENT", ""),
+    )
 
 
 def build_client(
@@ -1031,15 +1118,31 @@ def build_client(
     provider: str = "auto",
     model: str = "",
     use_batch: bool = False,
-) -> _AnthropicClassifier | _OpenRouterClassifier | _OllamaClassifier | None:
+) -> (
+    _AnthropicClassifier
+    | _OpenRouterClassifier
+    | _OllamaClassifier
+    | _AzureOpenAIClassifier
+    | None
+):
     """Build an LLM Classifier from environment variables.
 
-    provider: ``"auto"`` (ANTHROPIC_API_KEY first, then OPENROUTER_API_KEY),
-    ``"anthropic"``, ``"openrouter"``, or ``"ollama"``.
+    provider: ``"auto"`` (ANTHROPIC_API_KEY, then OPENROUTER_API_KEY, then
+    AZURE_OPENAI_API_KEY), ``"anthropic"``, ``"openrouter"``, ``"ollama"``, or
+    ``"azure"``.
     """
     from dotenv import load_dotenv
 
     load_dotenv()
+
+    if provider == "azure":
+        if not os.getenv("AZURE_OPENAI_API_KEY") or not os.getenv("AZURE_OPENAI_ENDPOINT"):
+            print(
+                "AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT must be set in .env.",
+                file=sys.stderr,
+            )
+            return None
+        return _build_azure(model)
 
     if provider == "ollama":
         try:
@@ -1091,8 +1194,12 @@ def build_client(
                 )
             except ImportError:
                 pass
+        azure = _build_azure(model)
+        if azure is not None:
+            return azure
         print(
-            "No LLM API key found. Set ANTHROPIC_API_KEY (or OPENROUTER_API_KEY) in .env.",
+            "No LLM API key found. Set ANTHROPIC_API_KEY, OPENROUTER_API_KEY, or "
+            "AZURE_OPENAI_API_KEY (+ AZURE_OPENAI_ENDPOINT) in .env.",
             file=sys.stderr,
         )
         return None
@@ -1195,6 +1302,9 @@ def run_categorize(
     delay: float = 0.1,
     limit: int = 0,
     embedder: Embedder | None = None,
+    tau: float | None = None,
+    prime_weight: float | None = None,
+    top_k: int | None = None,
 ) -> int:
     """Classify prompts into categories.csv; return count newly classified.
 
@@ -1318,11 +1428,18 @@ def run_categorize(
 
         emb = embedder if embedder is not None else StaticEmbedder()
         cfg = load_config(out).get("semantic") or {}
+        # Precedence: explicit CLI flag > config.yml > calibrated default.
+        resolved_tau = tau if tau is not None else float(cfg.get("tau", DEFAULT_TAU))
+        resolved_pw = (
+            prime_weight if prime_weight is not None
+            else float(cfg.get("prime_weight", DEFAULT_PRIME_WEIGHT))
+        )
+        resolved_top_k = top_k if top_k is not None else int(cfg.get("top_k", DEFAULT_TOP_K))
         clf = SemanticClassifier(
             emb,
-            tau=float(cfg.get("tau", DEFAULT_TAU)),
-            prime_weight=float(cfg.get("prime_weight", DEFAULT_PRIME_WEIGHT)),
-            top_k=int(cfg.get("top_k", DEFAULT_TOP_K)),
+            tau=resolved_tau,
+            prime_weight=resolved_pw,
+            top_k=resolved_top_k,
         )
         ids = [r["prompt_id"] for r in to_classify]
         raws = [
