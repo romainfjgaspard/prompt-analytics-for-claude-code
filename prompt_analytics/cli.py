@@ -432,10 +432,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Categorize prompts (heuristic by default, --llm for LLM).",
     )
     _add_output_dir(p_categorize)
-    p_categorize.add_argument(
+    categorize_mode = p_categorize.add_mutually_exclusive_group()
+    categorize_mode.add_argument(
         "--llm",
         action="store_true",
         help="Use an LLM API instead of the heuristic classifier.",
+    )
+    categorize_mode.add_argument(
+        "--semantic",
+        action="store_true",
+        help="Use the offline semantic classifier (embeddings, no API key).",
     )
     p_categorize.add_argument(
         "--batch",
@@ -1090,6 +1096,7 @@ def _handle_categorize(args: argparse.Namespace) -> int:
     count = categorize.run_categorize(
         output_dir=args.output_dir,
         use_llm=args.llm,
+        use_semantic=args.semantic,
         use_batch=args.batch,
         provider=args.provider,
         model=args.model,

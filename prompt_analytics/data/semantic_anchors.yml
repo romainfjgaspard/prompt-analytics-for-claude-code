@@ -1,0 +1,159 @@
+# Semantic anchors — the SHARED source of truth for prompt categories (Axe B1).
+#
+# Both classifiers read this one file, so they can never describe different
+# things for the same label:
+#   * `categorize --semantic` (offline, embeddings): the `semantic`-role
+#     categories' `examples` become DISTINCT prototypes (never averaged — a
+#     category covers several sub-forms, e.g. debug = "fix the null pointer" AND
+#     "why does the CI fail").
+#   * `categorize --llm`: the `definition` of every category is rendered into the
+#     LLM SYSTEM_PROMPT (see categorize.build_system_prompt).
+#
+# Editable / community-driven. Keep examples realistic and BALANCED FR + EN so
+# both languages live in the one shared vector space.
+#
+# Per category:
+#   definition: one-line intent description (feeds the LLM SYSTEM_PROMPT).
+#   role:
+#     semantic — scored by cosine to its `examples` (the prototypes).
+#     lexical  — no prototype; scored by a reused lexical prime (regex) that
+#                COMPETES for the single label rather than overriding it
+#                (so "implement X then commit" stays implementation).
+#     shortcut — hard short-circuit, decided before scoring (notification block,
+#                short acknowledgement).
+#     fallback — "everything else": no prototype, this is exactly the "below the
+#                threshold τ" case.
+#   examples: realistic FR + EN prompts. Used as prototypes only for `semantic`
+#     roles; for the other roles they merely document the category.
+#
+# Order matters: it is the order categories are listed in the LLM SYSTEM_PROMPT.
+
+categories:
+  plan:
+    definition: "planning, architecture, design decisions"
+    role: semantic
+    examples:
+      - "design an architecture for the distributed cache"
+      - "what is the best way to structure this new feature?"
+      - "let's plan the migration step by step before writing any code"
+      - "propose une architecture pour le cache distribué"
+      - "comment organiser le découpage en modules ?"
+      - "quelle stratégie pour migrer la base sans interruption ?"
+
+  implementation:
+    definition: "writing new code or features"
+    role: semantic
+    examples:
+      - "write a function that parses the CSV export"
+      - "add a login endpoint to the API"
+      - "implement pagination on the results page"
+      - "implémente la validation des champs du formulaire"
+      - "crée un endpoint pour la connexion utilisateur"
+      - "ajoute un bouton d'export dans la barre latérale"
+
+  debug:
+    definition: "fixing errors, investigating failures or crashes"
+    role: semantic
+    examples:
+      - "fix the null pointer exception in user.py"
+      - "why does the test crash with a traceback?"
+      - "the build is broken after the last merge, find out why"
+      - "corrige l'erreur qui plante au démarrage"
+      - "pourquoi ça ne marche plus après le merge ?"
+      - "il y a un bug, le calcul renvoie une valeur fausse"
+
+  refactor:
+    definition: "improving or restructuring existing code"
+    role: semantic
+    examples:
+      - "refactor the auth module to use the new token format"
+      - "clean up this function, it has grown too long"
+      - "rename these variables to be more descriptive"
+      - "refactorise le service pour simplifier les requêtes"
+      - "nettoie ce code et enlève les répétitions"
+      - "renomme la classe pour quelque chose de plus clair"
+
+  review:
+    definition: "reviewing, auditing or verifying code, results or project state"
+    role: semantic
+    examples:
+      - "review this pull request for correctness"
+      - "take a look at the diff and tell me if it's sound"
+      - "audit the project for security issues"
+      - "relis le code et dis-moi ce qui cloche"
+      - "vérifie que l'implémentation est correcte"
+      - "fais un point sur l'état du projet"
+
+  test:
+    definition: "writing or running tests, CI, coverage"
+    role: semantic
+    examples:
+      - "write unit tests for the parser"
+      - "add a test case covering the empty-input edge case"
+      - "make sure the CI passes with full coverage"
+      - "ajoute des tests pour la nouvelle fonction"
+      - "écris un test qui couvre ce cas limite"
+      - "vérifie que la couverture reste au-dessus de 85 %"
+
+  docs:
+    definition: "README, changelog, comments, status files, documentation"
+    role: semantic
+    examples:
+      - "update the README with the new commands"
+      - "add docstrings to these functions"
+      - "write a changelog entry for this release"
+      - "mets à jour la doc avec les nouvelles options"
+      - "ajoute des commentaires pour expliquer ce bloc"
+      - "écris la section installation du README"
+
+  ops:
+    definition: "git operations (commit, push, merge, PR), deploys, running scripts or jobs"
+    role: lexical
+    examples:
+      - "commit and push the branch, then open a PR"
+      - "merge the feature branch into main"
+      - "commit puis pousse la branche"
+      - "lance le script de déploiement"
+
+  question:
+    definition: "explanations, understanding"
+    role: semantic
+    examples:
+      - "explain how the caching layer works"
+      - "what does this decorator do?"
+      - "what's the difference between these two approaches?"
+      - "explique comment fonctionne le cache"
+      - "à quoi sert ce paramètre ?"
+      - "quelle est la différence entre les deux méthodes ?"
+
+  followup:
+    definition: 'short conversational steering ("yes", "ok", "continue", option picks)'
+    role: shortcut
+    examples:
+      - "yes"
+      - "ok, continue"
+      - "oui, vas-y"
+      - "les deux"
+
+  feedback:
+    definition: >-
+      reacting to or correcting the assistant's work without a new task --
+      critique, course-correction, preferences ("no, rather like this",
+      "almost, but the order is wrong", "actually I changed my mind",
+      "still the same", "not quite")
+    role: lexical
+    examples:
+      - "no, rather put the legend on the right, it overlaps the bars"
+      - "actually I changed my mind, keep the old layout"
+      - "en fait, fais plutôt l'inverse"
+      - "c'est presque ça mais l'ordre est inversé"
+
+  notification:
+    definition: >-
+      a harness-injected task-notification block (background task / sub-agent
+      finished) -- not a human prompt
+    role: shortcut
+
+  other:
+    definition: "everything else"
+    role: fallback

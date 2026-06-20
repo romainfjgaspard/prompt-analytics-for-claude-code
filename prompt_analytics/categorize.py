@@ -11,23 +11,39 @@ checkpoints, and Anthropic Message Batches (``--batch``, −50% cost).
 from __future__ import annotations
 
 import csv
+import importlib.resources
 import os
 import re
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
+
+import numpy as np
+import yaml
 
 if TYPE_CHECKING:
     from anthropic import Anthropic as _AnthropicClient
     from openai import OpenAI as _OpenAIClient
 
+    from .embeddings import Embedder, FloatMatrix
+
 from .schema import CATEGORIES_COLS
 from .storage import atomic_write_csv
 
-__all__ = ["run_categorize", "build_client", "SYSTEM_PROMPT", "HEURISTIC_VERSION"]
+__all__ = [
+    "run_categorize",
+    "build_client",
+    "SYSTEM_PROMPT",
+    "HEURISTIC_VERSION",
+    "SEMANTIC_VERSION",
+    "SemanticClassifier",
+    "load_anchors",
+    "build_system_prompt",
+]
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
@@ -91,35 +107,40 @@ _TIE_BREAK_ORDER = (
     "other",
 )
 
-SYSTEM_PROMPT = """\
-You classify developer prompts sent to an AI coding assistant.
-Reply with exactly "category|complexity" -- two values separated by a pipe, nothing else.
+# ── shared category source of truth (semantic_anchors.yml) ─────────────────────
 
-Category (pick one):
-- plan: planning, architecture, design decisions
-- implementation: writing new code or features
-- debug: fixing errors, investigating failures or crashes
-- refactor: improving or restructuring existing code
-- review: reviewing, auditing or verifying code, results or project state
-- test: writing or running tests, CI, coverage
-- docs: README, changelog, comments, status files, documentation
-- ops: git operations (commit, push, merge, PR), deploys, running scripts or jobs
-- question: explanations, understanding
-- followup: short conversational steering ("yes", "ok", "continue", option picks)
-- feedback: reacting to or correcting the assistant's work without a new task -- \
-critique, course-correction, preferences ("no, rather like this", "almost, but the \
-order is wrong", "actually I changed my mind", "still the same", "not quite")
-- notification: a harness-injected task-notification block (background task / \
-sub-agent finished) -- not a human prompt
-- other: everything else
+# The anchors file is the single, editable source of truth shared by both
+# classifiers (see prompt_analytics/data/semantic_anchors.yml): the LLM
+# SYSTEM_PROMPT renders its definitions, the semantic classifier embeds the
+# `semantic`-role examples as prototypes. Keeping them in one file is what stops
+# the two modes from quietly describing the same label differently.
 
+# Roles a category can play in the offline semantic classifier.
+_ROLE_SEMANTIC = "semantic"
+_ROLE_LEXICAL = "lexical"
+_ROLE_SHORTCUT = "shortcut"
+_ROLE_FALLBACK = "fallback"
+_VALID_ROLES = {_ROLE_SEMANTIC, _ROLE_LEXICAL, _ROLE_SHORTCUT, _ROLE_FALLBACK}
+
+# Categories whose lexical prime competes for the single label. They reuse the
+# heuristic regex (high-precision git verbs, discourse markers) rather than a
+# prototype, so a prompt like "implement X then commit" still wins on its
+# dominant intent instead of being short-circuited to ops.
+_LEXICAL_PRIME_CATEGORIES = ("ops", "feedback")
+
+# The LLM-only tail of the prompt: the complexity scale and a few illustrative
+# mappings. (Complexity is rated from observed effort, never from the LLM, so
+# these stay curated here rather than in the anchors file -- the divergence-prone
+# part, the category *definitions*, is what we render from the shared YAML.)
+_COMPLEXITY_SCALE = """\
 Complexity (1-5):
 1 = trivial one-liner or yes/no ("yes", "ok", "continue")
 2 = simple, single-step request
 3 = moderate, requires reading a few files or reasoning
 4 = complex, multi-step or cross-cutting task
-5 = very complex, architectural change or deep investigation
+5 = very complex, architectural change or deep investigation"""
 
+_FEWSHOT_EXAMPLES = """\
 Examples:
 "yes" -> followup|1
 "fix the null pointer in user.py" -> debug|2
@@ -127,6 +148,84 @@ Examples:
 "refactor the auth module to use the new token format" -> refactor|3
 "no, rather put the legend on the right, it overlaps the bars" -> feedback|2
 "analyze the project and propose an architecture for the distributed cache" -> plan|5"""
+
+_anchors_cache: dict[str, dict[str, Any]] | None = None
+
+
+def _anchors_path() -> Path:
+    """Path to the bundled ``semantic_anchors.yml`` (via importlib.resources)."""
+    ref = importlib.resources.files("prompt_analytics.data") / "semantic_anchors.yml"
+    return Path(str(ref))
+
+
+def load_anchors(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
+    """Load (and validate) the shared category anchors, keyed by category name.
+
+    The bundled file is parsed once and cached; pass an explicit ``path`` to
+    load a custom file (tests, power users) without touching the cache. Every
+    category must be a known one with a valid role, and each ``semantic``
+    category must carry at least one prototype example -- a malformed anchors
+    file is a packaging/editing bug, so it fails loudly here rather than
+    silently producing a classifier with no prototypes.
+    """
+    global _anchors_cache
+    if path is None and _anchors_cache is not None:
+        return _anchors_cache
+
+    src = Path(path) if path is not None else _anchors_path()
+    with src.open(encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    categories = (data or {}).get("categories")
+    if not isinstance(categories, dict) or not categories:
+        raise ValueError(f"{src}: missing or empty 'categories' mapping")
+
+    for name, spec in categories.items():
+        if name not in CATEGORIES:
+            raise ValueError(f"{src}: unknown category {name!r} (not in the taxonomy)")
+        role = spec.get("role")
+        if role not in _VALID_ROLES:
+            raise ValueError(f"{src}: category {name!r} has invalid role {role!r}")
+        if not spec.get("definition"):
+            raise ValueError(f"{src}: category {name!r} has no definition")
+        if role == _ROLE_SEMANTIC and not spec.get("examples"):
+            raise ValueError(f"{src}: semantic category {name!r} has no prototype examples")
+
+    if path is None:
+        _anchors_cache = categories
+    return categories
+
+
+def build_system_prompt(anchors: dict[str, dict[str, Any]] | None = None) -> str:
+    """Render the LLM SYSTEM_PROMPT from the shared anchors (definitions block).
+
+    The category list -- the part most prone to drifting from the offline
+    classifier -- is generated from the same file the semantic prototypes come
+    from. The complexity scale and few-shot examples are appended verbatim.
+    """
+    anchors = anchors if anchors is not None else load_anchors()
+    # Collapse any folded/multi-line YAML definition into one prompt line.
+    cat_lines = [
+        f"- {name}: {' '.join(str(spec['definition']).split())}"
+        for name, spec in anchors.items()
+    ]
+    return "\n".join(
+        [
+            "You classify developer prompts sent to an AI coding assistant.",
+            'Reply with exactly "category|complexity" -- two values separated by a '
+            "pipe, nothing else.",
+            "",
+            "Category (pick one):",
+            *cat_lines,
+            "",
+            _COMPLEXITY_SCALE,
+            "",
+            _FEWSHOT_EXAMPLES,
+        ]
+    )
+
+
+# Built once at import from the shared anchors so both modes stay in lock-step.
+SYSTEM_PROMPT = build_system_prompt()
 
 
 # ── heuristic classifier ──────────────────────────────────────────────────────
@@ -502,6 +601,172 @@ def _classify_heuristic(text: str) -> str:
     if scores[best] > 0.0:
         return best
     return "question" if stripped.endswith("?") else "other"
+
+
+# ── semantic classifier (offline embeddings, mono-label) ───────────────────────
+
+# Version stamp written to ``classifier_model`` by the semantic classifier
+# ("st" = the static model is distilled from a sentence-transformer). Bumping it
+# makes the next ``--semantic`` run re-classify rows stamped with an *older*
+# semantic version, mirroring the heuristic's re-classify-if-stale logic.
+SEMANTIC_VERSION = "semantic-st-v1"
+_SEMANTIC_PREFIX = "semantic-"
+
+# Calibrated defaults (B1.3 tunes these on the litmus + LLM-judge eval). They are
+# overridable per-user via a ``semantic:`` section in config.yml -- reproducible
+# and adjustable without touching code.
+DEFAULT_TAU = 0.30  # below this best score → "other" (drives the "other" volume)
+DEFAULT_PRIME_WEIGHT = 0.70  # scales the lexical prime onto the cosine scale
+DEFAULT_TOP_K = 1  # prototype aggregation: 1 = max, >1 = mean of the top-k
+
+
+def _lexical_evidence(text: str, patterns: list[re.Pattern[str]]) -> float:
+    """Saturating evidence in [0, 1) from how many lexical patterns fire.
+
+    ``1 - 0.4**hits``: one hit → 0.6, two → 0.84, three → 0.94. A single
+    unambiguous git verb already clears τ once weighted, while extra matches add
+    diminishing confidence rather than running away.
+    """
+    hits = sum(1 for pat in patterns if pat.search(text))
+    return 0.0 if hits == 0 else 1.0 - 0.4**hits
+
+
+@dataclass
+class _Prepared:
+    """A prompt readied for semantic scoring (noise stripped, flags resolved)."""
+
+    text: str  # harness chrome removed; used for embedding *and* lexical scoring
+    had_notification: bool
+    is_ack: bool
+
+
+class SemanticClassifier:
+    """Mono-label classifier over embeddings + a fused lexical prime (Axe B1).
+
+    One category per prompt, chosen as follows:
+
+    1. **Hard short-circuits** (a single intent is possible): a turn that is
+       nothing but a ``<task-notification>`` block → ``notification``; a short
+       pure-acknowledgement → ``followup``. These reuse the heuristic guard
+       rails so the two modes agree on the unambiguous cases.
+    2. **Scored categories**, combined in one logit space and resolved by argmax:
+       - ``semantic`` categories score the **max (or top-k mean) cosine** to
+         their *distinct* prototypes (never an averaged centroid, which would
+         blur a category's sub-forms);
+       - ``lexical`` categories (ops, feedback) score a reused regex prime,
+         scaled by ``prime_weight`` onto the cosine scale, so they **compete**
+         for the label without overriding a stronger intent.
+    3. If the best score is below ``tau`` → ``other`` (which has no prototype:
+       "everything else" is exactly the sub-threshold case).
+
+    Ties are broken deterministically by :data:`_TIE_BREAK_ORDER` (more specific
+    intent first), never by dict iteration order.
+
+    The embedder is injected (the heavy external dependency): production passes a
+    :class:`~prompt_analytics.embeddings.StaticEmbedder`; tests pass the
+    deterministic :class:`~prompt_analytics.embeddings.HashingEmbedder` so the
+    whole scoring path runs in CI without downloading the model.
+    """
+
+    def __init__(
+        self,
+        embedder: Embedder,
+        *,
+        anchors: dict[str, dict[str, Any]] | None = None,
+        tau: float = DEFAULT_TAU,
+        prime_weight: float = DEFAULT_PRIME_WEIGHT,
+        top_k: int = DEFAULT_TOP_K,
+    ) -> None:
+        self.embedder = embedder
+        self.tau = tau
+        self.prime_weight = prime_weight
+        self.top_k = max(1, top_k)
+        anchors = anchors if anchors is not None else load_anchors()
+
+        # Semantic prototypes: one matrix of all prototypes, plus the owning
+        # category index per row, so a category's score is a slice + reduce.
+        self._semantic_cats: list[str] = []
+        proto_texts: list[str] = []
+        owners: list[int] = []
+        for name, spec in anchors.items():
+            if spec.get("role") != _ROLE_SEMANTIC:
+                continue
+            examples = list(spec.get("examples") or [])
+            if not examples:
+                continue
+            idx = len(self._semantic_cats)
+            self._semantic_cats.append(name)
+            proto_texts.extend(examples)
+            owners.extend([idx] * len(examples))
+        self._proto_owner = np.asarray(owners, dtype=np.intp)
+        self._proto_matrix: FloatMatrix = (
+            embedder.embed(proto_texts)
+            if proto_texts
+            else np.zeros((0, 0), dtype=np.float32)
+        )
+
+        # Lexical prime patterns, reused verbatim from the heuristic rules so the
+        # two modes share the same regex (single source of lexical truth).
+        lexical_cats = [c for c in _LEXICAL_PRIME_CATEGORIES if anchors.get(c, {}).get("role") == _ROLE_LEXICAL]
+        compiled = {cat: pats for cat, pats, _w in _compile_rules()}
+        self._lexical_patterns: dict[str, list[re.Pattern[str]]] = {
+            cat: compiled[cat] for cat in lexical_cats if cat in compiled
+        }
+
+    @property
+    def dim(self) -> int:
+        """Embedding dimension (0 until any prototype has been embedded)."""
+        return 0 if self._proto_matrix.size == 0 else int(self._proto_matrix.shape[1])
+
+    def prepare(self, raw: str) -> _Prepared:
+        """Strip harness chrome and resolve the short-circuit flags."""
+        had_notification = _TASK_NOTIFICATION_RE.search(raw) is not None
+        cleaned = _NOISE_WRAPPER_RE.sub(" ", raw)
+        stripped = cleaned.strip()
+        is_ack = len(stripped) <= _FOLLOWUP_MAX_CHARS and bool(_ACK_RE.match(stripped))
+        return _Prepared(text=cleaned, had_notification=had_notification, is_ack=is_ack)
+
+    def _scores(self, clean_text: str, vector: FloatMatrix) -> dict[str, float]:
+        """Combined per-category logit scores (semantic cosine + lexical prime)."""
+        scores: dict[str, float] = {}
+        vec = np.asarray(vector, dtype=np.float32).reshape(-1)
+        if self._proto_matrix.shape[0] and vec.shape[0] == self._proto_matrix.shape[1]:
+            sims = self._proto_matrix @ vec  # vectors are L2-normalized → cosine
+            for idx, cat in enumerate(self._semantic_cats):
+                cat_sims = sims[self._proto_owner == idx]
+                if cat_sims.size == 0:
+                    continue
+                k = min(self.top_k, cat_sims.size)
+                scores[cat] = float(np.sort(cat_sims)[-k:].mean())
+        for cat, patterns in self._lexical_patterns.items():
+            evidence = _lexical_evidence(clean_text, patterns)
+            if evidence > 0.0:
+                scores[cat] = self.prime_weight * evidence
+        return scores
+
+    def label(self, prep: _Prepared, vector: FloatMatrix) -> str:
+        """Resolve the single category from a prepared prompt + its embedding."""
+        if prep.had_notification and not prep.text.strip():
+            return "notification"
+        if prep.is_ack:
+            return "followup"
+        scores = self._scores(prep.text, vector)
+        best_cat, best_score = "other", float("-inf")
+        for cat in _TIE_BREAK_ORDER:  # deterministic tie-break (specific first)
+            score = scores.get(cat)
+            if score is not None and score > best_score:
+                best_score, best_cat = score, cat
+        return best_cat if best_score >= self.tau else "other"
+
+    def classify(self, raw: str) -> str:
+        """Classify one prompt end to end (prepare → embed → label)."""
+        prep = self.prepare(raw)
+        if prep.had_notification and not prep.text.strip():
+            return "notification"
+        if prep.is_ack:
+            return "followup"
+        vector = self.embedder.embed([prep.text])
+        return self.label(prep, vector[0] if vector.shape[0] else vector)
 
 
 # ── observed complexity ───────────────────────────────────────────────────────
@@ -922,21 +1187,35 @@ def run_categorize(
     *,
     output_dir: str = "./output",
     use_llm: bool = False,
+    use_semantic: bool = False,
     use_batch: bool = False,
     provider: str = "auto",
     model: str = "",
     batch_size: int = 50,
     delay: float = 0.1,
     limit: int = 0,
+    embedder: Embedder | None = None,
 ) -> int:
     """Classify prompts into categories.csv; return count newly classified.
 
-    Default (use_llm=False): heuristic regex classifier, no API key needed.
+    Three modes: heuristic regex (default), the offline semantic classifier
+    (``use_semantic``, embeddings, no API key), and the LLM (``use_llm``).
     Observed complexity (quantile bands) is always recomputed for all real
-    prompts. Category is never overwritten for prompts that already have one,
-    with one exception: in heuristic mode, rows stamped with an *older*
-    heuristic version are re-classified by the current rules
-    (:data:`HEURISTIC_VERSION`). LLM-classified rows are never overwritten.
+    prompts.
+
+    Category is never overwritten across a more authoritative classifier:
+
+    * heuristic mode only redoes its own *stale*-version rows
+      (:data:`HEURISTIC_VERSION`);
+    * semantic mode supersedes heuristic rows (it is the richer classifier) and
+      redoes its own stale-version rows (:data:`SEMANTIC_VERSION`), but never
+      touches LLM-stamped rows;
+    * LLM-classified rows are never overwritten by either offline mode.
+
+    ``embedder`` is an injection seam for ``use_semantic`` (the heavy model is
+    the only external dependency): it defaults to the real
+    :class:`~prompt_analytics.embeddings.StaticEmbedder`; tests pass the
+    deterministic ``HashingEmbedder``.
     Prompts without any stored text (``extract --no-text``) are skipped with
     a warning and left uncategorized, never silently filed under "other".
 
@@ -982,15 +1261,22 @@ def run_categorize(
     # Prompts that still need a category. LLM rows are never overwritten; in
     # heuristic mode, rows stamped with an older heuristic version are redone
     # so a rules upgrade propagates without nuking LLM classifications.
-    def _stale_heuristic(pid: str) -> bool:
+    def _supersedable(pid: str) -> bool:
+        """Whether the current mode may (re)classify a row that already has one."""
         model_used = categories.get(pid, {}).get("classifier_model", "")
+        if use_llm:
+            return False  # the LLM never overwrites an existing category
+        if use_semantic:
+            if model_used.startswith(_HEURISTIC_PREFIX):
+                return True  # semantic supersedes the heuristic default
+            return model_used.startswith(_SEMANTIC_PREFIX) and model_used != SEMANTIC_VERSION
         return model_used.startswith(_HEURISTIC_PREFIX) and model_used != HEURISTIC_VERSION
 
     to_classify = [
         r
         for r in real_prompts
         if not categories.get(r["prompt_id"], {}).get("category")
-        or (not use_llm and _stale_heuristic(r["prompt_id"]))
+        or _supersedable(r["prompt_id"])
     ]
 
     # No stored text (extract --no-text): classifying "" would file everything
@@ -1024,6 +1310,44 @@ def run_categorize(
 
     print(f"Prompts to classify: {total} / {len(real_prompts)}")
     classified = 0
+
+    # ── semantic mode (offline embeddings, mono-label) ──────────────────────────
+    if use_semantic and not use_llm:
+        from .config import load_config
+        from .embeddings import EmbeddingCache, StaticEmbedder
+
+        emb = embedder if embedder is not None else StaticEmbedder()
+        cfg = load_config(out).get("semantic") or {}
+        clf = SemanticClassifier(
+            emb,
+            tau=float(cfg.get("tau", DEFAULT_TAU)),
+            prime_weight=float(cfg.get("prime_weight", DEFAULT_PRIME_WEIGHT)),
+            top_k=int(cfg.get("top_k", DEFAULT_TOP_K)),
+        )
+        ids = [r["prompt_id"] for r in to_classify]
+        raws = [
+            texts.get(pid) or r.get("prompt_preview", "")
+            for r, pid in zip(to_classify, ids, strict=True)
+        ]
+        preps = [clf.prepare(raw) for raw in raws]
+        # Embed the noise-stripped text once, cached on disk by (prompt_id, text)
+        # so a re-run never re-embeds unchanged prompts (the cache is namespaced
+        # by embedder identity, so static and hashing vectors never mix).
+        cache = EmbeddingCache(out / "embeddings.npz", emb)
+        vectors = cache.embed(ids, [prep.text for prep in preps])
+        now = datetime.now(timezone.utc).isoformat()
+        for row, prep, vector in zip(to_classify, preps, vectors, strict=True):
+            categories[row["prompt_id"]].update(
+                {
+                    "category": clf.label(prep, vector),
+                    "classifier_model": SEMANTIC_VERSION,
+                    "classified_at": now,
+                }
+            )
+            classified += 1
+        _flush(categories, out / "categories.csv")
+        print(f"Classified {classified}  ->  {(out / 'categories.csv').resolve()}")
+        return classified
 
     # ── heuristic mode ────────────────────────────────────────────────────────
     if not use_llm:
