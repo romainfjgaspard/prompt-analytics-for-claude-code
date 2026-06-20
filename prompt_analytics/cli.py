@@ -39,6 +39,7 @@ examples:
   prompt-analytics by-output                     what Claude produced: language mix, code vs tests
   prompt-analytics by-context                    what fills the cache: loading vs rent per source
   prompt-analytics by-file                       per-file footprint: edits + reads + context cost
+  prompt-analytics by-task                       cost per task: total (with context share), category
   prompt-analytics sessions --depth              marginal prompt cost vs session depth
   prompt-analytics context                       accumulated context per turn (when to /compact)
   prompt-analytics ttl                           what pauses cost in cache re-writes
@@ -201,6 +202,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _provider_arg(p_by_file)
     p_by_file.set_defaults(func=_handle_by_file)
+
+    p_by_task = subparsers.add_parser(
+        "by-task",
+        parents=[analytics_parent],
+        help="Cost by task: total cost (with context share), prompts, span, dominant category.",
+    )
+    _provider_arg(p_by_task)
+    p_by_task.add_argument(
+        "--top",
+        type=int,
+        default=20,
+        metavar="N",
+        help="How many tasks to show, by cost (0 = all; default: %(default)s).",
+    )
+    p_by_task.set_defaults(func=_handle_by_task)
 
     p_prompts = subparsers.add_parser(
         "prompts",
@@ -819,6 +835,19 @@ def _handle_by_file(args: argparse.Namespace) -> int:
     if ds is None:
         return code
     render(analytics.file_footprint(ds, args.provider), args.format)
+    return 0
+
+
+def _handle_by_task(args: argparse.Namespace) -> int:
+    from . import analytics
+    from .render import render
+
+    if code := _check_providers([args.provider], _pricing_path(args)):
+        return code
+    ds, code = _dataset_or_fail(args)
+    if ds is None:
+        return code
+    render(analytics.by_task(ds, args.provider, top=args.top), args.format)
     return 0
 
 

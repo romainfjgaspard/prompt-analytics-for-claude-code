@@ -68,6 +68,7 @@ __all__ = [
     "context_cost",
     "ContextCost",
     "ContextElementCost",
+    "by_task",
     "top_prompts",
     "sessions_table",
     "session_depth",
@@ -1568,6 +1569,160 @@ def file_footprint(ds: Dataset, provider: str) -> TableResult:
             Column("load_usd", "Load $", "money"),
             Column("rent_usd", "Rent $", "money"),
             Column("context_usd", "Context $", "money"),
+        ],
+        rows,
+        notes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axe B2: cost by task -- the task, not the prompt, is the unit of work.
+# ---------------------------------------------------------------------------
+
+# Token types that are context (cache) rather than fresh generation: the share
+# of a task's cost spent re-reading / caching context, the B2 "part contexte".
+_CONTEXT_TOKEN_TYPES = frozenset({"cache_read", "cache_write_5m", "cache_write_1h"})
+
+
+def _parse_iso(value: str) -> datetime | None:
+    """An aware-or-naive datetime from an ISO-8601 string, or None (empty-safe)."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_duration(seconds: float) -> str:
+    """A compact human span (e.g. ``2h 15m``); ``<1m`` under a minute."""
+    total = int(seconds)
+    if total <= 0:
+        return "<1m"
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or not parts:
+        parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def by_task(ds: Dataset, provider: str, *, top: int = 20) -> TableResult:
+    """Cost by task (Axe B2): the task is the unit of work, not the prompt.
+
+    Every real prompt belongs to exactly one task (``task_prompts``), so a task's
+    cost is just its prompts' token rows priced at read time -- it reconciles to
+    the bill by construction (continuation/compaction overhead, tied to no prompt,
+    is excluded and surfaced in the notes). Each row carries the task's total cost
+    and the **context share** of it (the cache reads/writes its prompts paid -- the
+    B2 "this task cost $X, of which Y% is context rent"), its prompt count, its
+    span (a task lives within one session -- ``task_id`` is session-scoped -- so
+    the span is its first->last prompt duration), its ``origin`` (``todo`` spine vs
+    ``inferred``, so readers can weigh it) and its **dominant category** (the most
+    frequent category among its prompts, when ``categorize`` has run). Sorted by
+    cost, top ``top`` (0 = all). Metrics only -- the task name is a Claude-authored
+    todo label or a blanked-under-``--no-text`` snippet, never source content.
+    """
+    engine = CostEngine(provider, ds.pricing_path)
+    task_of = {row["prompt_id"]: row["task_id"] for row in ds.task_prompts}
+
+    total_cost: defaultdict[str, float] = defaultdict(float)
+    context_cost_by_task: defaultdict[str, float] = defaultdict(float)
+    overhead = 0.0
+    for row in ds.tokens:
+        c = engine.cost(row.get("model") or "", row["token_type"], row["token_count"])
+        tid = task_of.get(row["prompt_id"])
+        if tid is None:
+            overhead += c
+            continue
+        total_cost[tid] += c
+        if row["token_type"] in _CONTEXT_TOKEN_TYPES:
+            context_cost_by_task[tid] += c
+
+    dominant: dict[str, Counter[str]] = defaultdict(Counter)
+    for row in ds.task_prompts:
+        info = ds.categories.get(row["prompt_id"])
+        category = (info or {}).get("category") or ""
+        if category:
+            dominant[row["task_id"]][category] += 1
+
+    grand_total = sum(total_cost.values())
+    context_total = sum(context_cost_by_task.values())
+    rows: list[dict[str, Any]] = []
+    for task in ds.tasks:
+        tid = task["task_id"]
+        cost = total_cost.get(tid, 0.0)
+        ctx = context_cost_by_task.get(tid, 0.0)
+        counter = dominant.get(tid)
+        first = _parse_iso(task.get("first_timestamp", ""))
+        last = _parse_iso(task.get("last_timestamp", ""))
+        span = _format_duration((last - first).total_seconds()) if first and last else ""
+        rows.append(
+            {
+                "task": (task.get("name") or tid)[:60],
+                "origin": task.get("origin", ""),
+                "prompts": int(task.get("prompts") or 0),
+                "duration": span,
+                "category": counter.most_common(1)[0][0] if counter else "(uncategorized)",
+                "context_pct": round(100 * ctx / cost, 1) if cost else 0.0,
+                "cost_usd": round(cost, 4),
+                "cost_share_pct": round(100 * cost / grand_total, 1) if grand_total else 0.0,
+            }
+        )
+    rows.sort(key=lambda r: (-r["cost_usd"], r["task"]))
+    if top:
+        rows = rows[:top]
+
+    notes = [_source_note(ds)]
+    if not ds.tasks:
+        notes.append(
+            "No task data -- re-run `prompt-analytics extract` "
+            "(task attribution ships with the latest extractor)."
+        )
+    else:
+        todo_n = sum(1 for t in ds.tasks if t.get("origin") == "todo")
+        sessions_n = len({t.get("session_id") for t in ds.tasks})
+        notes.append(
+            f"{len(ds.tasks):,} tasks across {sessions_n:,} sessions: {todo_n:,} from the "
+            f"TodoWrite spine, {len(ds.tasks) - todo_n:,} inferred (time gap + semantics)."
+        )
+        if grand_total:
+            notes.append(
+                f"Context is {round(100 * context_total / grand_total, 1)}% of task cost "
+                f"(${context_total:,.2f} of ${grand_total:,.2f}) -- the cache reads/writes the "
+                "tasks' prompts paid; per-task share is the Context % column."
+            )
+        if not ds.categories:
+            notes.append(
+                "No categorization found -- run `prompt-analytics categorize` to fill the "
+                "Top category column."
+            )
+    if overhead:
+        notes.append(
+            f"Session overhead (continuations, compactions): ${overhead:,.2f} "
+            "not attributable to a task, excluded above."
+        )
+    if (note := engine.note()) is not None:
+        notes.append(note)
+    if (lc_note := engine.long_context_note()) is not None:
+        notes.append(lc_note)
+
+    return TableResult(
+        f"Cost by task ({provider})",
+        [
+            Column("task", "Task"),
+            Column("origin", "Origin"),
+            Column("prompts", "Prompts", "int"),
+            Column("duration", "Span"),
+            Column("category", "Top category"),
+            Column("context_pct", "Context %", "pct"),
+            Column("cost_usd", f"Cost ({provider})", "money"),
+            Column("cost_share_pct", "Cost %", "pct"),
         ],
         rows,
         notes,

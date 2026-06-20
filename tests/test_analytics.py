@@ -991,3 +991,129 @@ def test_filter_prompt_ids_narrows_output_rows():
     # The narrowed dataset feeds the composition view: only Python survives.
     comp = analytics.output_composition(kept, "anthropic")
     assert [lng.language for lng in comp.languages] == ["Python"]
+
+
+# ---------------------------------------------------------------------------
+# by_task: cost by task (Axe B2), the task as the unit of work.
+# ---------------------------------------------------------------------------
+
+
+def _task_ds() -> Dataset:
+    """One session, two tasks (a todo spine + an inferred one) and a continuation.
+
+    OPUS rates (per 1M): input 5, output 25, cache_read 0.5, cache_write_5m 6.25.
+    t1 = p1 + p2: input $5 + output $5 + cache_read ($1 + $0.5) = $11.50 ($1.50 ctx).
+    t2 = p3: input $2 + cache_write_5m $6.25 = $8.25 ($6.25 ctx). A continuation
+    token row (no task) is the $0.50 overhead, excluded from every task.
+    """
+    tokens = [
+        _token("s1", "p1", OPUS, "input", 1_000_000),  # $5.00
+        _token("s1", "p1", OPUS, "output", 200_000),  # $5.00
+        _token("s1", "p1", OPUS, "cache_read", 2_000_000),  # $1.00 (context)
+        _token("s1", "p2", OPUS, "cache_read", 1_000_000),  # $0.50 (context)
+        _token("s1", "p3", OPUS, "input", 400_000),  # $2.00
+        _token("s1", "p3", OPUS, "cache_write_5m", 1_000_000),  # $6.25 (context)
+        _token("s1", "s1:cont", OPUS, "cache_read", 1_000_000),  # $0.50 overhead
+    ]
+    tasks = [
+        {
+            "task_id": "s1:t01",
+            "session_id": "s1",
+            "name": "Add the export pipeline",
+            "origin": "todo",
+            "prompts": 2,
+            "first_timestamp": "2026-06-01T08:00:00.000Z",
+            "last_timestamp": "2026-06-01T10:30:00.000Z",
+        },
+        {
+            "task_id": "s1:i01",
+            "session_id": "s1",
+            "name": "fix the failing test",
+            "origin": "inferred",
+            "prompts": 1,
+            "first_timestamp": "2026-06-01T11:00:00.000Z",
+            "last_timestamp": "2026-06-01T11:00:00.000Z",
+        },
+    ]
+    task_prompts = [
+        {"task_id": "s1:t01", "prompt_id": "p1"},
+        {"task_id": "s1:t01", "prompt_id": "p2"},
+        {"task_id": "s1:i01", "prompt_id": "p3"},
+    ]
+    categories = {
+        "p1": {"category": "implementation", "complexity": "3"},
+        "p2": {"category": "implementation", "complexity": "2"},
+        "p3": {"category": "debug", "complexity": "2"},
+    }
+    return Dataset(
+        sessions=[{"session_id": "s1", "project": "alpha"}],
+        prompts=[{"session_id": "s1", "prompt_id": pid} for pid in ("p1", "p2", "p3")],
+        tokens=tokens,
+        categories=categories,
+        source="test data",
+        tasks=tasks,
+        task_prompts=task_prompts,
+    )
+
+
+def test_by_task_cost_split_context_and_dominant_category():
+    rows = {r["task"]: r for r in analytics.by_task(_task_ds(), "anthropic").rows}
+
+    t1 = rows["Add the export pipeline"]
+    assert t1["origin"] == "todo"
+    assert t1["prompts"] == 2
+    assert t1["duration"] == "2h 30m"
+    assert t1["category"] == "implementation"
+    assert t1["cost_usd"] == pytest.approx(11.50, abs=1e-6)
+    assert t1["context_pct"] == round(100 * 1.50 / 11.50, 1)  # 13.0
+    assert t1["cost_share_pct"] == round(100 * 11.50 / 19.75, 1)  # 58.2
+
+    t2 = rows["fix the failing test"]
+    assert t2["origin"] == "inferred"
+    assert t2["duration"] == "<1m"  # single instant
+    assert t2["category"] == "debug"
+    assert t2["cost_usd"] == pytest.approx(8.25, abs=1e-6)
+    assert t2["context_pct"] == round(100 * 6.25 / 8.25, 1)  # 75.8
+
+
+def test_by_task_sorted_by_cost_and_top_truncates():
+    rows = analytics.by_task(_task_ds(), "anthropic").rows
+    assert [r["task"] for r in rows] == ["Add the export pipeline", "fix the failing test"]
+    top1 = analytics.by_task(_task_ds(), "anthropic", top=1).rows
+    assert [r["task"] for r in top1] == ["Add the export pipeline"]
+
+
+def test_by_task_notes_origin_split_context_and_overhead():
+    notes = analytics.by_task(_task_ds(), "anthropic").notes
+    spine = next(n for n in notes if "TodoWrite spine" in n)
+    assert "2 tasks across 1 sessions" in spine
+    assert "1 from the TodoWrite spine, 1 inferred" in spine
+    ctx = next(n for n in notes if n.startswith("Context is"))
+    assert "$7.75 of $19.75" in ctx  # 1.50 + 6.25 of 11.50 + 8.25
+    assert "39.2%" in ctx
+    overhead = next(n for n in notes if n.startswith("Session overhead"))
+    assert "$0.50" in overhead
+
+
+def test_by_task_costs_reconcile_to_the_bill():
+    ds = _task_ds()
+    engine = CostEngine("anthropic")
+    task_cost = sum(r["cost_usd"] for r in analytics.by_task(ds, "anthropic").rows)
+    overhead = engine.cost(OPUS, "cache_read", 1_000_000)  # the continuation row
+    total_bill = sum(engine.cost(t["model"], t["token_type"], t["token_count"]) for t in ds.tokens)
+    assert task_cost + overhead == pytest.approx(total_bill, abs=1e-6)
+
+
+def test_by_task_uncategorized_when_no_categories():
+    ds = _task_ds()
+    ds.categories.clear()
+    result = analytics.by_task(ds, "anthropic")
+    assert all(r["category"] == "(uncategorized)" for r in result.rows)
+    assert any("No categorization found" in n for n in result.notes)
+
+
+def test_by_task_empty_dataset_hints_to_extract():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test data")
+    result = analytics.by_task(empty, "anthropic")
+    assert result.rows == []
+    assert any("No task data" in n for n in result.notes)

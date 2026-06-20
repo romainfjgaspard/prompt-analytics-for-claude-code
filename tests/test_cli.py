@@ -137,6 +137,19 @@ def test_by_file_empty_history_hints(fake_claude):
     assert main(_args(fake_claude, "by-file")) == 1
 
 
+def test_by_task_dispatch(fake_claude, capsys):
+    # Any session with prompts assembles tasks (inference fallback when no todos).
+    fake_claude.add("session_output.jsonl", project="out")
+    assert main(_args(fake_claude, "by-task")) == 0
+    out = capsys.readouterr().out
+    assert "Cost by task" in out
+
+
+def test_by_task_empty_history_hints(fake_claude):
+    # No JSONL history at all -> the usual "no data" path (exit 1), not a crash.
+    assert main(_args(fake_claude, "by-task")) == 1
+
+
 def test_prompts_dispatch(data, capsys):
     assert main(_args(data, "prompts", "--top", "2")) == 0
     out = capsys.readouterr().out
