@@ -38,6 +38,13 @@ dependencies = [
     # core on purpose; extract degrades to an offline heuristic if it (or its
     # vocabulary) is unavailable, so the split is always produced.
     "tiktoken>=0.7",
+    # Semantic layer (Axe B1): static, torch-free embeddings at the core so the
+    # semantic features ship by default, not behind a heavy extra. `model2vec`
+    # is pure numpy at inference (a few tens of MB on disk); `numpy` backs every
+    # vector op (it was previously only under [dashboard]). scikit-learn
+    # (HDBSCAN) joins later, at B1.2, when the taxonomy audit actually uses it.
+    "model2vec>=0.6",
+    "numpy>=1.24",
     # Windows has no system IANA database; without this, --timezone fails there.
     "tzdata; sys_platform == 'win32'",
 ]
@@ -53,7 +60,8 @@ dashboard = [
     # st_echarts need a recent Streamlit too.
     "streamlit>=1.49",
     "pandas>=2.0",
-    "numpy>=1.24",
+    # numpy is a core dependency now (semantic layer), so the dashboard inherits
+    # it; no need to repeat it here.
     # Apache ECharts -- the only chart engine (the board moved off Plotly, see
     # docs/MIGRATION-ECHARTS.md). Registers its frontend only under a real
     # `streamlit run`; a bare import / AppTest sees an empty component registry.
