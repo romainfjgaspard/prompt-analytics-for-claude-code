@@ -602,6 +602,18 @@ def test_build_frames_date_columns_are_utc_aware(demo_env: Path) -> None:
             )
 
 
+def test_impact_to_iso_handles_date_datetime_str_none() -> None:
+    """impact._to_iso normalizes the pivot value the date widget / a suggestion stores."""
+    from prompt_analytics.dashboard import impact
+
+    assert impact._to_iso(datetime.date(2026, 6, 5)) == "2026-06-05"
+    assert impact._to_iso(datetime.datetime(2026, 6, 5, 14, 30)) == "2026-06-05"
+    assert impact._to_iso("2026-06-05") == "2026-06-05"
+    assert impact._to_iso("not a date") is None
+    assert impact._to_iso(None) is None
+    assert impact._to_iso("") is None
+
+
 def test_available_date_bounds_correct_dates(no_session_state: None) -> None:
     """available_date_bounds returns the min and max date across both frames."""
     from prompt_analytics.dashboard import filters

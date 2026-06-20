@@ -43,7 +43,7 @@ from streamlit import runtime
 
 from prompt_analytics import analytics
 from prompt_analytics.context import NO_LANGUAGE
-from prompt_analytics.dashboard import data, echarts, filters, theme
+from prompt_analytics.dashboard import data, echarts, filters, impact, theme
 
 # How many languages to show before folding the long tail into an "Other" slice.
 _MIX_TOP = 12
@@ -751,6 +751,53 @@ def _render_tasks_section(graph: analytics.TaskGraph) -> None:
         )
 
 
+def _render_task_side(graph: analytics.TaskGraph, *, side: str, pivot: str, key: str) -> None:
+    """One side (before / after) of the task graph in compare mode: KPI + force graph."""
+    when = f"before {pivot}" if side == "Before" else f"from {pivot}"
+    st.markdown(f"**{side}** · _{when}_")
+    if not graph.has_data:
+        st.info("No task data on this side of the pivot.")
+        return
+    cols = st.columns(2)
+    cols[0].metric("Tasks", f"{graph.total_tasks:,}")
+    cols[1].metric(
+        f"Task cost ({graph.provider})",
+        f"${graph.grand_total:,.2f}",
+        delta=(
+            f"${graph.grand_total / graph.total_tasks:,.2f}/task" if graph.total_tasks else None
+        ),
+        delta_color="off",
+    )
+    option = _task_graph_option(graph)
+    if option is not None:
+        echarts.render(option, key=key, height="460px")
+
+
+def _render_tasks_comparison(ds: analytics.Dataset, provider: str, pivot: str) -> None:
+    """Before/after of the B2 task graph (DASH2): the constellation on each side.
+
+    The cost-per-task headline above the graphs is the workload-normalized lens;
+    the two force layouts show how the constellation of work itself shifted across
+    the switch date.
+    """
+    before_ds, after_ds = analytics.split_on_pivot(ds, pivot)
+    before = analytics.task_graph(before_ds, provider, top=_TASK_TOP)
+    after = analytics.task_graph(after_ds, provider, top=_TASK_TOP)
+
+    left, right = st.columns(2)
+    with left:
+        _render_task_side(before, side="Before", pivot=pivot, key="comp_task_graph_before")
+    with right:
+        _render_task_side(after, side="After", pivot=pivot, key="comp_task_graph_after")
+    st.caption(
+        "Each **task** is a centre of gravity (size = cost, colour = dominant category), its "
+        "**prompts** orbiting as satellites — shown before vs after your switch date. The "
+        "cost-per-task figures normalize for how much work each side carried. "
+        "👉 On the command line: `prompt-analytics by-task` per range, or "
+        f"`prompt-analytics impact --pivot {pivot}`."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Page.
 # ---------------------------------------------------------------------------
@@ -795,6 +842,17 @@ def main() -> None:
         )
         st.stop()
 
+    # Compare mode (Axe E / DASH2): lead with the before/after panel — its Output
+    # cost share and Context rent share deltas are exactly the composition story.
+    pivot = impact.current_pivot()
+    if pivot is not None:
+        theme.section(
+            f"Impact of {pivot} — before vs after",
+            "The before/after of your switch date across the whole spine, in workload-normalized "
+            "ratios (output cost share and context rent share are the composition deltas).",
+        )
+        impact.render_impact_panel(ds, primary, pivot)
+
     theme.section(
         "Input — what you asked for",
         "The spend split of your prompts, by category (full detail on the Prompts tab).",
@@ -831,14 +889,18 @@ def main() -> None:
         "The unit of work, not the prompt: tasks as centres of gravity (size = cost, "
         "colour = dominant category), the prompts that served each one orbiting around it.",
     )
-    graph = analytics.task_graph(ds, primary, top=_TASK_TOP)
-    if graph.has_data:
-        _render_tasks_section(graph)
+    if pivot is not None:
+        # Compare mode: the constellation before vs after the switch date.
+        _render_tasks_comparison(ds, primary, pivot)
     else:
-        st.info(
-            "No task data yet. Task attribution (the TodoWrite spine + inference) ships with "
-            "the latest extractor — re-run `prompt-analytics extract`, then revisit this page."
-        )
+        graph = analytics.task_graph(ds, primary, top=_TASK_TOP)
+        if graph.has_data:
+            _render_tasks_section(graph)
+        else:
+            st.info(
+                "No task data yet. Task attribution (the TodoWrite spine + inference) ships with "
+                "the latest extractor — re-run `prompt-analytics extract`, then revisit this page."
+            )
 
 
 # Render only under a real Streamlit server: streamlit-echarts cannot register

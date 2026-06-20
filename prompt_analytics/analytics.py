@@ -54,6 +54,7 @@ __all__ = [
     "filter_project",
     "filter_dates",
     "filter_prompt_ids",
+    "split_on_pivot",
     "known_providers",
     "summary",
     "by_project",
@@ -3266,17 +3267,27 @@ def _day_before(day: str) -> str:
     return (datetime.fromisoformat(day) - timedelta(days=1)).date().isoformat()
 
 
+def split_on_pivot(ds: Dataset, pivot: str) -> tuple[Dataset, Dataset]:
+    """Split ``ds`` on a pivot day into ``(before, after)`` views (Axe E / DASH2).
+
+    ``before`` covers prompts up to the day before ``pivot``; ``after`` covers the
+    pivot day onward -- the same inclusive convention :func:`impact_report` is
+    built on (it calls this). Shared with the dashboard's global date-pivot mode so
+    the CLI table and the before/after views split the history identically.
+    """
+    return filter_dates(ds, None, _day_before(pivot)), filter_dates(ds, pivot, None)
+
+
 def impact_report(ds: Dataset, *, provider: str, pivot: str) -> ImpactReport:
     """Assemble the Axe-E before/after report around ``pivot`` (see :class:`ImpactReport`).
 
     Splits the dataset on the pivot day (``before`` = up to the day before it,
-    ``after`` = the pivot day onward, reusing :func:`filter_dates`), then computes
+    ``after`` = the pivot day onward, via :func:`split_on_pivot`), then computes
     the same workload-normalized ratios and workload confounders on each side.
     Pure: the filesystem pivot suggestions live in :func:`suggest_pivots`, kept out
     of here so this stays deterministic and unit-testable.
     """
-    before = filter_dates(ds, None, _day_before(pivot))
-    after = filter_dates(ds, pivot, None)
+    before, after = split_on_pivot(ds, pivot)
     b = _impact_side_stats(before, provider)
     a = _impact_side_stats(after, provider)
 

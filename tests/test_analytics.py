@@ -1327,6 +1327,26 @@ def test_impact_drops_optional_rows_without_tasks_or_categories():
     assert "Cost per prompt" in labels  # the ratios always stay
 
 
+def test_split_on_pivot_partitions_the_whole():
+    # The dashboard's date-pivot mode (DASH2) splits a dataset into before/after;
+    # the pivot day lands in AFTER, the prior day in BEFORE, and every prompt is on
+    # exactly one side.
+    before, after = analytics.split_on_pivot(_impact_ds(), "2026-06-05")
+    before_ids = {p["prompt_id"] for p in before.prompts}
+    after_ids = {p["prompt_id"] for p in after.prompts}
+    assert before_ids == {"p1", "p2"}  # dated 2026-06-01
+    assert after_ids == {"p3", "p4"}  # dated 2026-06-10 (pivot day onward)
+    assert before_ids.isdisjoint(after_ids)
+    assert before_ids | after_ids == {"p1", "p2", "p3", "p4"}
+
+
+def test_split_on_pivot_includes_pivot_day_in_after():
+    # A pivot exactly on a prompt's day keeps that prompt on the AFTER side.
+    before, after = analytics.split_on_pivot(_impact_ds(), "2026-06-10")
+    assert {p["prompt_id"] for p in before.prompts} == {"p1", "p2"}
+    assert {p["prompt_id"] for p in after.prompts} == {"p3", "p4"}
+
+
 def test_impact_suggestions_folded_into_notes():
     result = analytics.impact(
         _impact_ds(),

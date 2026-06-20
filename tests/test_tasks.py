@@ -4,6 +4,7 @@ and the cost-reconciliation invariant (every prompt in exactly one task)."""
 from __future__ import annotations
 
 import csv
+from pathlib import Path
 
 from prompt_analytics.analytics import CostEngine, dataset_from_csvs
 from prompt_analytics.embeddings import HashingEmbedder
@@ -218,7 +219,7 @@ def test_extract_writes_tasks_from_real_todowrite(fake_claude):
 def test_task_cost_reconciles_with_total_prompt_cost():
     """Every real prompt is in exactly one task, so the task costs sum to the
     real-prompt bill exactly (the B2 reconciliation invariant on demo data)."""
-    ds = dataset_from_csvs("demo_data")
+    ds = dataset_from_csvs(Path("demo_data"))
     assert ds.tasks and ds.task_prompts
 
     real = {p["prompt_id"] for p in ds.prompts}
