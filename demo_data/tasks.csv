@@ -1,0 +1,221 @@
+task_id,session_id,name,origin,prompts,first_timestamp,last_timestamp
+demo-000-450c5bbc:i01,demo-000-450c5bbc,Met à jour le fichier de status avant de fermer,inferred,1,2026-06-09T08:27:08.000Z,2026-06-09T08:27:08.000Z
+demo-000-450c5bbc:i02,demo-000-450c5bbc,Add the retry decorator to the API client,inferred,5,2026-06-09T09:01:08.000Z,2026-06-09T10:36:08.000Z
+demo-000-450c5bbc:i03,demo-000-450c5bbc,Implement the CSV export endpoint with pagination,inferred,7,2026-06-09T11:08:08.000Z,2026-06-09T13:37:08.000Z
+demo-000-450c5bbc:i04,demo-000-450c5bbc,Read PLAN.md and outline the steps to add the export pipeline,inferred,2,2026-06-09T14:16:08.000Z,2026-06-09T14:24:08.000Z
+demo-000-450c5bbc:i05,demo-000-450c5bbc,"The dashboard crashes with a tz-naive vs tz-aware error, fix it",inferred,2,2026-06-09T14:55:08.000Z,2026-06-09T15:20:08.000Z
+demo-000-450c5bbc:i06,demo-000-450c5bbc,"The dashboard crashes with a tz-naive vs tz-aware error, fix it",inferred,4,2026-06-09T16:00:08.000Z,2026-06-09T16:46:08.000Z
+demo-000-450c5bbc:i07,demo-000-450c5bbc,Design the data model for the new billing module,inferred,5,2026-06-09T17:26:08.000Z,2026-06-09T18:24:08.000Z
+demo-000-450c5bbc:i08,demo-000-450c5bbc,How should we structure the multi-tenant migration?,inferred,9,2026-06-09T18:59:08.000Z,2026-06-09T20:40:08.000Z
+demo-000-450c5bbc:i09,demo-000-450c5bbc,Audit the error handling in the export pipeline,inferred,1,2026-06-09T21:11:08.000Z,2026-06-09T21:11:08.000Z
+demo-001-638b2bb1:i01,demo-001-638b2bb1,Tests fail on Windows only — investigate the path handling,inferred,5,2026-05-30T10:00:33.000Z,2026-05-30T10:17:33.000Z
+demo-002-8356f0d0:t01,demo-002-8356f0d0,Migrate the billing module,todo,13,2026-06-04T21:08:24.000Z,2026-06-05T01:29:24.000Z
+demo-003-47ba47d3:i01,demo-003-47ba47d3,Read PLAN.md and outline the steps to add the export pipeline,inferred,1,2026-05-10T14:06:26.000Z,2026-05-10T14:06:26.000Z
+demo-003-47ba47d3:i02,demo-003-47ba47d3,Commit the changes and push the branch,inferred,2,2026-05-10T14:44:26.000Z,2026-05-10T14:56:26.000Z
+demo-003-47ba47d3:i03,demo-003-47ba47d3,Implement the CSV export endpoint with pagination,inferred,3,2026-05-10T15:27:26.000Z,2026-05-10T16:11:26.000Z
+demo-003-47ba47d3:i04,demo-003-47ba47d3,Design the data model for the new billing module,inferred,3,2026-05-10T16:45:26.000Z,2026-05-10T17:04:26.000Z
+demo-003-47ba47d3:i05,demo-003-47ba47d3,Audit the error handling in the export pipeline,inferred,1,2026-05-10T17:38:26.000Z,2026-05-10T17:38:26.000Z
+demo-004-1e214b52:t01,demo-004-1e214b52,Migrate the billing module,todo,17,2026-05-13T12:44:14.000Z,2026-05-13T17:42:14.000Z
+demo-005-5ae14d75:i01,demo-005-5ae14d75,"Here are my notes from the standup, keep them in mind",inferred,2,2026-04-16T23:26:33.000Z,2026-04-16T23:43:33.000Z
+demo-005-5ae14d75:i02,demo-005-5ae14d75,Vérifie que les totaux collent avec la facture,inferred,1,2026-04-17T00:15:33.000Z,2026-04-17T00:15:33.000Z
+demo-005-5ae14d75:i03,demo-005-5ae14d75,Tests fail on Windows only — investigate the path handling,inferred,3,2026-04-17T00:49:33.000Z,2026-04-17T01:37:33.000Z
+demo-006-1fb999e6:t01,demo-006-1fb999e6,Migrate the billing module,todo,1,2026-04-22T01:31:02.000Z,2026-04-22T01:31:02.000Z
+demo-006-1fb999e6:t02,demo-006-1fb999e6,Refactor the streaming parser,todo,9,2026-04-22T02:04:02.000Z,2026-04-22T04:37:02.000Z
+demo-007-0b96130a:i01,demo-007-0b96130a,"The dashboard crashes with a tz-naive vs tz-aware error, fix it",inferred,1,2026-01-30T17:37:47.000Z,2026-01-30T17:37:47.000Z
+demo-007-0b96130a:i02,demo-007-0b96130a,How should we structure the multi-tenant migration?,inferred,3,2026-01-30T18:13:47.000Z,2026-01-30T18:37:47.000Z
+demo-008-493d65aa:t01,demo-008-493d65aa,Harden the quota parser edge cases,todo,9,2026-05-22T18:59:20.000Z,2026-05-22T21:52:20.000Z
+demo-009-89415ed4:t01,demo-009-89415ed4,Wire the new settings page,todo,1,2026-02-28T08:45:51.000Z,2026-02-28T08:45:51.000Z
+demo-009-89415ed4:t02,demo-009-89415ed4,Migrate the billing module,todo,2,2026-02-28T09:15:51.000Z,2026-02-28T09:39:51.000Z
+demo-009-89415ed4:t03,demo-009-89415ed4,Document the release,todo,5,2026-02-28T10:03:51.000Z,2026-02-28T11:10:51.000Z
+demo-010-a9987b64:i01,demo-010-a9987b64,Add unit tests for the quota parser edge cases,inferred,1,2026-03-13T01:02:30.000Z,2026-03-13T01:02:30.000Z
+demo-010-a9987b64:i02,demo-010-a9987b64,Write docstrings for the public analytics helpers,inferred,2,2026-03-13T01:37:30.000Z,2026-03-13T01:54:30.000Z
+demo-010-a9987b64:i03,demo-010-a9987b64,anglais,inferred,7,2026-03-13T02:32:30.000Z,2026-03-13T03:42:30.000Z
+demo-011-c50e7639:i01,demo-011-c50e7639,How should we structure the multi-tenant migration?,inferred,2,2026-05-24T11:54:53.000Z,2026-05-24T12:07:53.000Z
+demo-011-c50e7639:i02,demo-011-c50e7639,How should we structure the multi-tenant migration?,inferred,3,2026-05-24T12:47:53.000Z,2026-05-24T13:07:53.000Z
+demo-012-2960a43d:i01,demo-012-2960a43d,Commit the changes and push the branch,inferred,1,2026-06-09T05:04:18.000Z,2026-06-09T05:04:18.000Z
+demo-012-2960a43d:i02,demo-012-2960a43d,How should we structure the multi-tenant migration?,inferred,3,2026-06-09T05:39:18.000Z,2026-06-09T05:57:18.000Z
+demo-012-2960a43d:i03,demo-012-2960a43d,Design the data model for the new billing module,inferred,6,2026-06-09T06:29:18.000Z,2026-06-09T07:24:18.000Z
+demo-012-2960a43d:i04,demo-012-2960a43d,Design the data model for the new billing module,inferred,1,2026-06-09T07:57:18.000Z,2026-06-09T07:57:18.000Z
+demo-012-2960a43d:i05,demo-012-2960a43d,Design the data model for the new billing module,inferred,2,2026-06-09T08:31:18.000Z,2026-06-09T08:37:18.000Z
+demo-012-2960a43d:i06,demo-012-2960a43d,Does uv lock pin transitive dependencies?,inferred,3,2026-06-09T09:15:18.000Z,2026-06-09T09:46:18.000Z
+demo-013-b9eb2f85:i01,demo-013-b9eb2f85,Design the data model for the new billing module,inferred,3,2026-05-30T06:04:18.000Z,2026-05-30T06:51:18.000Z
+demo-013-b9eb2f85:i02,demo-013-b9eb2f85,How should we structure the multi-tenant migration?,inferred,4,2026-05-30T07:26:18.000Z,2026-05-30T08:20:18.000Z
+demo-013-b9eb2f85:i03,demo-013-b9eb2f85,Commit the changes and push the branch,inferred,3,2026-05-30T08:52:18.000Z,2026-05-30T09:03:18.000Z
+demo-013-b9eb2f85:i04,demo-013-b9eb2f85,anglais,inferred,3,2026-05-30T09:34:18.000Z,2026-05-30T10:01:18.000Z
+demo-014-dfa0e9f1:t01,demo-014-dfa0e9f1,Refactor the streaming parser,todo,8,2026-04-03T21:17:29.000Z,2026-04-03T23:20:29.000Z
+demo-014-dfa0e9f1:t02,demo-014-dfa0e9f1,Fix the failing Windows CI,todo,1,2026-04-03T23:24:29.000Z,2026-04-03T23:24:29.000Z
+demo-014-dfa0e9f1:t03,demo-014-dfa0e9f1,Audit the error handling,todo,3,2026-04-04T00:00:29.000Z,2026-04-04T00:43:29.000Z
+demo-015-8fc82e35:i01,demo-015-8fc82e35,Fais le merge de main et ouvre la PR,inferred,1,2026-03-14T04:41:00.000Z,2026-03-14T04:41:00.000Z
+demo-015-8fc82e35:i02,demo-015-8fc82e35,continue with option 2,inferred,1,2026-03-14T05:17:00.000Z,2026-03-14T05:17:00.000Z
+demo-015-8fc82e35:i03,demo-015-8fc82e35,Same as yesterday but for the staging tenant,inferred,1,2026-03-14T05:52:00.000Z,2026-03-14T05:52:00.000Z
+demo-015-8fc82e35:i04,demo-015-8fc82e35,continue with option 2,inferred,1,2026-03-14T06:29:00.000Z,2026-03-14T06:29:00.000Z
+demo-015-8fc82e35:i05,demo-015-8fc82e35,"The dashboard crashes with a tz-naive vs tz-aware error, fix it",inferred,2,2026-03-14T07:02:00.000Z,2026-03-14T07:21:00.000Z
+demo-015-8fc82e35:i06,demo-015-8fc82e35,oui vas y,inferred,2,2026-03-14T07:58:00.000Z,2026-03-14T08:23:00.000Z
+demo-015-8fc82e35:i07,demo-015-8fc82e35,Same as yesterday but for the staging tenant,inferred,1,2026-03-14T08:54:00.000Z,2026-03-14T08:54:00.000Z
+demo-015-8fc82e35:i08,demo-015-8fc82e35,Fais le merge de main et ouvre la PR,inferred,1,2026-03-14T09:33:00.000Z,2026-03-14T09:33:00.000Z
+demo-016-f10087cf:t01,demo-016-f10087cf,Implement the retry decorator,todo,2,2026-03-05T22:16:25.000Z,2026-03-05T22:29:25.000Z
+demo-016-f10087cf:t02,demo-016-f10087cf,Refactor the streaming parser,todo,3,2026-03-05T22:37:25.000Z,2026-03-05T23:31:25.000Z
+demo-016-f10087cf:t03,demo-016-f10087cf,Migrate the billing module,todo,3,2026-03-06T00:06:25.000Z,2026-03-06T00:45:25.000Z
+demo-017-4f15148f:t01,demo-017-4f15148f,Raise filters.py coverage,todo,2,2026-05-27T05:10:04.000Z,2026-05-27T05:27:04.000Z
+demo-017-4f15148f:t02,demo-017-4f15148f,Refactor the streaming parser,todo,2,2026-05-27T05:39:04.000Z,2026-05-27T06:18:04.000Z
+demo-017-4f15148f:t03,demo-017-4f15148f,Migrate the billing module,todo,2,2026-05-27T06:45:04.000Z,2026-05-27T06:59:04.000Z
+demo-018-48b2c8a5:i01,demo-018-48b2c8a5,Vérifie que les totaux collent avec la facture,inferred,2,2025-12-25T02:16:56.000Z,2025-12-25T02:41:56.000Z
+demo-018-48b2c8a5:i02,demo-018-48b2c8a5,Why does the nightly job double-count rows?,inferred,6,2025-12-25T03:16:56.000Z,2025-12-25T05:00:56.000Z
+demo-018-48b2c8a5:i03,demo-018-48b2c8a5,Wire the new settings page into the router,inferred,1,2025-12-25T05:36:56.000Z,2025-12-25T05:36:56.000Z
+demo-019-158f03c8:i01,demo-019-158f03c8,Does uv lock pin transitive dependencies?,inferred,3,2026-04-30T09:02:11.000Z,2026-04-30T09:23:11.000Z
+demo-020-0164b3ae:i01,demo-020-0164b3ae,Add the retry decorator to the API client,inferred,7,2026-01-19T08:51:34.000Z,2026-01-19T10:44:34.000Z
+demo-020-0164b3ae:i02,demo-020-0164b3ae,Review the diff before I open the PR,inferred,2,2026-01-19T11:21:34.000Z,2026-01-19T11:29:34.000Z
+demo-021-7ab39286:i01,demo-021-7ab39286,Does uv lock pin transitive dependencies?,inferred,2,2026-06-08T05:32:02.000Z,2026-06-08T06:00:02.000Z
+demo-021-7ab39286:i02,demo-021-7ab39286,Read PLAN.md and outline the steps to add the export pipeline,inferred,3,2026-06-08T06:32:02.000Z,2026-06-08T07:18:02.000Z
+demo-021-7ab39286:i03,demo-021-7ab39286,How should we structure the multi-tenant migration?,inferred,4,2026-06-08T07:51:02.000Z,2026-06-08T08:59:02.000Z
+demo-021-7ab39286:i04,demo-021-7ab39286,anglais,inferred,1,2026-06-08T09:36:02.000Z,2026-06-08T09:36:02.000Z
+demo-021-7ab39286:i05,demo-021-7ab39286,continue with option 2,inferred,1,2026-06-08T10:12:02.000Z,2026-06-08T10:12:02.000Z
+demo-021-7ab39286:i06,demo-021-7ab39286,Add the retry decorator to the API client,inferred,2,2026-06-08T10:50:02.000Z,2026-06-08T11:20:02.000Z
+demo-021-7ab39286:i07,demo-021-7ab39286,"The dashboard crashes with a tz-naive vs tz-aware error, fix it",inferred,1,2026-06-08T11:54:02.000Z,2026-06-08T11:54:02.000Z
+demo-021-7ab39286:i08,demo-021-7ab39286,Vérifie que les totaux collent avec la facture,inferred,2,2026-06-08T12:30:02.000Z,2026-06-08T12:48:02.000Z
+demo-021-7ab39286:i09,demo-021-7ab39286,Same as yesterday but for the staging tenant,inferred,1,2026-06-08T13:26:02.000Z,2026-06-08T13:26:02.000Z
+demo-021-7ab39286:i10,demo-021-7ab39286,Design the data model for the new billing module,inferred,2,2026-06-08T14:03:02.000Z,2026-06-08T14:17:02.000Z
+demo-021-7ab39286:i11,demo-021-7ab39286,Deploy to staging and run the smoke script,inferred,2,2026-06-08T14:56:02.000Z,2026-06-08T14:59:02.000Z
+demo-022-abccfffd:i01,demo-022-abccfffd,Wire the new settings page into the router,inferred,3,2026-05-30T14:00:32.000Z,2026-05-30T14:14:32.000Z
+demo-023-042116e8:i01,demo-023-042116e8,Tests fail on Windows only — investigate the path handling,inferred,1,2026-06-03T13:34:40.000Z,2026-06-03T13:34:40.000Z
+demo-023-042116e8:i02,demo-023-042116e8,Add the retry decorator to the API client,inferred,3,2026-06-03T14:09:40.000Z,2026-06-03T14:37:40.000Z
+demo-023-042116e8:i03,demo-023-042116e8,Add the retry decorator to the API client,inferred,1,2026-06-03T15:17:40.000Z,2026-06-03T15:17:40.000Z
+demo-024-171600f1:t01,demo-024-171600f1,Fix the failing Windows CI,todo,4,2026-02-16T13:16:05.000Z,2026-02-16T14:28:05.000Z
+demo-024-171600f1:t02,demo-024-171600f1,Wire the new settings page,todo,22,2026-02-16T14:30:05.000Z,2026-02-16T21:04:05.000Z
+demo-025-3ab52417:i01,demo-025-3ab52417,Add the retry decorator to the API client,inferred,2,2026-05-07T21:21:26.000Z,2026-05-07T21:43:26.000Z
+demo-025-3ab52417:i02,demo-025-3ab52417,Why does the nightly job double-count rows?,inferred,1,2026-05-07T22:14:26.000Z,2026-05-07T22:14:26.000Z
+demo-025-3ab52417:i03,demo-025-3ab52417,Implement the CSV export endpoint with pagination,inferred,3,2026-05-07T22:49:26.000Z,2026-05-07T23:34:26.000Z
+demo-025-3ab52417:i04,demo-025-3ab52417,Implement the CSV export endpoint with pagination,inferred,7,2026-05-08T00:11:26.000Z,2026-05-08T01:36:26.000Z
+demo-025-3ab52417:i05,demo-025-3ab52417,"The dashboard crashes with a tz-naive vs tz-aware error, fix it",inferred,1,2026-05-08T02:10:26.000Z,2026-05-08T02:10:26.000Z
+demo-025-3ab52417:i06,demo-025-3ab52417,Fais le merge de main et ouvre la PR,inferred,6,2026-05-08T02:43:26.000Z,2026-05-08T04:05:26.000Z
+demo-025-3ab52417:i07,demo-025-3ab52417,Design the data model for the new billing module,inferred,4,2026-05-08T04:43:26.000Z,2026-05-08T05:32:26.000Z
+demo-025-3ab52417:i08,demo-025-3ab52417,Fais le merge de main et ouvre la PR,inferred,1,2026-05-08T06:03:26.000Z,2026-05-08T06:03:26.000Z
+demo-026-34fd07a5:i01,demo-026-34fd07a5,Add the retry decorator to the API client,inferred,2,2026-01-28T14:52:38.000Z,2026-01-28T15:20:38.000Z
+demo-026-34fd07a5:i02,demo-026-34fd07a5,Why does the nightly job double-count rows?,inferred,2,2026-01-28T16:00:38.000Z,2026-01-28T16:03:38.000Z
+demo-026-34fd07a5:i03,demo-026-34fd07a5,Read PLAN.md and outline the steps to add the export pipeline,inferred,8,2026-01-28T16:34:38.000Z,2026-01-28T18:37:38.000Z
+demo-026-34fd07a5:i04,demo-026-34fd07a5,Deploy to staging and run the smoke script,inferred,2,2026-01-28T19:13:38.000Z,2026-01-28T19:18:38.000Z
+demo-027-446dc987:i01,demo-027-446dc987,Add the retry decorator to the API client,inferred,4,2026-03-15T01:12:13.000Z,2026-03-15T02:12:13.000Z
+demo-027-446dc987:i02,demo-027-446dc987,"The dashboard crashes with a tz-naive vs tz-aware error, fix it",inferred,2,2026-03-15T02:43:13.000Z,2026-03-15T02:47:13.000Z
+demo-027-446dc987:i03,demo-027-446dc987,Read PLAN.md and outline the steps to add the export pipeline,inferred,4,2026-03-15T03:25:13.000Z,2026-03-15T04:23:13.000Z
+demo-027-446dc987:i04,demo-027-446dc987,Design the data model for the new billing module,inferred,2,2026-03-15T05:03:13.000Z,2026-03-15T05:29:13.000Z
+demo-028-8b7d57ec:t01,demo-028-8b7d57ec,Migrate the billing module,todo,10,2026-04-21T09:21:06.000Z,2026-04-21T12:18:06.000Z
+demo-029-150b4a07:t01,demo-029-150b4a07,Wire the new settings page,todo,1,2026-02-14T04:56:27.000Z,2026-02-14T04:56:27.000Z
+demo-029-150b4a07:t02,demo-029-150b4a07,Fix the failing Windows CI,todo,7,2026-02-14T05:11:27.000Z,2026-02-14T07:30:27.000Z
+demo-030-bf94b5aa:i01,demo-030-bf94b5aa,How should we structure the multi-tenant migration?,inferred,5,2026-01-31T05:14:40.000Z,2026-01-31T06:24:40.000Z
+demo-030-bf94b5aa:i02,demo-030-bf94b5aa,Add unit tests for the quota parser edge cases,inferred,1,2026-01-31T07:02:40.000Z,2026-01-31T07:02:40.000Z
+demo-031-be91e92f:t01,demo-031-be91e92f,Audit the error handling,todo,6,2026-02-05T21:14:11.000Z,2026-02-05T22:59:11.000Z
+demo-031-be91e92f:t02,demo-031-be91e92f,Implement the retry decorator,todo,4,2026-02-05T23:33:11.000Z,2026-02-06T00:46:11.000Z
+demo-032-6adee58a:t01,demo-032-6adee58a,Wire the new settings page,todo,6,2026-05-01T15:47:28.000Z,2026-05-01T17:33:28.000Z
+demo-033-f8aea77f:i01,demo-033-f8aea77f,Why does the nightly job double-count rows?,inferred,2,2026-04-30T16:26:24.000Z,2026-04-30T16:31:24.000Z
+demo-033-f8aea77f:i02,demo-033-f8aea77f,Read PLAN.md and outline the steps to add the export pipeline,inferred,7,2026-04-30T17:08:24.000Z,2026-04-30T18:08:24.000Z
+demo-034-dc2d0ff1:i01,demo-034-dc2d0ff1,Relance les tests d'intégration et regarde les régressions,inferred,3,2025-12-20T22:45:02.000Z,2025-12-20T23:30:02.000Z
+demo-034-dc2d0ff1:i02,demo-034-dc2d0ff1,Why does the nightly job double-count rows?,inferred,1,2025-12-21T00:06:02.000Z,2025-12-21T00:06:02.000Z
+demo-034-dc2d0ff1:i03,demo-034-dc2d0ff1,Why does the nightly job double-count rows?,inferred,1,2025-12-21T00:40:02.000Z,2025-12-21T00:40:02.000Z
+demo-035-e71503f7:i01,demo-035-e71503f7,Design the data model for the new billing module,inferred,2,2026-01-22T21:22:37.000Z,2026-01-22T21:36:37.000Z
+demo-035-e71503f7:i02,demo-035-e71503f7,Design the data model for the new billing module,inferred,3,2026-01-22T22:11:37.000Z,2026-01-22T22:47:37.000Z
+demo-036-6d823204:i01,demo-036-6d823204,Met à jour le fichier de status avant de fermer,inferred,3,2026-03-27T02:13:25.000Z,2026-03-27T02:41:25.000Z
+demo-036-6d823204:i02,demo-036-6d823204,Add the retry decorator to the API client,inferred,2,2026-03-27T03:13:25.000Z,2026-03-27T03:22:25.000Z
+demo-036-6d823204:i03,demo-036-6d823204,Read PLAN.md and outline the steps to add the export pipeline,inferred,3,2026-03-27T04:01:25.000Z,2026-03-27T04:10:25.000Z
+demo-036-6d823204:i04,demo-036-6d823204,Write docstrings for the public analytics helpers,inferred,4,2026-03-27T04:45:25.000Z,2026-03-27T06:00:25.000Z
+demo-036-6d823204:i05,demo-036-6d823204,Does uv lock pin transitive dependencies?,inferred,1,2026-03-27T06:33:25.000Z,2026-03-27T06:33:25.000Z
+demo-036-6d823204:i06,demo-036-6d823204,Write docstrings for the public analytics helpers,inferred,1,2026-03-27T07:09:25.000Z,2026-03-27T07:09:25.000Z
+demo-037-5fd147f9:t01,demo-037-5fd147f9,Harden the quota parser edge cases,todo,6,2026-04-21T04:24:11.000Z,2026-04-21T05:35:11.000Z
+demo-037-5fd147f9:t02,demo-037-5fd147f9,Document the release,todo,7,2026-04-21T05:58:11.000Z,2026-04-21T07:32:11.000Z
+demo-038-838e1ee4:t01,demo-038-838e1ee4,Implement the retry decorator,todo,3,2026-03-04T00:44:46.000Z,2026-03-04T01:21:46.000Z
+demo-039-9a1c44b7:i01,demo-039-9a1c44b7,Design the data model for the new billing module,inferred,4,2026-02-15T23:07:58.000Z,2026-02-15T23:55:58.000Z
+demo-039-9a1c44b7:i02,demo-039-9a1c44b7,Deploy to staging and run the smoke script,inferred,1,2026-02-16T00:31:58.000Z,2026-02-16T00:31:58.000Z
+demo-040-a17d2749:i01,demo-040-a17d2749,Add the retry decorator to the API client,inferred,3,2026-01-11T14:07:58.000Z,2026-01-11T14:29:58.000Z
+demo-041-5404f6ff:i01,demo-041-5404f6ff,How should we structure the multi-tenant migration?,inferred,2,2026-04-29T18:23:59.000Z,2026-04-29T18:53:59.000Z
+demo-041-5404f6ff:i02,demo-041-5404f6ff,Implement the CSV export endpoint with pagination,inferred,8,2026-04-29T19:33:59.000Z,2026-04-29T21:15:59.000Z
+demo-041-5404f6ff:i03,demo-041-5404f6ff,Add the retry decorator to the API client,inferred,2,2026-04-29T21:53:59.000Z,2026-04-29T22:05:59.000Z
+demo-041-5404f6ff:i04,demo-041-5404f6ff,Fais le merge de main et ouvre la PR,inferred,4,2026-04-29T22:42:59.000Z,2026-04-29T23:42:59.000Z
+demo-042-854ce295:i01,demo-042-854ce295,Add the retry decorator to the API client,inferred,4,2026-01-03T21:40:23.000Z,2026-01-03T22:24:23.000Z
+demo-043-0defbc1a:i01,demo-043-0defbc1a,Implement the CSV export endpoint with pagination,inferred,8,2026-04-01T19:36:48.000Z,2026-04-01T21:48:48.000Z
+demo-044-fcca5162:t01,demo-044-fcca5162,Harden the quota parser edge cases,todo,3,2026-01-21T23:15:20.000Z,2026-01-22T00:10:20.000Z
+demo-045-66a1a317:i01,demo-045-66a1a317,Read PLAN.md and outline the steps to add the export pipeline,inferred,4,2026-04-12T10:37:51.000Z,2026-04-12T11:33:51.000Z
+demo-046-6994d0af:i01,demo-046-6994d0af,Implement the CSV export endpoint with pagination,inferred,3,2026-04-30T13:17:23.000Z,2026-04-30T13:28:23.000Z
+demo-046-6994d0af:i02,demo-046-6994d0af,Fais le merge de main et ouvre la PR,inferred,1,2026-04-30T14:02:23.000Z,2026-04-30T14:02:23.000Z
+demo-047-384829d9:i01,demo-047-384829d9,Design the data model for the new billing module,inferred,4,2026-04-30T02:40:49.000Z,2026-04-30T03:09:49.000Z
+demo-047-384829d9:i02,demo-047-384829d9,Add the retry decorator to the API client,inferred,4,2026-04-30T03:45:49.000Z,2026-04-30T04:50:49.000Z
+demo-047-384829d9:i03,demo-047-384829d9,anglais,inferred,5,2026-04-30T05:23:49.000Z,2026-04-30T06:16:49.000Z
+demo-047-384829d9:i04,demo-047-384829d9,Met à jour le fichier de status avant de fermer,inferred,1,2026-04-30T06:53:49.000Z,2026-04-30T06:53:49.000Z
+demo-047-384829d9:i05,demo-047-384829d9,Add the retry decorator to the API client,inferred,4,2026-04-30T07:32:49.000Z,2026-04-30T08:11:49.000Z
+demo-047-384829d9:i06,demo-047-384829d9,Why does the nightly job double-count rows?,inferred,1,2026-04-30T08:48:49.000Z,2026-04-30T08:48:49.000Z
+demo-047-384829d9:i07,demo-047-384829d9,Why does the nightly job double-count rows?,inferred,5,2026-04-30T09:20:49.000Z,2026-04-30T10:30:49.000Z
+demo-047-384829d9:i08,demo-047-384829d9,How should we structure the multi-tenant migration?,inferred,2,2026-04-30T11:04:49.000Z,2026-04-30T11:21:49.000Z
+demo-047-384829d9:i09,demo-047-384829d9,Met à jour le fichier de status avant de fermer,inferred,4,2026-04-30T11:58:49.000Z,2026-04-30T12:26:49.000Z
+demo-048-b3e19be6:i01,demo-048-b3e19be6,Met à jour le fichier de status avant de fermer,inferred,1,2026-05-18T23:15:57.000Z,2026-05-18T23:15:57.000Z
+demo-048-b3e19be6:i02,demo-048-b3e19be6,Read PLAN.md and outline the steps to add the export pipeline,inferred,8,2026-05-18T23:46:57.000Z,2026-05-19T01:28:57.000Z
+demo-049-b2e88d4b:i01,demo-049-b2e88d4b,Is there a way to stream large CSVs in pandas?,inferred,4,2026-01-21T08:13:13.000Z,2026-01-21T09:05:13.000Z
+demo-049-b2e88d4b:i02,demo-049-b2e88d4b,Does uv lock pin transitive dependencies?,inferred,2,2026-01-21T09:44:13.000Z,2026-01-21T10:05:13.000Z
+demo-050-58ef0b37:t01,demo-050-58ef0b37,Implement the retry decorator,todo,3,2026-02-17T11:04:37.000Z,2026-02-17T11:44:37.000Z
+demo-051-ecba3aff:t01,demo-051-ecba3aff,Audit the error handling,todo,26,2026-01-05T11:14:35.000Z,2026-01-05T20:20:35.000Z
+demo-052-3ae50165:i01,demo-052-3ae50165,Deploy to staging and run the smoke script,inferred,7,2026-05-07T14:39:39.000Z,2026-05-07T16:29:39.000Z
+demo-052-3ae50165:i02,demo-052-3ae50165,anglais,inferred,3,2026-05-07T17:03:39.000Z,2026-05-07T17:31:39.000Z
+demo-053-1e662cf7:i01,demo-053-1e662cf7,Deploy to staging and run the smoke script,inferred,1,2026-05-28T16:32:31.000Z,2026-05-28T16:32:31.000Z
+demo-053-1e662cf7:i02,demo-053-1e662cf7,Implement the CSV export endpoint with pagination,inferred,8,2026-05-28T17:07:31.000Z,2026-05-28T19:32:31.000Z
+demo-053-1e662cf7:i03,demo-053-1e662cf7,Relance les tests d'intégration et regarde les régressions,inferred,3,2026-05-28T20:06:31.000Z,2026-05-28T20:32:31.000Z
+demo-054-64f3d835:i01,demo-054-64f3d835,Read PLAN.md and outline the steps to add the export pipeline,inferred,6,2026-04-07T00:16:19.000Z,2026-04-07T01:52:19.000Z
+demo-055-7446d42d:i01,demo-055-7446d42d,Design the data model for the new billing module,inferred,4,2026-05-08T15:34:59.000Z,2026-05-08T16:42:59.000Z
+demo-055-7446d42d:i02,demo-055-7446d42d,Extract the duplicated cost logic into one helper,inferred,2,2026-05-08T17:16:59.000Z,2026-05-08T17:39:59.000Z
+demo-056-50481bee:i01,demo-056-50481bee,"Here are my notes from the standup, keep them in mind",inferred,1,2026-04-25T02:54:17.000Z,2026-04-25T02:54:17.000Z
+demo-056-50481bee:i02,demo-056-50481bee,Design the data model for the new billing module,inferred,2,2026-04-25T03:32:17.000Z,2026-04-25T03:56:17.000Z
+demo-057-cba49dce:i01,demo-057-cba49dce,Review the diff before I open the PR,inferred,2,2026-01-05T08:23:13.000Z,2026-01-05T08:35:13.000Z
+demo-057-cba49dce:i02,demo-057-cba49dce,"The dashboard crashes with a tz-naive vs tz-aware error, fix it",inferred,3,2026-01-05T09:13:13.000Z,2026-01-05T09:55:13.000Z
+demo-058-72dc9829:t01,demo-058-72dc9829,Migrate the billing module,todo,4,2026-05-02T05:08:21.000Z,2026-05-02T06:34:21.000Z
+demo-058-72dc9829:t02,demo-058-72dc9829,Fix the failing Windows CI,todo,8,2026-05-02T07:06:21.000Z,2026-05-02T09:06:21.000Z
+demo-058-72dc9829:t03,demo-058-72dc9829,Harden the quota parser edge cases,todo,1,2026-05-02T09:09:21.000Z,2026-05-02T09:09:21.000Z
+demo-059-6ef2d936:t01,demo-059-6ef2d936,Wire the new settings page,todo,7,2026-03-19T03:17:02.000Z,2026-03-19T04:51:02.000Z
+demo-059-6ef2d936:t02,demo-059-6ef2d936,Refactor the streaming parser,todo,1,2026-03-19T04:56:02.000Z,2026-03-19T04:56:02.000Z
+demo-060-13bc9eb3:t01,demo-060-13bc9eb3,Add the CSV export pipeline,todo,2,2026-04-18T19:46:27.000Z,2026-04-18T19:59:27.000Z
+demo-060-13bc9eb3:t02,demo-060-13bc9eb3,Harden the quota parser edge cases,todo,2,2026-04-18T20:04:27.000Z,2026-04-18T20:23:27.000Z
+demo-060-13bc9eb3:t03,demo-060-13bc9eb3,Migrate the billing module,todo,10,2026-04-18T20:36:27.000Z,2026-04-18T23:59:27.000Z
+demo-061-0677b40c:i01,demo-061-0677b40c,Tests fail on Windows only — investigate the path handling,inferred,2,2025-12-17T16:49:35.000Z,2025-12-17T17:04:35.000Z
+demo-061-0677b40c:i02,demo-061-0677b40c,Update the README and the changelog for the release,inferred,3,2025-12-17T17:44:35.000Z,2025-12-17T18:14:35.000Z
+demo-062-1a26be3b:t01,demo-062-1a26be3b,Fix the failing Windows CI,todo,14,2026-04-25T16:10:00.000Z,2026-04-25T21:17:00.000Z
+demo-063-2a07a210:i01,demo-063-2a07a210,Deploy to staging and run the smoke script,inferred,1,2026-05-22T05:48:03.000Z,2026-05-22T05:48:03.000Z
+demo-064-9e8f5bad:i01,demo-064-9e8f5bad,Read PLAN.md and outline the steps to add the export pipeline,inferred,4,2026-01-13T10:31:51.000Z,2026-01-13T11:03:51.000Z
+demo-064-9e8f5bad:i02,demo-064-9e8f5bad,Add the retry decorator to the API client,inferred,8,2026-01-13T11:34:51.000Z,2026-01-13T13:44:51.000Z
+demo-065-b1174f4c:i01,demo-065-b1174f4c,Design the data model for the new billing module,inferred,1,2026-02-01T09:31:54.000Z,2026-02-01T09:31:54.000Z
+demo-065-b1174f4c:i02,demo-065-b1174f4c,Design the data model for the new billing module,inferred,5,2026-02-01T10:09:54.000Z,2026-02-01T11:17:54.000Z
+demo-066-48dadfab:i01,demo-066-48dadfab,Design the data model for the new billing module,inferred,1,2026-05-22T06:36:11.000Z,2026-05-22T06:36:11.000Z
+demo-066-48dadfab:i02,demo-066-48dadfab,Add the retry decorator to the API client,inferred,5,2026-05-22T07:15:11.000Z,2026-05-22T07:53:11.000Z
+demo-066-48dadfab:i03,demo-066-48dadfab,Update the README and the changelog for the release,inferred,3,2026-05-22T08:31:11.000Z,2026-05-22T09:18:11.000Z
+demo-066-48dadfab:i04,demo-066-48dadfab,Read PLAN.md and outline the steps to add the export pipeline,inferred,4,2026-05-22T09:49:11.000Z,2026-05-22T10:54:11.000Z
+demo-067-2a53fc32:i01,demo-067-2a53fc32,Does uv lock pin transitive dependencies?,inferred,1,2026-02-10T07:22:32.000Z,2026-02-10T07:22:32.000Z
+demo-067-2a53fc32:i02,demo-067-2a53fc32,Implement the CSV export endpoint with pagination,inferred,4,2026-02-10T07:59:32.000Z,2026-02-10T08:57:32.000Z
+demo-068-8f78e097:i01,demo-068-8f78e097,Read PLAN.md and outline the steps to add the export pipeline,inferred,3,2026-03-01T05:48:49.000Z,2026-03-01T06:19:49.000Z
+demo-068-8f78e097:i02,demo-068-8f78e097,Commit the changes and push the branch,inferred,2,2026-03-01T06:58:49.000Z,2026-03-01T07:22:49.000Z
+demo-068-8f78e097:i03,demo-068-8f78e097,Add the retry decorator to the API client,inferred,2,2026-03-01T07:57:49.000Z,2026-03-01T08:21:49.000Z
+demo-068-8f78e097:i04,demo-068-8f78e097,Why does the nightly job double-count rows?,inferred,2,2026-03-01T08:59:49.000Z,2026-03-01T09:09:49.000Z
+demo-068-8f78e097:i05,demo-068-8f78e097,Wire the new settings page into the router,inferred,1,2026-03-01T09:43:49.000Z,2026-03-01T09:43:49.000Z
+demo-068-8f78e097:i06,demo-068-8f78e097,Met à jour le fichier de status avant de fermer,inferred,1,2026-03-01T10:21:49.000Z,2026-03-01T10:21:49.000Z
+demo-068-8f78e097:i07,demo-068-8f78e097,Same as yesterday but for the staging tenant,inferred,2,2026-03-01T10:58:49.000Z,2026-03-01T11:07:49.000Z
+demo-068-8f78e097:i08,demo-068-8f78e097,Relance les tests d'intégration et regarde les régressions,inferred,4,2026-03-01T11:40:49.000Z,2026-03-01T12:37:49.000Z
+demo-068-8f78e097:i09,demo-068-8f78e097,Split the god-object service into focused classes,inferred,1,2026-03-01T13:17:49.000Z,2026-03-01T13:17:49.000Z
+demo-069-9f65b230:i01,demo-069-9f65b230,Add the retry decorator to the API client,inferred,8,2026-01-17T04:42:03.000Z,2026-01-17T05:59:03.000Z
+demo-070-e2fb3299:t01,demo-070-e2fb3299,Refactor the streaming parser,todo,1,2025-12-18T13:59:50.000Z,2025-12-18T13:59:50.000Z
+demo-070-e2fb3299:t02,demo-070-e2fb3299,Audit the error handling,todo,11,2025-12-18T14:05:50.000Z,2025-12-18T17:39:50.000Z
+demo-071-f56a0338:i01,demo-071-f56a0338,Implement the CSV export endpoint with pagination,inferred,2,2026-05-21T12:28:52.000Z,2026-05-21T12:41:52.000Z
+demo-071-f56a0338:i02,demo-071-f56a0338,Wire the new settings page into the router,inferred,3,2026-05-21T13:16:52.000Z,2026-05-21T14:02:52.000Z
+demo-071-f56a0338:i03,demo-071-f56a0338,What's the difference between cache_read and cache_write billing?,inferred,3,2026-05-21T14:42:52.000Z,2026-05-21T15:34:52.000Z
+demo-071-f56a0338:i04,demo-071-f56a0338,Vérifie que les totaux collent avec la facture,inferred,1,2026-05-21T16:13:52.000Z,2026-05-21T16:13:52.000Z
+demo-071-f56a0338:i05,demo-071-f56a0338,Audit the error handling in the export pipeline,inferred,3,2026-05-21T16:45:52.000Z,2026-05-21T17:08:52.000Z
+demo-071-f56a0338:i06,demo-071-f56a0338,Tests fail on Windows only — investigate the path handling,inferred,3,2026-05-21T17:43:52.000Z,2026-05-21T18:18:52.000Z
+demo-071-f56a0338:i07,demo-071-f56a0338,How should we structure the multi-tenant migration?,inferred,4,2026-05-21T18:53:52.000Z,2026-05-21T19:33:52.000Z
+demo-071-f56a0338:i08,demo-071-f56a0338,Tests fail on Windows only — investigate the path handling,inferred,2,2026-05-21T20:08:52.000Z,2026-05-21T20:29:52.000Z
+demo-072-fe57191e:t01,demo-072-fe57191e,Migrate the billing module,todo,9,2026-05-02T06:56:45.000Z,2026-05-02T10:11:45.000Z
+demo-073-5c9d18a6:i01,demo-073-5c9d18a6,ok go ahead,inferred,2,2026-03-30T00:21:50.000Z,2026-03-30T00:31:50.000Z
+demo-073-5c9d18a6:i02,demo-073-5c9d18a6,Implement the CSV export endpoint with pagination,inferred,2,2026-03-30T01:05:50.000Z,2026-03-30T01:08:50.000Z
+demo-073-5c9d18a6:i03,demo-073-5c9d18a6,Read PLAN.md and outline the steps to add the export pipeline,inferred,3,2026-03-30T01:42:50.000Z,2026-03-30T02:11:50.000Z
+demo-073-5c9d18a6:i04,demo-073-5c9d18a6,Vérifie que les totaux collent avec la facture,inferred,2,2026-03-30T02:48:50.000Z,2026-03-30T03:00:50.000Z
+demo-073-5c9d18a6:i05,demo-073-5c9d18a6,Wire the new settings page into the router,inferred,3,2026-03-30T03:31:50.000Z,2026-03-30T04:00:50.000Z
+demo-074-21a62751:i01,demo-074-21a62751,Commit the changes and push the branch,inferred,1,2026-04-22T13:18:05.000Z,2026-04-22T13:18:05.000Z
+demo-074-21a62751:i02,demo-074-21a62751,Same as yesterday but for the staging tenant,inferred,1,2026-04-22T13:55:05.000Z,2026-04-22T13:55:05.000Z
+demo-074-21a62751:i03,demo-074-21a62751,Design the data model for the new billing module,inferred,3,2026-04-22T14:29:05.000Z,2026-04-22T15:04:05.000Z
+demo-075-125ca850:t01,demo-075-125ca850,Implement the retry decorator,todo,21,2026-04-02T10:44:20.000Z,2026-04-02T17:59:20.000Z
+demo-076-61e5e38e:t01,demo-076-61e5e38e,Migrate the billing module,todo,10,2026-06-03T13:43:45.000Z,2026-06-03T17:13:45.000Z
+demo-077-10383537:t01,demo-077-10383537,Fix the failing Windows CI,todo,3,2026-03-12T01:14:25.000Z,2026-03-12T01:57:25.000Z
+demo-077-10383537:t02,demo-077-10383537,Implement the retry decorator,todo,1,2026-03-12T02:37:25.000Z,2026-03-12T02:37:25.000Z
+demo-078-26379ada:t01,demo-078-26379ada,Wire the new settings page,todo,9,2026-04-19T19:37:16.000Z,2026-04-19T21:50:16.000Z
+demo-079-9675b6d9:i01,demo-079-9675b6d9,Fais le merge de main et ouvre la PR,inferred,1,2026-03-09T05:44:00.000Z,2026-03-09T05:44:00.000Z

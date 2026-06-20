@@ -38,9 +38,12 @@ __all__ = [
     "OUTPUT_TOKENS_COLS",
     "CONTEXT_SOURCES_COLS",
     "CONTEXT_COST_COLS",
+    "TASKS_COLS",
+    "TASK_PROMPTS_COLS",
     "UNATTRIBUTED_SOURCE",
     "ToolEdit",
     "ContextItem",
+    "TodoEvent",
     "ParsedPrompt",
     "UsageRecord",
     "ParsedFile",
@@ -52,6 +55,8 @@ __all__ = [
     "OutputTokenRow",
     "ContextSourceRow",
     "ContextCostRow",
+    "TaskRow",
+    "TaskPromptRow",
     "continuation_prompt_id",
 ]
 
@@ -230,6 +235,34 @@ CONTEXT_COST_COLS = [
 # exact; its size is the honest measure of the ``parentUuid`` ~= API-context gap.
 UNATTRIBUTED_SOURCE = "(unattributed)"
 
+# Task attribution (Axe B2): the prompt is not the unit of work -- the *task* is
+# ("implement feature X", "debug Y"). ``tasks.csv`` is the dimension table (one
+# row per task), ``task_prompts.csv`` the membership edges (one row per prompt:
+# its task). A task is assembled from the ``TodoWrite`` todos Claude Code really
+# wrote (the spine) or, when a session has none, inferred from time gaps +
+# prompt semantics (the fallback). The cost of a task is NOT stored here: it is
+# derived at read time by joining ``task_prompts`` -> ``tokens`` per model (the
+# whole codebase prices raw counts at read time), so a task's input+output+cache
+# cost reconciles to the bill exactly -- every real prompt belongs to one task.
+#
+# ``origin`` is ``todo`` (a real ``TodoWrite`` label, kept -- a Claude-authored
+# label, not user content) or ``inferred`` (a time/semantics segment; ``name`` is
+# a best-effort snippet of the segment's first anchoring prompt, blanked under
+# ``--no-text`` like the prompt preview). ``prompts`` is the member count.
+TASKS_COLS = [
+    "task_id",
+    "session_id",
+    "name",
+    "origin",
+    "prompts",
+    "first_timestamp",
+    "last_timestamp",
+]
+
+# Membership edges: one row per real prompt -> the task it belongs to (the
+# satellite link the B2 graph draws). A prompt belongs to exactly one task.
+TASK_PROMPTS_COLS = ["task_id", "prompt_id"]
+
 
 def continuation_prompt_id(session_id: str) -> str:
     """Pseudo prompt_id gathering a session's unattributable usage.
@@ -305,6 +338,25 @@ class ContextItem(TypedDict):
     dedup_id: str
 
 
+class TodoEvent(TypedDict):
+    """One ``TodoWrite`` snapshot Claude Code wrote on the main thread (Axe B2).
+
+    Claude Code rewrites the *whole* todo list on every ``TodoWrite``; we keep
+    only the ``in_progress`` todo's label (the active task at that moment) plus
+    the ``prompt_id`` it happened under and the timestamp, so task assembly can
+    map each prompt to the todo active during its turn. ``label`` is empty when
+    no todo is ``in_progress`` in that snapshot (all pending/completed).
+    ``dedup_id`` is the tool-use id so a replayed (resumed) session is not
+    double-counted. The label is a Claude-authored task name, not user content
+    nor source code -- safe to keep (it is the task's centre of gravity).
+    """
+
+    prompt_id: str
+    timestamp: str
+    label: str
+    dedup_id: str
+
+
 class UsageRecord(TypedDict):
     """One assistant JSONL line carrying API usage.
 
@@ -352,6 +404,7 @@ class ParsedFile(TypedDict):
     prompts: list[ParsedPrompt]
     usage: list[UsageRecord]
     context_items: list[ContextItem]
+    todo_events: list[TodoEvent]
     lines_total: int
     lines_invalid: int
     event_types: dict[str, int]
@@ -484,3 +537,28 @@ class ContextCostRow(TypedDict):
     rent_read_tokens: int
     load_write_5m_tokens: int
     load_write_1h_tokens: int
+
+
+class TaskRow(TypedDict):
+    """One row of ``tasks.csv`` (Axe B2, the task dimension table).
+
+    ``origin`` is ``todo`` (a real ``TodoWrite`` label) or ``inferred`` (a
+    time/semantics segment). ``name`` is the task's centre-of-gravity label (a
+    Claude-authored todo label, or a snippet of the segment's anchoring prompt;
+    blanked under ``--no-text``). Carries no cost: it is derived at read time.
+    """
+
+    task_id: str
+    session_id: str
+    name: str
+    origin: str
+    prompts: int
+    first_timestamp: str
+    last_timestamp: str
+
+
+class TaskPromptRow(TypedDict):
+    """One row of ``task_prompts.csv`` (Axe B2): a prompt -> its task edge."""
+
+    task_id: str
+    prompt_id: str

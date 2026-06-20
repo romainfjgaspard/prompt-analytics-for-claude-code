@@ -72,6 +72,8 @@ from .schema import (
     PROMPTS_COLS,
     REQUESTS_COLS,
     SESSIONS_COLS,
+    TASK_PROMPTS_COLS,
+    TASKS_COLS,
     TOKEN_TYPE_DESCRIPTIONS,
     TOKEN_TYPE_LABELS,
     TOKEN_TYPES,
@@ -87,12 +89,16 @@ from .schema import (
     PromptRow,
     RequestRow,
     SessionRow,
+    TaskPromptRow,
+    TaskRow,
+    TodoEvent,
     TokenRow,
     ToolEdit,
     UsageRecord,
     continuation_prompt_id,
 )
 from .storage import atomic_write_csv, atomic_write_json
+from .tasks import TaskPromptInput, TaskTodoInput, assemble_tasks
 from .tokenizer import count_tokens
 
 __all__ = ["run_extract", "collect", "parse_file", "ExtractReport", "ExtractResult"]
@@ -102,8 +108,9 @@ __all__ = ["run_extract", "collect", "parse_file", "ExtractReport", "ExtractResu
 # weights + file-edit metrics); V4 adds the Axe D context items (sized tool
 # results + attachments) and the prompt ``text_tokens``; V5 adds the
 # project-relative file ``path`` to edits (Axe C) and context items (Axe D) so
-# the unified per-file view joins a file's edits to its reads (DASH4 / D5-D6).
-CACHE_VERSION = 5
+# the unified per-file view joins a file's edits to its reads (DASH4 / D5-D6);
+# V6 adds the Axe B2 ``TodoWrite`` events (the task spine).
+CACHE_VERSION = 6
 
 PREVIEW_CHARS = 100
 
@@ -239,6 +246,26 @@ def _usage_tokens(usage: dict[str, Any]) -> dict[str, int]:
     return {key: value for key, value in counts.items() if value}
 
 
+def _todo_in_progress_label(tool_input: Any) -> str:
+    """The ``in_progress`` todo's label from a ``TodoWrite`` input (Axe B2).
+
+    Claude Code writes the whole todo list on every call; the active task is the
+    one ``in_progress``. Prefer the imperative ``content`` over ``activeForm``.
+    Empty when nothing is in progress (all pending/completed) -- the assembler
+    ignores those. A Claude-authored task label, never user content.
+    """
+    if not isinstance(tool_input, dict):
+        return ""
+    todos = tool_input.get("todos")
+    if not isinstance(todos, list):
+        return ""
+    for item in todos:
+        if isinstance(item, dict) and item.get("status") == "in_progress":
+            label = item.get("content") or item.get("activeForm") or ""
+            return str(label).strip()
+    return ""
+
+
 def _dedup_key(message: dict[str, Any], event: dict[str, Any]) -> str:
     """Global deduplication key for an assistant usage line.
 
@@ -294,6 +321,7 @@ def parse_file(filepath: Path) -> ParsedFile:
     prompts: list[ParsedPrompt] = []
     usage_records: list[UsageRecord] = []
     context_items: list[ContextItem] = []
+    todo_events: list[TodoEvent] = []
     # Axe D: tool-use id -> (source, language), filled from assistant tool calls
     # so the later ``tool_result`` (which only carries the id) can be classified.
     tool_use_meta: dict[str, tuple[str, str, str]] = {}
@@ -419,10 +447,27 @@ def parse_file(filepath: Path) -> ParsedFile:
                 content = message.get("content")
                 # Axe D: remember each tool call's (source, language, path) so the
                 # matching tool_result (carrying only the id) is classifiable.
+                # Axe B2: a ``TodoWrite`` records the active task -- capture the
+                # in-progress label so prompts can be attached to it (main thread
+                # only; a subagent's todos belong to its own context).
                 if not event.get("isSidechain"):
                     tool_use_meta.update(
                         assistant_tool_metas(content, str(event.get("cwd") or session_cwd))
                     )
+                    for block in content if isinstance(content, list) else []:
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_use"
+                            and block.get("name") == "TodoWrite"
+                        ):
+                            todo_events.append(
+                                TodoEvent(
+                                    prompt_id=pid,
+                                    timestamp=str(event.get("timestamp") or ""),
+                                    label=_todo_in_progress_label(block.get("input")),
+                                    dedup_id=str(block.get("id") or event_uuid),
+                                )
+                            )
                 tool_use_ids = [
                     str(block["id"])
                     for block in (content if isinstance(content, list) else [])
@@ -489,6 +534,7 @@ def parse_file(filepath: Path) -> ParsedFile:
         prompts=prompts,
         usage=usage_records,
         context_items=context_items,
+        todo_events=todo_events,
         lines_total=lines_total,
         lines_invalid=lines_invalid,
         event_types=dict(event_types),
@@ -776,6 +822,8 @@ class ExtractResult:
     output_tokens: list[OutputTokenRow]
     context_sources: list[ContextSourceRow]
     context_cost: list[ContextCostRow]
+    tasks: list[TaskRow]
+    task_prompts: list[TaskPromptRow]
 
 
 def collect(
@@ -838,6 +886,9 @@ def collect(
     # session, deduplicated later; plus the running conversation size (prompts +
     # main-thread assistant turns), summed straight from the deduplicated rows.
     pending_context: list[tuple[str, ContextItem]] = []
+    # Axe B2: ``TodoWrite`` snapshots paired with their session (deduplicated
+    # later, then handed to the task assembler as the spine).
+    pending_todos: list[tuple[str, TodoEvent]] = []
     conv_tokens: Counter[str] = Counter()  # session_id -> conversation tokens
     conv_items: Counter[str] = Counter()  # session_id -> conversation pieces
     # Axe D (D2): the conversation size at *prompt* grain, so the cost-over-time
@@ -902,9 +953,12 @@ def collect(
 
         # Axe D: a subagent transcript's reads/output belong to the subagent's
         # own context, not the parent thread's snapshot -- skip them entirely.
+        # Axe B2 todos follow the same rule (the parent thread owns the tasks).
         if not _subagent_parent_session(filepath):
             for item in parsed["context_items"]:
                 pending_context.append((session_id, item))
+            for todo in parsed.get("todo_events", []):
+                pending_todos.append((session_id, todo))
 
     if use_cache:
         digests = {
@@ -1234,6 +1288,37 @@ def collect(
                     )
                 )
 
+    # --- Axe B2 task attribution (todo spine + inference fallback). ----------
+    # Assemble tasks over the in-window real prompts and map each to one. The
+    # cost of a task is not stored: every prompt is in exactly one task, so a
+    # task's input+output+cache cost is its prompts' tokens priced at read time,
+    # reconciled to the bill by construction. Deduplicate the ``TodoWrite``
+    # snapshots (resumed sessions replay them) and resolve their session before
+    # handing them to the assembler. No embedder here: the live/extract path
+    # keeps the fallback gap-only (offline, deterministic); the semantic split is
+    # exercised in tests / available to callers that pass a B1 embedder.
+    seen_todo_ids: set[str] = set()
+    todo_inputs: list[TaskTodoInput] = []
+    for session_id, todo in pending_todos:
+        dedup_id = todo["dedup_id"]
+        if dedup_id:
+            if dedup_id in seen_todo_ids:
+                continue
+            seen_todo_ids.add(dedup_id)
+        todo_inputs.append(
+            TaskTodoInput(session_id=session_id, timestamp=todo["timestamp"], label=todo["label"])
+        )
+    prompt_inputs = [
+        TaskPromptInput(
+            session_id=row["session_id"],
+            prompt_id=row["prompt_id"],
+            timestamp=row["timestamp"],
+            text=prompt_aggs[row["prompt_id"]].parsed["text"],
+        )
+        for row in prompt_rows
+    ]
+    task_rows, task_prompt_rows = assemble_tasks(prompt_inputs, todo_inputs, no_text=no_text)
+
     session_rows: list[SessionRow] = []
     for session_id in included_sessions:
         row = sessions.get(session_id)
@@ -1294,6 +1379,8 @@ def collect(
         output_tokens=output_token_rows,
         context_sources=context_source_rows,
         context_cost=context_cost_rows,
+        tasks=task_rows,
+        task_prompts=task_prompt_rows,
     )
 
 
@@ -1358,6 +1445,11 @@ def run_extract(
     # Axe D cost over time (metrics only -- raw cache tokens attributed by size,
     # priced at read time; reconciles to the billed main-chain cache totals).
     atomic_write_csv(output_dir / "context_cost.csv", CONTEXT_COST_COLS, result.context_cost)
+    # Axe B2 task attribution (the task dimension + its prompt-membership edges;
+    # cost is derived at read time by joining task_prompts -> tokens, so it
+    # reconciles to the bill -- every real prompt belongs to exactly one task).
+    atomic_write_csv(output_dir / "tasks.csv", TASKS_COLS, result.tasks)
+    atomic_write_csv(output_dir / "task_prompts.csv", TASK_PROMPTS_COLS, result.task_prompts)
     # Window marker (1.5): a windowed extract must never be served later as if
     # it covered the full history -- readers append it to their Source line.
     atomic_write_json(

@@ -155,6 +155,42 @@ def test_demo_context_is_metrics_only():
     assert not any("." in lang and "/" in lang for lang in langs)
 
 
+def test_committed_tasks_match_the_generator(generated):
+    """tasks.csv / task_prompts.csv stay in sync with the generator."""
+    assert len(_read_csv("tasks.csv")) == len(generated["tasks"])
+    assert len(_read_csv("task_prompts.csv")) == len(generated["task_prompts"])
+
+
+def test_demo_tasks_cover_every_prompt_once():
+    """Axe B2 invariant on the committed demo: every real prompt is in exactly
+    one task (so task costs reconcile to the prompt bill), both origins present."""
+    prompt_ids = sorted(r["prompt_id"] for r in _read_csv("prompts.csv"))
+    links = _read_csv("task_prompts.csv")
+    covered = [row["prompt_id"] for row in links]
+    assert sorted(covered) == prompt_ids  # one edge per real prompt, no extras
+    assert len(covered) == len(set(covered))
+
+    tasks = _read_csv("tasks.csv")
+    origins = {t["origin"] for t in tasks}
+    assert origins == {"todo", "inferred"}  # both assembly paths are exercised
+    # The per-task prompt count matches its membership edges.
+    counts: dict[str, int] = defaultdict(int)
+    for row in links:
+        counts[row["task_id"]] += 1
+    for task in tasks:
+        assert int(task["prompts"]) == counts[task["task_id"]]
+
+
+def test_demo_tasks_are_metrics_only():
+    """tasks.csv carries no cost columns (cost is derived at read time)."""
+    rows = _read_csv("tasks.csv")
+    assert rows
+    cols = set(rows[0])
+    assert not (cols & {"cost", "cost_usd", "rent_read_tokens", "input_tokens"})
+    for row in rows:
+        assert "/" not in row.get("session_id", "")
+
+
 def test_demo_represents_the_new_dimensions():
     tokens = _read_csv("tokens.csv")
     requests = _read_csv("requests.csv")

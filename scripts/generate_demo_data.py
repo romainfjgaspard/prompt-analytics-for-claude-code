@@ -41,6 +41,7 @@ from prompt_analytics.context import (
     ContextRequest,
     attribute_context_cost,
 )
+from prompt_analytics.tasks import TaskPromptInput, TaskTodoInput, assemble_tasks
 
 SEED = 20260611
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -760,6 +761,79 @@ def _context_composition(
     return context_sources, context_cost
 
 
+# Task attribution (Axe B2). A pool of plausible Claude-authored todo labels the
+# demo's spine sessions advance through (the rest of the dataset is segmented by
+# the inference fallback, so the demo shows both origins). Generic on purpose --
+# they are todo labels, not project code.
+_TODO_LABELS = [
+    "Add the CSV export pipeline",
+    "Refactor the streaming parser",
+    "Fix the failing Windows CI",
+    "Wire the new settings page",
+    "Migrate the billing module",
+    "Harden the quota parser edge cases",
+    "Implement the retry decorator",
+    "Raise filters.py coverage",
+    "Audit the error handling",
+    "Document the release",
+]
+
+
+def _task_attribution(
+    prompts: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Derive tasks.csv + task_prompts.csv from the generated prompts.
+
+    Runs on its own RNG (``SEED + 4``) so adding Axe B2 never perturbs the other
+    streams. About a third of the sessions get a synthetic ``TodoWrite`` spine
+    (split into 1-3 phases, each with a real-looking label) so the demo shows the
+    todo-driven path; the remaining sessions go through the inference fallback
+    (gap + category), exactly like a real history with no todos. Both paths run
+    through the very same :func:`assemble_tasks` the extractor uses, so the demo
+    can never drift from production behaviour.
+    """
+    rng = random.Random(SEED + 4)
+
+    # Group prompts by session, preserving generation (chronological) order.
+    by_session: dict[str, list[dict[str, object]]] = {}
+    for prompt in prompts:
+        by_session.setdefault(str(prompt["session_id"]), []).append(prompt)
+
+    prompt_inputs = [
+        TaskPromptInput(
+            session_id=str(p["session_id"]),
+            prompt_id=str(p["prompt_id"]),
+            timestamp=str(p["timestamp"]),
+            text=str(p["prompt_preview"]),
+        )
+        for p in prompts
+    ]
+
+    todo_inputs: list[TaskTodoInput] = []
+    for session_id, session_prompts in by_session.items():
+        # ~1 session in 3 is todo-driven (and needs >= 2 prompts to phase).
+        if len(session_prompts) < 2 or rng.random() >= 0.34:
+            continue
+        n_phases = min(rng.randint(1, 3), len(session_prompts))
+        labels = rng.sample(_TODO_LABELS, n_phases)
+        # Contiguous phase boundaries: a TodoWrite at each phase's first prompt.
+        starts = sorted(rng.sample(range(1, len(session_prompts)), n_phases - 1))
+        bounds = [0, *starts]
+        for label, start in zip(labels, bounds, strict=True):
+            todo_inputs.append(
+                TaskTodoInput(
+                    session_id=session_id,
+                    timestamp=str(session_prompts[start]["timestamp"]),
+                    label=label,
+                )
+            )
+
+    task_rows, link_rows = assemble_tasks(prompt_inputs, todo_inputs)
+    tasks = [dict(row) for row in task_rows]
+    task_prompts = [dict(row) for row in link_rows]
+    return tasks, task_prompts
+
+
 def generate() -> dict[str, list[dict[str, object]]]:
     """Build all rows in memory (deterministic for a fixed seed)."""
     rng = random.Random(SEED)
@@ -928,6 +1002,10 @@ def generate() -> dict[str, list[dict[str, object]]]:
     # billed main-chain cache tokens by reusing the production attribution walk.
     context_sources, context_cost = _context_composition(prompts, categories, requests)
 
+    # Task attribution (Axe B2) -- todo spine + inference fallback over the
+    # finished prompts, on a dedicated RNG, via the production assembler.
+    tasks, task_prompts = _task_attribution(prompts)
+
     return {
         "sessions": sessions,
         "prompts": prompts,
@@ -940,6 +1018,8 @@ def generate() -> dict[str, list[dict[str, object]]]:
         "output_tokens": output_tokens,
         "context_sources": context_sources,
         "context_cost": context_cost,
+        "tasks": tasks,
+        "task_prompts": task_prompts,
     }
 
 
@@ -1012,6 +1092,8 @@ def main() -> None:
         OUT_DIR / "context_sources.csv", schema.CONTEXT_SOURCES_COLS, data["context_sources"]
     )
     _write_csv(OUT_DIR / "context_cost.csv", schema.CONTEXT_COST_COLS, data["context_cost"])
+    _write_csv(OUT_DIR / "tasks.csv", schema.TASKS_COLS, data["tasks"])
+    _write_csv(OUT_DIR / "task_prompts.csv", schema.TASK_PROMPTS_COLS, data["task_prompts"])
 
     # A config.yml so the dashboard's gated pages (categorization, quota) light up.
     (OUT_DIR / "config.yml").write_text(
@@ -1027,7 +1109,8 @@ def main() -> None:
         f"{len(data['output_files'])} output-file rows, "
         f"{len(data['output_tokens'])} output-token rows, "
         f"{len(data['context_sources'])} context-source rows, "
-        f"{len(data['context_cost'])} context-cost rows."
+        f"{len(data['context_cost'])} context-cost rows, "
+        f"{len(data['tasks'])} tasks, {len(data['task_prompts'])} task-prompt edges."
     )
 
 

@@ -188,6 +188,12 @@ class Dataset:
     # model): the real cache tokens attributed by size x turns of presence (rent)
     # and one-off loading (write). Empty when reading a pre-D2 extract.
     context_cost: list[dict[str, Any]] = field(default_factory=list)
+    # Task attribution (Axe B2). ``tasks`` is the task dimension (one row per
+    # task); ``task_prompts`` the prompt->task membership edges. A task's cost is
+    # derived at read time by joining ``task_prompts`` -> ``tokens``. Empty when
+    # reading a pre-B2 extract (the `by-task` view degrades gracefully).
+    tasks: list[dict[str, Any]] = field(default_factory=list)
+    task_prompts: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
@@ -314,6 +320,8 @@ def load_dataset(
         output_tokens=[dict(row) for row in result.output_tokens],
         context_sources=[dict(row) for row in result.context_sources],
         context_cost=[dict(row) for row in result.context_cost],
+        tasks=[dict(row) for row in result.tasks],
+        task_prompts=[dict(row) for row in result.task_prompts],
     )
 
 
@@ -347,6 +355,8 @@ def dataset_from_csvs(
     output_tokens = _rows("output_tokens.csv")
     context_sources = _rows("context_sources.csv")
     context_cost = _rows("context_cost.csv")
+    tasks = _rows("tasks.csv")
+    task_prompts = _rows("task_prompts.csv")
     _coerce_int(prompts, ("prompt_index", "char_count", "assistant_turns", "tool_calls"))
     _coerce_int(tokens, ("token_count", "is_sidechain"))
     _coerce_int(requests, _REQUEST_INT_COLS)
@@ -357,6 +367,7 @@ def dataset_from_csvs(
         context_cost,
         ("rent_read_tokens", "load_write_5m_tokens", "load_write_1h_tokens"),
     )
+    _coerce_int(tasks, ("prompts",))
     if source is None:
         window = _window_label(data_dir)
         source = f"{data_dir} CSVs ({window})" if window else f"{data_dir} CSVs"
@@ -372,6 +383,8 @@ def dataset_from_csvs(
         output_tokens=output_tokens,
         context_sources=context_sources,
         context_cost=context_cost,
+        tasks=tasks,
+        task_prompts=task_prompts,
     )
 
 
@@ -400,6 +413,8 @@ def filter_project(ds: Dataset, project: str) -> Dataset:
         output_tokens=[row for row in ds.output_tokens if row["prompt_id"] in kept_prompt_ids],
         context_sources=[row for row in ds.context_sources if row["session_id"] in session_ids],
         context_cost=[row for row in ds.context_cost if row["session_id"] in session_ids],
+        tasks=[row for row in ds.tasks if row["session_id"] in session_ids],
+        task_prompts=[row for row in ds.task_prompts if row["prompt_id"] in kept_prompt_ids],
     )
 
 
@@ -454,6 +469,9 @@ def filter_dates(ds: Dataset, since: str | None, until: str | None) -> Dataset:
             row for row in ds.context_sources if row["session_id"] in kept_session_ids
         ],
         context_cost=[row for row in ds.context_cost if row["session_id"] in kept_session_ids],
+        # Tasks follow their session; membership edges follow their kept prompt.
+        tasks=[row for row in ds.tasks if row["session_id"] in kept_session_ids],
+        task_prompts=[row for row in ds.task_prompts if row["prompt_id"] in kept_prompt_ids],
     )
 
 
@@ -480,6 +498,9 @@ def filter_prompt_ids(ds: Dataset, prompt_ids: set[str] | frozenset[str]) -> Dat
         # Session-grain context rows ride along unnarrowed, like sessions.
         context_sources=ds.context_sources,
         context_cost=ds.context_cost,
+        # The task dimension rides along; membership edges honour the selection.
+        tasks=ds.tasks,
+        task_prompts=[row for row in ds.task_prompts if row.get("prompt_id") in kept],
     )
 
 

@@ -94,6 +94,8 @@ def test_full_extract_produces_all_csvs(fake_claude):
         "prompts_text.csv",
         "context_sources.csv",
         "context_cost.csv",
+        "tasks.csv",
+        "task_prompts.csv",
         "extract_meta.json",
     ):
         assert (out / name).exists(), f"missing {name}"
