@@ -49,6 +49,7 @@ examples:
   prompt-analytics recommend                     what compacting long sessions earlier would save
   prompt-analytics burn-rate                     $/day and week-over-week trend
   prompt-analytics break-even                    your API-equivalent value vs a Max subscription
+  prompt-analytics impact --pivot 2026-06-01     before/after a setup change: normalized deltas
   prompt-analytics prompts --top 10              your 10 most expensive prompts
   prompt-analytics compare --providers anthropic,copilot
   prompt-analytics summary --format json         machine-readable output (also: csv)
@@ -365,6 +366,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _provider_arg(p_break_even)
     p_break_even.set_defaults(func=_handle_break_even)
+
+    p_impact = subparsers.add_parser(
+        "impact",
+        parents=[analytics_parent],
+        help="Before/after a date pivot: workload-normalized deltas + confounders (Axe E).",
+    )
+    _provider_arg(p_impact)
+    p_impact.add_argument(
+        "--pivot",
+        metavar="YYYY-MM-DD",
+        help="Split day: BEFORE is up to the day before it, AFTER is this day onward. "
+        "Omit to list detected config-change dates as suggestions.",
+    )
+    p_impact.set_defaults(func=_handle_impact)
 
     p_compare = subparsers.add_parser(
         "compare",
@@ -1035,6 +1050,42 @@ def _handle_break_even(args: argparse.Namespace) -> int:
         return code
     render(
         analytics.break_even(ds, provider=args.provider, quota_rows=_read_quota_rows(args)),
+        args.format,
+    )
+    return 0
+
+
+def _handle_impact(args: argparse.Namespace) -> int:
+    import sys
+
+    from . import analytics
+    from .extract import _parse_bound
+    from .render import render
+
+    if code := _check_providers([args.provider], _pricing_path(args)):
+        return code
+    ds, code = _dataset_or_fail(args)
+    if ds is None:
+        return code
+    suggestions = analytics.suggest_pivots(ds)
+    # No pivot: this is a date-pivot tool, so list the detected config-change
+    # dates as a typing aid and ask for one (exit 2, a usage gate -- not an error).
+    if not args.pivot:
+        print("Provide a pivot date with --pivot YYYY-MM-DD to split before/after.")
+        if suggestions:
+            print("Detected config-change dates you could use as a pivot:")
+            for day, label in suggestions:
+                print(f"  {day}  {label}")
+        else:
+            print("(No CLAUDE.md / settings.json changes detected inside the data range.)")
+        return 2
+    try:
+        _parse_bound(args.pivot, "pivot")
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    render(
+        analytics.impact(ds, args.provider, pivot=args.pivot, suggestions=suggestions),
         args.format,
     )
     return 0

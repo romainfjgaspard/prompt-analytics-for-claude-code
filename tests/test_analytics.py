@@ -1174,3 +1174,199 @@ def test_task_graph_empty_dataset_has_no_data():
     assert graph.tasks == []
     assert graph.satellites == []
     assert not graph.has_data
+
+
+# ---------------------------------------------------------------------------
+# impact: before/after a date pivot (Axe E, the capstone transverse view).
+# ---------------------------------------------------------------------------
+
+
+def _impact_ds() -> Dataset:
+    """Two prompts before a pivot, two after, with clean OPUS-priced costs.
+
+    OPUS rates (per 1M): input 5, output 25, cache_read 0.5.
+    BEFORE (s1, 2026-06-01): p1 = p2 = input 1M ($5) + output 100k ($2.50) +
+    cache_read 1M ($0.50) = $8.00 each -> $16.00, output $5, context $1.
+    AFTER (s2, 2026-06-10): p3 = p4 = input 2M ($10) + output 400k ($10) +
+    cache_read 4M ($2) = $22.00 each -> $44.00, output $20, context $4.
+    One request per prompt (the 'turns'). Pivot 2026-06-05 splits 2 / 2.
+    """
+
+    def _p(session, pid, day):
+        return {"session_id": session, "prompt_id": pid, "timestamp": f"{day}T10:00:00Z"}
+
+    def _req(session, pid):
+        return {"session_id": session, "prompt_id": pid, "is_sidechain": 0}
+
+    tokens = []
+    for pid in ("p1", "p2"):
+        tokens += [
+            _token("s1", pid, OPUS, "input", 1_000_000),
+            _token("s1", pid, OPUS, "output", 100_000),
+            _token("s1", pid, OPUS, "cache_read", 1_000_000),
+        ]
+    for pid in ("p3", "p4"):
+        tokens += [
+            _token("s2", pid, OPUS, "input", 2_000_000),
+            _token("s2", pid, OPUS, "output", 400_000),
+            _token("s2", pid, OPUS, "cache_read", 4_000_000),
+        ]
+    return Dataset(
+        sessions=[{"session_id": "s1"}, {"session_id": "s2"}],
+        prompts=[
+            _p("s1", "p1", "2026-06-01"),
+            _p("s1", "p2", "2026-06-01"),
+            _p("s2", "p3", "2026-06-10"),
+            _p("s2", "p4", "2026-06-10"),
+        ],
+        tokens=tokens,
+        categories={
+            "p1": {"category": "implementation"},
+            "p2": {"category": "implementation"},
+            "p3": {"category": "debug"},
+            "p4": {"category": "implementation"},
+        },
+        source="test data",
+        requests=[_req("s1", "p1"), _req("s1", "p2"), _req("s2", "p3"), _req("s2", "p4")],
+        tasks=[{"task_id": "s1:t1", "session_id": "s1"}],
+        task_prompts=[{"task_id": "s1:t1", "prompt_id": "p1"}],
+    )
+
+
+def _metric(report, label):
+    return next(m for m in report.metrics if m.label == label)
+
+
+def test_impact_report_normalized_ratios_split_on_pivot():
+    report = analytics.impact_report(_impact_ds(), provider="anthropic", pivot="2026-06-05")
+
+    assert report.before_prompts == 2
+    assert report.after_prompts == 2
+    assert report.has_both_sides
+
+    cpp = _metric(report, "Cost per prompt")
+    assert cpp.before == pytest.approx(8.0)  # $16.00 / 2
+    assert cpp.after == pytest.approx(22.0)  # $44.00 / 2
+
+    out_share = _metric(report, "Output cost share")
+    assert out_share.before == pytest.approx(100 * 5 / 16)  # 31.25
+    assert out_share.after == pytest.approx(100 * 20 / 44)  # 45.45
+
+    ctx_share = _metric(report, "Context rent share")
+    assert ctx_share.before == pytest.approx(100 * 1 / 16)  # 6.25
+    assert ctx_share.after == pytest.approx(100 * 4 / 44)  # 9.09
+
+    crpt = _metric(report, "Cache read / turn")
+    assert crpt.before == pytest.approx(2_000_000 / 2)  # two requests before
+    assert crpt.after == pytest.approx(8_000_000 / 2)
+
+    oppt = _metric(report, "Output tokens / prompt")
+    assert oppt.before == pytest.approx(200_000 / 2)
+    assert oppt.after == pytest.approx(800_000 / 2)
+
+
+def test_impact_report_confounders_and_total_reconciles():
+    report = analytics.impact_report(_impact_ds(), provider="anthropic", pivot="2026-06-05")
+
+    before_total = _metric(report, "Total cost").before
+    after_total = _metric(report, "Total cost").after
+    assert before_total == pytest.approx(16.0)
+    assert after_total == pytest.approx(44.0)
+    # The two sides reconcile to the whole bill (every token is on exactly one side).
+    engine = CostEngine("anthropic")
+    bill = sum(
+        engine.cost(t["model"], t["token_type"], t["token_count"]) for t in _impact_ds().tokens
+    )
+    assert before_total + after_total == pytest.approx(bill)
+
+    prompts = _metric(report, "Prompts")
+    assert prompts.confounder and prompts.before == 2 and prompts.after == 2
+    pps = _metric(report, "Prompts / session")
+    assert pps.before == pytest.approx(2.0) and pps.after == pytest.approx(2.0)
+    cats = _metric(report, "Top category")
+    assert cats.before == "implementation"  # 2 implementation
+    assert cats.after == "debug"  # debug wins the 1-1 tie by Counter order (first seen)
+
+
+def test_impact_table_has_confounder_divider_and_honesty_note():
+    result = analytics.impact(_impact_ds(), "anthropic", pivot="2026-06-05")
+    metrics = [r["metric"] for r in result.rows]
+    # Ratios come first, then the divider, then the confounders.
+    assert "Cost per prompt" in metrics
+    divider = next(i for i, m in enumerate(metrics) if "confounders" in m)
+    assert metrics.index("Cost per prompt") < divider < metrics.index("Prompts")
+    # The honesty caveat (observational, not causal) is always present.
+    assert any("observational split" in n for n in result.notes)
+    assert any("Pivot 2026-06-05" in n for n in result.notes)
+    # Percentage-point delta for a share row; signed money delta for a cost row.
+    ctx_row = next(r for r in result.rows if r["metric"] == "Context rent share")
+    assert ctx_row["change"].endswith("pp")
+    cpp_row = next(r for r in result.rows if r["metric"] == "Cost per prompt")
+    assert cpp_row["change"].startswith("+$")
+
+
+def test_impact_empty_side_warns_and_blanks_cells():
+    # A pivot before all the data: the BEFORE side is empty.
+    result = analytics.impact(_impact_ds(), "anthropic", pivot="2026-06-01")
+    report = analytics.impact_report(_impact_ds(), provider="anthropic", pivot="2026-06-01")
+    assert not report.has_both_sides
+    assert any(n.startswith("WARNING: no prompts before") for n in result.notes)
+    cpp_row = next(r for r in result.rows if r["metric"] == "Cost per prompt")
+    assert cpp_row["before"] == "-"  # nothing to normalize on the empty side
+    assert cpp_row["change"] == "-"
+
+
+def test_impact_drops_optional_rows_without_tasks_or_categories():
+    ds = _impact_ds()
+    ds.tasks.clear()
+    ds.categories.clear()
+    report = analytics.impact_report(ds, provider="anthropic", pivot="2026-06-05")
+    labels = {m.label for m in report.metrics}
+    assert "Tasks" not in labels
+    assert "Top category" not in labels
+    assert "Cost per prompt" in labels  # the ratios always stay
+
+
+def test_impact_suggestions_folded_into_notes():
+    result = analytics.impact(
+        _impact_ds(),
+        "anthropic",
+        pivot="2026-06-05",
+        suggestions=[("2026-06-03", "webapp/CLAUDE.md")],
+    )
+    assert any("2026-06-03 (webapp/CLAUDE.md)" in n for n in result.notes)
+
+
+def test_suggest_pivots_from_config_mtime_inside_range(tmp_path):
+    import os
+    from datetime import datetime
+
+    project = tmp_path / "webapp"
+    project.mkdir()
+    claude_md = project / "CLAUDE.md"
+    claude_md.write_text("# project memory\n", encoding="utf-8")
+    # Set the mtime to 2026-06-05 12:00 local, strictly inside [06-01, 06-10].
+    pivot_ts = datetime(2026, 6, 5, 12, 0, 0).timestamp()
+    os.utime(claude_md, (pivot_ts, pivot_ts))
+
+    ds = _impact_ds()
+    ds.sessions[0]["cwd"] = str(project)
+    suggestions = analytics.suggest_pivots(ds)
+    assert ("2026-06-05", "webapp/CLAUDE.md") in suggestions
+
+
+def test_suggest_pivots_filters_out_of_range_dates(tmp_path):
+    import os
+    from datetime import datetime
+
+    project = tmp_path / "webapp"
+    project.mkdir()
+    claude_md = project / "CLAUDE.md"
+    claude_md.write_text("x", encoding="utf-8")
+    # Mtime way after the data window -> filtered out (degenerate split).
+    far = datetime(2027, 1, 1, 12, 0, 0).timestamp()
+    os.utime(claude_md, (far, far))
+
+    ds = _impact_ds()
+    ds.sessions[0]["cwd"] = str(project)
+    assert analytics.suggest_pivots(ds) == []

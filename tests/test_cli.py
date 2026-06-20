@@ -150,6 +150,31 @@ def test_by_task_empty_history_hints(fake_claude):
     assert main(_args(fake_claude, "by-task")) == 1
 
 
+def test_impact_dispatch_with_pivot(data, capsys):
+    assert main(_args(data, "impact", "--pivot", "2026-05-01")) == 0
+    out = capsys.readouterr().out
+    assert "Impact before/after 2026-05-01" in out
+    assert "workload confounders" in out
+
+
+def test_impact_without_pivot_lists_suggestions_exit_2(data, capsys):
+    # No --pivot: the date-pivot tool gates on a chosen date (exit 2), printing
+    # the detected config-change dates (or a "none found" line) as a typing aid.
+    assert main(_args(data, "impact")) == 2
+    out = capsys.readouterr().out
+    assert "--pivot YYYY-MM-DD" in out
+
+
+def test_impact_bad_pivot_exit_2(data, capsys):
+    assert main(_args(data, "impact", "--pivot", "not-a-date")) == 2
+    err = capsys.readouterr().err
+    assert "Invalid --pivot date" in err
+
+
+def test_impact_empty_history_hints(fake_claude):
+    assert main(_args(fake_claude, "impact", "--pivot", "2026-05-01")) == 1
+
+
 def test_prompts_dispatch(data, capsys):
     assert main(_args(data, "prompts", "--top", "2")) == 0
     out = capsys.readouterr().out

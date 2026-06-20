@@ -86,6 +86,11 @@ __all__ = [
     "timeline",
     "break_even",
     "compare_providers",
+    "impact",
+    "impact_report",
+    "ImpactReport",
+    "ImpactMetric",
+    "suggest_pivots",
     "flat_export",
     "mini_summary",
 ]
@@ -3145,6 +3150,360 @@ def compare_providers(ds: Dataset, providers: list[str]) -> TableResult:
         Column(f"cost_{provider}_usd", f"Cost ({provider})", "money") for provider in providers
     ]
     return TableResult("Provider cost comparison", columns, rows, notes)
+
+
+# ---------------------------------------------------------------------------
+# Axe E: before/after impact of an optimization (capstone, transverse).
+#
+# A date pivot splits the history; the SAME workload-normalized ratios are
+# computed on both sides so a config change (a CLAUDE.md edit, /compact earlier,
+# a model switch) reads as a delta instead of a raw-total swing that the workload
+# alone would confound. The confounders (volume, depth, task mix) are surfaced
+# right next to the ratios so the change is never over-sold as causal: this is an
+# observational split, not a controlled experiment.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ImpactMetric:
+    """One before/after metric of the Axe-E split (shared shape, CLI + dashboard).
+
+    ``before``/``after`` are raw values (a float ratio, a money amount, a count,
+    or a label) or ``None`` when a side has no data; ``fmt`` drives how
+    :func:`impact` renders them and their delta. ``confounder`` flags the workload
+    descriptors (volume, depth, task mix) shown to keep the ratio deltas honest --
+    they describe how the workload moved, they are not the optimization.
+    """
+
+    label: str
+    before: float | str | None
+    after: float | str | None
+    fmt: str
+    confounder: bool = False
+
+
+@dataclass(frozen=True)
+class ImpactReport:
+    """Structured Axe-E before/after report (shared by the CLI + the dashboard).
+
+    ``pivot`` is the inclusive split day: ``before`` covers prompts up to the day
+    before it, ``after`` covers the pivot day onward. ``metrics`` lists the
+    workload-normalized ratios first, then the confounders. The pure numbers feed
+    both :func:`impact` (the CLI table) and the dashboard, so the two never drift.
+    """
+
+    provider: str
+    pivot: str
+    before_prompts: int
+    after_prompts: int
+    before_days: int
+    after_days: int
+    metrics: list[ImpactMetric]
+
+    @property
+    def has_both_sides(self) -> bool:
+        """True when both sides carry at least one prompt (a meaningful split)."""
+        return self.before_prompts > 0 and self.after_prompts > 0
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float | None:
+    """``numerator / denominator``, or ``None`` when the denominator is 0."""
+    return numerator / denominator if denominator else None
+
+
+def _impact_side_stats(side: Dataset, provider: str) -> dict[str, Any]:
+    """Workload-normalized ratios + confounders for one side of the split.
+
+    Every ratio is normalized (per prompt, per turn, or as a cost share) so it
+    isolates the config from the workload; the raw confounders (prompts, cost,
+    days, depth, tasks, dominant category) ride alongside so the deltas stay
+    honest. A turn is one API request (``requests.csv`` grain).
+    """
+    engine = CostEngine(provider, side.pricing_path)
+    prompts = len(side.prompts)
+    sessions = len(side.sessions)
+
+    total_cost = output_cost = input_cost = context_cost_total = 0.0
+    cache_read_tokens = output_tokens = 0
+    for row in side.tokens:
+        token_type = row["token_type"]
+        c = engine.cost(row.get("model") or "", token_type, row["token_count"])
+        total_cost += c
+        if token_type == "output":
+            output_cost += c
+            output_tokens += row["token_count"]
+        elif token_type == "input":
+            input_cost += c
+        elif token_type in _CONTEXT_TOKEN_TYPES:
+            context_cost_total += c
+            if token_type == "cache_read":
+                cache_read_tokens += row["token_count"]
+
+    turns = len(side.requests)
+    categories: Counter[str] = Counter()
+    for row in side.prompts:
+        category = (side.categories.get(row["prompt_id"]) or {}).get("category") or ""
+        if category:
+            categories[category] += 1
+
+    return {
+        "prompts": prompts,
+        "total_cost": round(total_cost, 4),
+        "cost_per_prompt": _safe_ratio(total_cost, prompts),
+        "output_share": (100 * output_cost / total_cost) if total_cost else None,
+        "context_share": (100 * context_cost_total / total_cost) if total_cost else None,
+        "cache_read_per_turn": _safe_ratio(cache_read_tokens, turns),
+        "output_per_prompt": _safe_ratio(output_tokens, prompts),
+        "days": _span_days(side) if prompts else 0,
+        "prompts_per_session": _safe_ratio(prompts, sessions),
+        "tasks": len(side.tasks),
+        "top_category": categories.most_common(1)[0][0] if categories else "(uncategorized)",
+    }
+
+
+def _day_before(day: str) -> str:
+    """The calendar day before an ISO ``YYYY-MM-DD`` (lexical, no timezone)."""
+    return (datetime.fromisoformat(day) - timedelta(days=1)).date().isoformat()
+
+
+def impact_report(ds: Dataset, *, provider: str, pivot: str) -> ImpactReport:
+    """Assemble the Axe-E before/after report around ``pivot`` (see :class:`ImpactReport`).
+
+    Splits the dataset on the pivot day (``before`` = up to the day before it,
+    ``after`` = the pivot day onward, reusing :func:`filter_dates`), then computes
+    the same workload-normalized ratios and workload confounders on each side.
+    Pure: the filesystem pivot suggestions live in :func:`suggest_pivots`, kept out
+    of here so this stays deterministic and unit-testable.
+    """
+    before = filter_dates(ds, None, _day_before(pivot))
+    after = filter_dates(ds, pivot, None)
+    b = _impact_side_stats(before, provider)
+    a = _impact_side_stats(after, provider)
+
+    metrics: list[ImpactMetric] = [
+        ImpactMetric("Cost per prompt", b["cost_per_prompt"], a["cost_per_prompt"], "money"),
+        ImpactMetric("Output cost share", b["output_share"], a["output_share"], "pct"),
+        ImpactMetric("Context rent share", b["context_share"], a["context_share"], "pct"),
+        ImpactMetric(
+            "Cache read / turn", b["cache_read_per_turn"], a["cache_read_per_turn"], "ratio"
+        ),
+        ImpactMetric(
+            "Output tokens / prompt", b["output_per_prompt"], a["output_per_prompt"], "ratio"
+        ),
+        ImpactMetric("Prompts", b["prompts"], a["prompts"], "int", confounder=True),
+        ImpactMetric(
+            "Total cost", b["total_cost"], a["total_cost"], "money_total", confounder=True
+        ),
+        ImpactMetric("Active days", b["days"], a["days"], "int", confounder=True),
+        ImpactMetric(
+            "Prompts / session",
+            b["prompts_per_session"],
+            a["prompts_per_session"],
+            "ratio",
+            confounder=True,
+        ),
+    ]
+    if ds.tasks:
+        metrics.append(ImpactMetric("Tasks", b["tasks"], a["tasks"], "int", confounder=True))
+    if ds.categories:
+        metrics.append(
+            ImpactMetric(
+                "Top category", b["top_category"], a["top_category"], "str", confounder=True
+            )
+        )
+
+    return ImpactReport(
+        provider=provider,
+        pivot=pivot,
+        before_prompts=b["prompts"],
+        after_prompts=a["prompts"],
+        before_days=b["days"],
+        after_days=a["days"],
+        metrics=metrics,
+    )
+
+
+def _impact_fmt_value(value: float | str | None, fmt: str) -> str:
+    """Render a before/after cell (a side may be empty -> ``-``)."""
+    if value is None or value == "":
+        return "-"
+    if fmt == "money":
+        return f"${float(value):,.4f}"
+    if fmt == "money_total":
+        return f"${float(value):,.2f}"
+    if fmt == "pct":
+        return f"{float(value):.1f}%"
+    if fmt == "ratio":
+        return f"{float(value):,.1f}"
+    if fmt == "int":
+        return f"{int(value):,}"
+    return str(value)
+
+
+def _impact_fmt_change(before: float | str | None, after: float | str | None, fmt: str) -> str:
+    """Render the delta cell: percentage points for shares, signed delta (+ % change)
+    for amounts and ratios, a same/changed flag for a label."""
+    if fmt == "str":
+        if before is None and after is None:
+            return "-"
+        return "same" if before == after else "changed"
+    if before is None or after is None:
+        return "-"  # one side empty -> no meaningful delta
+    bf, af = float(before), float(after)
+    delta = af - bf
+    if fmt == "pct":
+        # Shares move in percentage POINTS, not a relative percentage.
+        return f"{delta:+.1f} pp"
+    if fmt == "money":
+        body = f"{'+' if delta >= 0 else '-'}${abs(delta):,.4f}"
+    elif fmt == "money_total":
+        body = f"{'+' if delta >= 0 else '-'}${abs(delta):,.2f}"
+    elif fmt == "int":
+        body = f"{delta:+,.0f}"
+    else:  # ratio
+        body = f"{delta:+,.1f}"
+    if bf:
+        body += f" ({100 * delta / bf:+.0f}%)"
+    return body
+
+
+def impact(
+    ds: Dataset,
+    provider: str,
+    *,
+    pivot: str,
+    suggestions: list[tuple[str, str]] | None = None,
+) -> TableResult:
+    """Before/after impact of an optimization around a date ``pivot`` (Axe E).
+
+    Splits the history on ``pivot`` and shows, per metric, the BEFORE value, the
+    AFTER value and the change. The headline rows are workload-normalized ratios
+    (cost per prompt, output cost share, context rent share, cache read per turn,
+    output tokens per prompt) so a config change reads through the workload; the
+    rows under the divider are the workload confounders (volume, depth, task mix)
+    that keep the deltas honest. The notes spell out that this is an observational
+    split, not a controlled experiment. The pure numbers live in
+    :func:`impact_report` (shared with the dashboard); ``suggestions`` (from
+    :func:`suggest_pivots`) are folded into the notes as a pivot-picking aid.
+    """
+    report = impact_report(ds, provider=provider, pivot=pivot)
+
+    def _row(metric: ImpactMetric) -> dict[str, Any]:
+        return {
+            "metric": metric.label,
+            "before": _impact_fmt_value(metric.before, metric.fmt),
+            "after": _impact_fmt_value(metric.after, metric.fmt),
+            "change": _impact_fmt_change(metric.before, metric.after, metric.fmt),
+        }
+
+    rows: list[dict[str, Any]] = [_row(m) for m in report.metrics if not m.confounder]
+    confounders = [m for m in report.metrics if m.confounder]
+    if confounders:
+        rows.append(
+            {
+                "metric": "— workload confounders (not the optimization) —",
+                "before": "",
+                "after": "",
+                "change": "",
+            }
+        )
+        rows.extend(_row(m) for m in confounders)
+
+    pivot_before = _day_before(pivot)
+    notes = [_source_note(ds)]
+    notes.append(
+        f"Pivot {pivot}: BEFORE = {report.before_prompts:,} prompts up to {pivot_before} "
+        f"({report.before_days} active days); AFTER = {report.after_prompts:,} prompts from "
+        f"{pivot} ({report.after_days} active days)."
+    )
+    if not report.has_both_sides:
+        empty = "before" if report.before_prompts == 0 else "after"
+        notes.append(
+            f"WARNING: no prompts {empty} the pivot -- pick a date inside the data range "
+            "for a meaningful comparison."
+        )
+    notes.append(
+        "The ratios above the divider are workload-normalized (per prompt, per turn, or as a "
+        "cost share); the confounders below describe how the workload itself moved. This is an "
+        "observational split, not a controlled experiment -- if volume, depth or task mix "
+        "shifted a lot, read the ratio deltas with caution (correlation, not proven causation)."
+    )
+    notes.append("Cache read / turn = average context re-sent per API request (a 'turn').")
+    if suggestions:
+        listed = ", ".join(f"{day} ({label})" for day, label in suggestions)
+        notes.append(f"Detected config changes you could use as a pivot: {listed}.")
+    # Loud about unpriced / long-context models, like every other cost view.
+    engine = CostEngine(provider, ds.pricing_path)
+    for row in ds.tokens:
+        engine.cost(row.get("model") or "", row["token_type"], row["token_count"])
+    if (note := engine.note()) is not None:
+        notes.append(note)
+    if (lc_note := engine.long_context_note()) is not None:
+        notes.append(lc_note)
+
+    return TableResult(
+        f"Impact before/after {pivot} ({provider})",
+        [
+            Column("metric", "Metric"),
+            Column("before", "Before", "str"),
+            Column("after", "After", "str"),
+            Column("change", "Change", "str"),
+        ],
+        rows,
+        notes,
+    )
+
+
+def suggest_pivots(ds: Dataset) -> list[tuple[str, str]]:
+    """Candidate pivot dates from the mtime of config files (Axe E pivot aid).
+
+    Probes the Claude config dir (``CLAUDE.md`` / ``settings.json`` /
+    ``settings.local.json``) and every project ``cwd`` seen in the data for a
+    ``CLAUDE.md`` or ``.claude/settings*.json``; a file's last-modified day is a
+    plausible "I changed my setup here" pivot. This is only a typing aid -- it
+    never drives the analysis -- and is filtered to dates strictly inside the data
+    range so the suggested split is non-degenerate. Returns ``(YYYY-MM-DD, label)``
+    pairs sorted by day, deduplicated.
+    """
+    days = sorted(_parse_day(p.get("timestamp", "")) for p in ds.prompts if p.get("timestamp"))
+    if not days:
+        return []
+    first, last = days[0], days[-1]
+
+    candidates: list[tuple[Path, str]] = []
+    config_dir = paths.claude_config_dir()
+    for name in ("CLAUDE.md", "settings.json", "settings.local.json"):
+        candidates.append((config_dir / name, f"~/.claude/{name}"))
+    cwds = {row.get("cwd") or "" for row in ds.sessions} | {
+        row.get("cwd") or "" for row in ds.prompts
+    }
+    for cwd in sorted(c for c in cwds if c):
+        base = Path(cwd)
+        label_base = base.name or cwd
+        candidates.append((base / "CLAUDE.md", f"{label_base}/CLAUDE.md"))
+        candidates.append(
+            (base / ".claude" / "settings.json", f"{label_base}/.claude/settings.json")
+        )
+        candidates.append(
+            (base / ".claude" / "settings.local.json", f"{label_base}/.claude/settings.local.json")
+        )
+
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for path, label in candidates:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        day = datetime.fromtimestamp(mtime).date().isoformat()
+        if not (first < day <= last):
+            continue
+        key = (day, label)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    out.sort()
+    return out
 
 
 # ---------------------------------------------------------------------------
