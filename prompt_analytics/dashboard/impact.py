@@ -30,7 +30,7 @@ import pandas as pd
 import streamlit as st
 
 from prompt_analytics import analytics
-from prompt_analytics.analytics import _day_before, _impact_fmt_change, _impact_fmt_value
+from prompt_analytics.analytics import day_before, impact_fmt_change, impact_fmt_value
 from prompt_analytics.dashboard import data
 
 # Sidebar widget keys (owned via ``key=``); persisted like the filter keys so the
@@ -155,9 +155,9 @@ def _delta_metric(col: Any, metric: analytics.ImpactMetric) -> None:
     neutral), so we never imply a verdict -- the honesty ADN of the whole product.
     The BEFORE value rides in the help tooltip.
     """
-    after = _impact_fmt_value(metric.after, metric.fmt)
-    before = _impact_fmt_value(metric.before, metric.fmt)
-    change = _impact_fmt_change(metric.before, metric.after, metric.fmt)
+    after = impact_fmt_value(metric.after, metric.fmt)
+    before = impact_fmt_value(metric.before, metric.fmt)
+    change = impact_fmt_change(metric.before, metric.after, metric.fmt)
     col.metric(
         metric.label,
         after,
@@ -174,7 +174,7 @@ def render_impact_panel(ds: analytics.Dataset, provider: str, pivot: str) -> Non
     the CLI ``impact`` table. Used at the top of every wired page in compare mode.
     """
     report = analytics.impact_report(ds, provider=provider, pivot=pivot)
-    pivot_before = _day_before(pivot)
+    pivot_before = day_before(pivot)
 
     st.caption(
         f"**Before {pivot}:** {report.before_prompts:,} prompts over "

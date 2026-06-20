@@ -152,6 +152,18 @@ Commands that price tokens take `--provider NAME` to choose the rate card for th
 | `prompts` | `--top N` `--provider NAME` | The N most expensive prompts, with a preview. |
 | `sessions` | `--depth` \| `--top N`, `--project NAME` | Sessions ranked by cost, or `--depth` for the marginal-cost-by-depth meta-analysis; `--project` restricts to one. |
 
+**Cost by content** — the same reconciled bill, attributed across four levels of *content* (input → output → context → task), each metrics-only (no source code is ever stored):
+
+| Command | Shows |
+| --- | --- |
+| `by-output` | **Output** composition: language mix (by extension), code vs tests, lines +/−, and the prose-vs-code split of generation cost. |
+| `by-context` | **Context** composition: what fills the re-read cache by source, splitting one-off **loading** (`cache_write`) from **rent** (`cache_read` paid every turn it lingers). |
+| `by-file` | Per-**file** footprint: edits + line diff (output) crossed with reads + context cost — the actionable "what to keep out of context". |
+| `by-task` | Cost by **task** (the unit of work, not the prompt): total cost with context share, prompts, span, dominant category. Built from the `TodoWrite` spine with an inference fallback. |
+| `impact` | **Before/after** a `--pivot YYYY-MM-DD` date: workload-normalized ratios (cost/prompt, output share, context rent share) with the workload confounders alongside — an observational split, not a controlled experiment. |
+
+These power the dashboard's **Composition** page ("where your cost goes, by content") and a global before/after **compare mode**.
+
 Beyond these, there are **power-user analyses** on the request grain (`context`, `ttl`, `compactions`, `overhead`, `model-category`, `recommend`, `burn-rate`, `break-even`) and the **pricing / export / pipeline** commands (`compare`, `export`, `extract`, `snapshot`, `categorize`, `run`, `dashboard`, `config init`). The full reference, grouped by purpose with every flag, is in the wiki:
 
 - 📖 [**CLI Commands** — power-user analyses](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/CLI-Commands#power-user-analyses-request-grain)

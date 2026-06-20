@@ -92,6 +92,9 @@ __all__ = [
     "ImpactReport",
     "ImpactMetric",
     "suggest_pivots",
+    "day_before",
+    "impact_fmt_value",
+    "impact_fmt_change",
     "flat_export",
     "mini_summary",
 ]
@@ -3262,7 +3265,7 @@ def _impact_side_stats(side: Dataset, provider: str) -> dict[str, Any]:
     }
 
 
-def _day_before(day: str) -> str:
+def day_before(day: str) -> str:
     """The calendar day before an ISO ``YYYY-MM-DD`` (lexical, no timezone)."""
     return (datetime.fromisoformat(day) - timedelta(days=1)).date().isoformat()
 
@@ -3275,7 +3278,7 @@ def split_on_pivot(ds: Dataset, pivot: str) -> tuple[Dataset, Dataset]:
     built on (it calls this). Shared with the dashboard's global date-pivot mode so
     the CLI table and the before/after views split the history identically.
     """
-    return filter_dates(ds, None, _day_before(pivot)), filter_dates(ds, pivot, None)
+    return filter_dates(ds, None, day_before(pivot)), filter_dates(ds, pivot, None)
 
 
 def impact_report(ds: Dataset, *, provider: str, pivot: str) -> ImpactReport:
@@ -3334,7 +3337,7 @@ def impact_report(ds: Dataset, *, provider: str, pivot: str) -> ImpactReport:
     )
 
 
-def _impact_fmt_value(value: float | str | None, fmt: str) -> str:
+def impact_fmt_value(value: float | str | None, fmt: str) -> str:
     """Render a before/after cell (a side may be empty -> ``-``)."""
     if value is None or value == "":
         return "-"
@@ -3351,7 +3354,7 @@ def _impact_fmt_value(value: float | str | None, fmt: str) -> str:
     return str(value)
 
 
-def _impact_fmt_change(before: float | str | None, after: float | str | None, fmt: str) -> str:
+def impact_fmt_change(before: float | str | None, after: float | str | None, fmt: str) -> str:
     """Render the delta cell: percentage points for shares, signed delta (+ % change)
     for amounts and ratios, a same/changed flag for a label."""
     if fmt == "str":
@@ -3402,9 +3405,9 @@ def impact(
     def _row(metric: ImpactMetric) -> dict[str, Any]:
         return {
             "metric": metric.label,
-            "before": _impact_fmt_value(metric.before, metric.fmt),
-            "after": _impact_fmt_value(metric.after, metric.fmt),
-            "change": _impact_fmt_change(metric.before, metric.after, metric.fmt),
+            "before": impact_fmt_value(metric.before, metric.fmt),
+            "after": impact_fmt_value(metric.after, metric.fmt),
+            "change": impact_fmt_change(metric.before, metric.after, metric.fmt),
         }
 
     rows: list[dict[str, Any]] = [_row(m) for m in report.metrics if not m.confounder]
@@ -3420,7 +3423,7 @@ def impact(
         )
         rows.extend(_row(m) for m in confounders)
 
-    pivot_before = _day_before(pivot)
+    pivot_before = day_before(pivot)
     notes = [_source_note(ds)]
     notes.append(
         f"Pivot {pivot}: BEFORE = {report.before_prompts:,} prompts up to {pivot_before} "
