@@ -137,6 +137,39 @@ MODES = ["default", "default", "plan"]
 VERSIONS = ["2.1.85", "2.1.90", "2.2.0"]
 STOP_REASONS = ["end_turn", "end_turn", "end_turn", "tool_use", "max_tokens"]
 
+# Output composition (Axe C). Per project, the (code language, secondary
+# language) the assistant edits; tests land in the project's test language.
+# Labels match what ``compose.detect_language`` derives from real extensions, so
+# the demo's language mix looks like a real one.
+PROJECT_LANGUAGES: dict[str, tuple[str, str]] = {
+    "webapp-frontend": ("TypeScript", "CSS"),
+    "data-pipeline": ("Python", "SQL"),
+    "ml-experiments": ("Python", "Jupyter Notebook"),
+    "infra-terraform": ("Terraform", "YAML"),
+    "mobile-app": ("Kotlin", "Swift"),
+}
+
+# Category -> code share of the generated output tokens (lo, hi). Code-heavy
+# work (implementation, refactor, tests, debug, ops) emits mostly tool/code
+# tokens; prose-y work (question, docs, plan) skews to text.
+CODE_SHARE: dict[str, tuple[float, float]] = {
+    "implementation": (0.62, 0.85),
+    "refactor": (0.60, 0.82),
+    "test": (0.58, 0.80),
+    "debug": (0.45, 0.72),
+    "ops": (0.40, 0.70),
+    "review": (0.25, 0.50),
+    "plan": (0.15, 0.35),
+    "docs": (0.20, 0.45),
+    "followup": (0.10, 0.35),
+    "question": (0.05, 0.25),
+    "other": (0.10, 0.35),
+}
+
+# Categories that actually edit files on disk, and how (kind weights). The
+# others (question/plan/followup/other) produce no file rows -- only tokens.
+FILE_CATEGORIES = frozenset({"implementation", "refactor", "test", "debug", "ops", "docs"})
+
 
 def _weighted_choice(rng: random.Random, weighted: dict[str, tuple[float, tuple[int, int]]]) -> str:
     names = list(weighted)
@@ -272,6 +305,115 @@ def _emit_requests(
             if count:
                 key = (session_id, prompt_id, model, token_type, side)
                 tokens_acc[key] = tokens_acc.get(key, 0) + count
+
+
+def _accum(
+    groups: dict[tuple[str, str], tuple[int, list[int]]],
+    language: str,
+    kind: str,
+    files: int,
+    added: int,
+    deleted: int,
+) -> None:
+    """Fold one file group into ``(language, kind) -> (files, [added, deleted])``."""
+    f, totals = groups.get((language, kind), (0, [0, 0]))
+    groups[(language, kind)] = (f + files, [totals[0] + added, totals[1] + deleted])
+
+
+def _output_composition(
+    prompts: list[dict[str, object]],
+    categories: list[dict[str, object]],
+    tokens_acc: dict[tuple[str, str, str, str, int], int],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Derive output_files.csv + output_tokens.csv from the generated prompts.
+
+    Runs on its own RNG (``SEED + 2``) over the already-built rows, so adding
+    Axe C never perturbs the token/request streams (the committed totals stay
+    byte-identical). The prose/code split always sums to the prompt's real
+    output tokens (the C1 invariant), and file rows carry metrics only.
+    """
+    rng = random.Random(SEED + 2)
+    # Per-prompt real output tokens (non-sidechain), summed from tokens.csv.
+    output_total: dict[str, int] = {}
+    for (_sid, pid, _model, token_type, side), count in tokens_acc.items():
+        if token_type == "output" and side == 0:
+            output_total[pid] = output_total.get(pid, 0) + count
+    cat_by_pid = {
+        str(c["prompt_id"]): (str(c["category"]), int(c["complexity"])) for c in categories
+    }
+
+    output_files: list[dict[str, object]] = []
+    output_tokens: list[dict[str, object]] = []
+    for prompt in prompts:
+        pid = str(prompt["prompt_id"])
+        total = output_total.get(pid, 0)
+        if total <= 0:
+            continue
+        category, complexity = cat_by_pid.get(pid, ("other", 1))
+        project = str(prompt["project"])
+        code_lang, second_lang = PROJECT_LANGUAGES[project]
+
+        # Prose/code token split (sums to the exact output total).
+        lo, hi = CODE_SHARE.get(category, (0.1, 0.35))
+        code = round(total * rng.uniform(lo, hi))
+        code = max(0, min(total, code))
+        output_tokens.append(
+            {
+                "prompt_id": pid,
+                "output_prose_tokens": total - code,
+                "output_code_tokens": code,
+            }
+        )
+
+        # File edits: only the categories that touch disk, and not every time.
+        if category not in FILE_CATEGORIES or rng.random() < 0.2:
+            continue
+        groups: dict[tuple[str, str], tuple[int, list[int]]] = {}
+        span = 8 + 14 * complexity
+        if category == "test":
+            _accum(groups, code_lang, "test", rng.randint(1, 2), rng.randint(span, span * 3), 0)
+            if rng.random() < 0.4:
+                _accum(groups, code_lang, "code", 1, rng.randint(2, span), rng.randint(0, 6))
+        elif category == "docs":
+            _accum(groups, "Markdown", "code", 1, rng.randint(5, 40), rng.randint(0, 15))
+        elif category == "ops":
+            _accum(
+                groups,
+                second_lang,
+                "code",
+                rng.randint(1, 2),
+                rng.randint(4, span),
+                rng.randint(0, 8),
+            )
+        else:  # implementation / refactor / debug
+            _accum(
+                groups,
+                code_lang,
+                "code",
+                rng.randint(1, 3),
+                rng.randint(span, span * 4),
+                rng.randint(0, span),
+            )
+            if rng.random() < 0.45:
+                _accum(groups, code_lang, "test", 1, rng.randint(span, span * 2), rng.randint(0, 4))
+            if rng.random() < 0.25:
+                _accum(groups, second_lang, "code", 1, rng.randint(2, span), rng.randint(0, 6))
+
+        for (language, kind), (files, totals) in groups.items():
+            output_files.append(
+                {
+                    "prompt_id": pid,
+                    "language": language,
+                    "kind": kind,
+                    "files": files,
+                    "lines_added": totals[0],
+                    "lines_deleted": totals[1],
+                }
+            )
+
+    output_files.sort(key=lambda r: (str(r["prompt_id"]), str(r["language"]), str(r["kind"])))
+    output_tokens.sort(key=lambda r: str(r["prompt_id"]))
+    return output_files, output_tokens
 
 
 def generate() -> dict[str, list[dict[str, object]]]:
@@ -434,6 +576,10 @@ def generate() -> dict[str, list[dict[str, object]]]:
 
     quota_log = _generate_quota(rng)
 
+    # Output composition (Axe C) -- derived from the finished prompts/tokens on
+    # a dedicated RNG, so it never shifts the streams above.
+    output_files, output_tokens = _output_composition(prompts, categories, tokens_acc)
+
     return {
         "sessions": sessions,
         "prompts": prompts,
@@ -442,6 +588,8 @@ def generate() -> dict[str, list[dict[str, object]]]:
         "categories": categories,
         "token_types": token_types,
         "quota_log": quota_log,
+        "output_files": output_files,
+        "output_tokens": output_tokens,
     }
 
 
@@ -508,6 +656,8 @@ def main() -> None:
     _write_csv(OUT_DIR / "token_types.csv", schema.TOKEN_TYPES_COLS, data["token_types"])
     _write_csv(OUT_DIR / "categories.csv", schema.CATEGORIES_COLS, data["categories"])
     _write_csv(OUT_DIR / "quota_log.csv", schema.QUOTA_LOG_COLS, data["quota_log"])
+    _write_csv(OUT_DIR / "output_files.csv", schema.OUTPUT_FILES_COLS, data["output_files"])
+    _write_csv(OUT_DIR / "output_tokens.csv", schema.OUTPUT_TOKENS_COLS, data["output_tokens"])
 
     # A config.yml so the dashboard's gated pages (categorization, quota) light up.
     (OUT_DIR / "config.yml").write_text(
@@ -519,7 +669,9 @@ def main() -> None:
         f"Wrote demo dataset to {OUT_DIR}: "
         f"{len(data['sessions'])} sessions, {len(data['prompts'])} prompts, "
         f"{len(data['tokens'])} token rows, {len(data['requests'])} request rows, "
-        f"{len(data['quota_log'])} quota snapshots."
+        f"{len(data['quota_log'])} quota snapshots, "
+        f"{len(data['output_files'])} output-file rows, "
+        f"{len(data['output_tokens'])} output-token rows."
     )
 
 

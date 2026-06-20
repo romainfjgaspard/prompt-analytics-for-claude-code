@@ -576,3 +576,116 @@ def test_live_dataset_costs_match_csv_dataset(fake_claude):
     live_rows = analytics.by_project(live, "anthropic").rows
     cached_rows = analytics.by_project(cached, "anthropic").rows
     assert live_rows == cached_rows
+
+
+# ---------------------------------------------------------------------------
+# by_output: output composition (Axe C, C2).
+# ---------------------------------------------------------------------------
+
+
+def _output_ds() -> Dataset:
+    """Two prompts with file edits + a prose/code output split.
+
+    Hand-computed (anthropic): opus output $25/1M, haiku output $5/1M.
+
+    * p1 (opus): 100k output ($2.50), split prose 60k / code 40k
+      -> prose $1.50, code $1.00. Files: Python code (+100/-10, 2 files),
+      Python test (+50, 1 file).
+    * p3 (haiku): 100k output ($0.50), split prose 20k / code 80k
+      -> prose $0.10, code $0.40. Files: SQL code (+20, 1 file).
+
+    Lines added: Python 150 (test 50), SQL 20; total 170 (test 50 = 29.4%).
+    """
+    sessions = [{"session_id": "s1", "project": "alpha"}]
+    prompts = [
+        {"session_id": "s1", "prompt_id": "p1", "project": "alpha", "model": OPUS},
+        {"session_id": "s1", "prompt_id": "p3", "project": "alpha", "model": HAIKU},
+    ]
+    tokens = [
+        _token("s1", "p1", OPUS, "output", 100_000),
+        _token("s1", "p3", HAIKU, "output", 100_000),
+    ]
+    output_files = [
+        {
+            "prompt_id": "p1",
+            "language": "Python",
+            "kind": "code",
+            "files": 2,
+            "lines_added": 100,
+            "lines_deleted": 10,
+        },
+        {
+            "prompt_id": "p1",
+            "language": "Python",
+            "kind": "test",
+            "files": 1,
+            "lines_added": 50,
+            "lines_deleted": 0,
+        },
+        {
+            "prompt_id": "p3",
+            "language": "SQL",
+            "kind": "code",
+            "files": 1,
+            "lines_added": 20,
+            "lines_deleted": 0,
+        },
+    ]
+    output_tokens = [
+        {"prompt_id": "p1", "output_prose_tokens": 60_000, "output_code_tokens": 40_000},
+        {"prompt_id": "p3", "output_prose_tokens": 20_000, "output_code_tokens": 80_000},
+    ]
+    return Dataset(
+        sessions=sessions,
+        prompts=prompts,
+        tokens=tokens,
+        categories={},
+        source="test data",
+        output_files=output_files,
+        output_tokens=output_tokens,
+    )
+
+
+def test_by_output_language_mix_and_kind_split():
+    result = analytics.by_output(_output_ds(), "anthropic")
+    by_lang = {r["language"]: r for r in result.rows}
+
+    python = by_lang["Python"]
+    assert python["files"] == 3
+    assert python["lines_added"] == 150
+    assert python["lines_deleted"] == 10
+    assert python["test_pct"] == round(100 * 50 / 150, 1)  # 33.3
+    assert python["share_pct"] == round(100 * 150 / 170, 1)  # 88.2
+
+    sql = by_lang["SQL"]
+    assert sql["lines_added"] == 20 and sql["test_pct"] == 0.0
+
+    total = by_lang["TOTAL"]
+    assert total["files"] == 4
+    assert total["lines_added"] == 170
+    assert total["lines_deleted"] == 10
+    assert total["test_pct"] == round(100 * 50 / 170, 1)  # 29.4
+    assert total["share_pct"] == 100.0
+
+
+def test_by_output_sorted_by_lines_with_total_last():
+    rows = analytics.by_output(_output_ds(), "anthropic").rows
+    assert [r["language"] for r in rows] == ["Python", "SQL", "TOTAL"]
+
+
+def test_by_output_prose_vs_code_cost_note():
+    notes = analytics.by_output(_output_ds(), "anthropic").notes
+    # prose $1.50+$0.10=$1.60, code $1.00+$0.40=$1.40 -> code = 46.7% of $3.00.
+    gen_note = next(n for n in notes if n.startswith("Generated output"))
+    assert "$1.60" in gen_note and "$1.40" in gen_note
+    assert "46.7% of generation cost is code" in gen_note
+    assert "80,000 prose" in gen_note and "120,000 code/tool" in gen_note
+    tests_note = next(n for n in notes if n.startswith("Code vs tests"))
+    assert "29.4%" in tests_note and "120 code, 50 test" in tests_note
+
+
+def test_by_output_empty_dataset_hints_to_extract():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test data")
+    result = analytics.by_output(empty, "anthropic")
+    assert result.rows == []
+    assert any("No output-composition data" in n for n in result.notes)

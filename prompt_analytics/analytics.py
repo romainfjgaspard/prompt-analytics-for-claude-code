@@ -51,6 +51,7 @@ __all__ = [
     "by_model",
     "by_token_type",
     "by_category",
+    "by_output",
     "top_prompts",
     "sessions_table",
     "session_depth",
@@ -158,6 +159,11 @@ class Dataset:
     source: str  # human-readable provenance for the notes
     pricing_path: Path | None = None
     requests: list[dict[str, Any]] = field(default_factory=list)
+    # Output composition (Axe C). Long per (prompt_id, language, kind); and the
+    # per-prompt prose/code split of the generated output tokens. Empty when
+    # reading a pre-Axe-C extract (the `by-output` view degrades gracefully).
+    output_files: list[dict[str, Any]] = field(default_factory=list)
+    output_tokens: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
@@ -280,6 +286,8 @@ def load_dataset(
         source=source,
         pricing_path=pricing_path,
         requests=[dict(row) for row in result.requests],
+        output_files=[dict(row) for row in result.output_files],
+        output_tokens=[dict(row) for row in result.output_tokens],
     )
 
 
@@ -309,9 +317,13 @@ def dataset_from_csvs(
     prompts = _rows("prompts.csv")
     tokens = _rows("tokens.csv")
     requests = _rows("requests.csv")
+    output_files = _rows("output_files.csv")
+    output_tokens = _rows("output_tokens.csv")
     _coerce_int(prompts, ("prompt_index", "char_count", "assistant_turns", "tool_calls"))
     _coerce_int(tokens, ("token_count", "is_sidechain"))
     _coerce_int(requests, _REQUEST_INT_COLS)
+    _coerce_int(output_files, ("files", "lines_added", "lines_deleted"))
+    _coerce_int(output_tokens, ("output_prose_tokens", "output_code_tokens"))
     if source is None:
         window = _window_label(data_dir)
         source = f"{data_dir} CSVs ({window})" if window else f"{data_dir} CSVs"
@@ -323,6 +335,8 @@ def dataset_from_csvs(
         source=source,
         pricing_path=pricing_path,
         requests=requests,
+        output_files=output_files,
+        output_tokens=output_tokens,
     )
 
 
@@ -337,14 +351,18 @@ def filter_project(ds: Dataset, project: str) -> Dataset:
     session_ids = {
         row["session_id"] for row in ds.sessions if (row.get("project") or "") == project
     }
+    kept_prompts = [row for row in ds.prompts if row["session_id"] in session_ids]
+    kept_prompt_ids = {row["prompt_id"] for row in kept_prompts}
     return Dataset(
         sessions=[row for row in ds.sessions if row["session_id"] in session_ids],
-        prompts=[row for row in ds.prompts if row["session_id"] in session_ids],
+        prompts=kept_prompts,
         tokens=[row for row in ds.tokens if row["session_id"] in session_ids],
         categories=ds.categories,
         source=ds.source,
         pricing_path=ds.pricing_path,
         requests=[row for row in ds.requests if row["session_id"] in session_ids],
+        output_files=[row for row in ds.output_files if row["prompt_id"] in kept_prompt_ids],
+        output_tokens=[row for row in ds.output_tokens if row["prompt_id"] in kept_prompt_ids],
     )
 
 
@@ -391,6 +409,9 @@ def filter_dates(ds: Dataset, since: str | None, until: str | None) -> Dataset:
         source=ds.source,
         pricing_path=ds.pricing_path,
         requests=[row for row in ds.requests if _keep_usage(row)],
+        # Output rows exist for real prompts only -> follow their prompt_id.
+        output_files=[row for row in ds.output_files if row["prompt_id"] in kept_prompt_ids],
+        output_tokens=[row for row in ds.output_tokens if row["prompt_id"] in kept_prompt_ids],
     )
 
 
@@ -883,6 +904,133 @@ def by_category(ds: Dataset, provider: str) -> TableResult:
             Column("med_cost_per_prompt_usd", "$/prompt (med)", "money"),
             Column("cost_usd", f"Cost ({provider})", "money"),
             Column("cost_share_pct", "Cost %", "pct"),
+        ],
+        rows,
+        notes,
+    )
+
+
+def _output_cost_by_prompt(ds: Dataset, engine: CostEngine) -> dict[str, float]:
+    """``prompt_id -> USD`` of the generated **output** tokens only (3.x)."""
+    costs: dict[str, float] = defaultdict(float)
+    for row in ds.tokens:
+        if row["token_type"] == "output":
+            costs[row["prompt_id"]] += engine.cost(
+                row.get("model") or "", "output", row["token_count"]
+            )
+    return costs
+
+
+def by_output(ds: Dataset, provider: str) -> TableResult:
+    """Output composition (Axe C): what the assistant actually produced.
+
+    The main table is the **language mix** (one row per language, sorted by
+    lines produced) with, per language, the files touched, the exact +/- line
+    diff, and the share of those added lines that landed in **tests** vs code.
+    Two headline notes carry the cross-language story: the overall test ratio of
+    the produced lines, and the **prose vs code** split of the generated output
+    tokens priced on ``provider`` (each prompt's output cost prorated by its
+    local-tokenizer prose/code weight). Metrics only -- no source code is ever
+    read here, just the integer rows ``extract`` derived.
+    """
+    # Per (language) aggregation over the file-edit metrics, splitting the
+    # added lines by kind so a single table answers both "language mix" and
+    # "code vs tests".
+    added: Counter[str] = Counter()
+    deleted: Counter[str] = Counter()
+    files: Counter[str] = Counter()
+    test_added: Counter[str] = Counter()
+    for row in ds.output_files:
+        language = row.get("language") or "(unknown)"
+        la = int(row.get("lines_added") or 0)
+        added[language] += la
+        deleted[language] += int(row.get("lines_deleted") or 0)
+        files[language] += int(row.get("files") or 0)
+        if (row.get("kind") or "") == "test":
+            test_added[language] += la
+
+    total_added = sum(added.values())
+    total_deleted = sum(deleted.values())
+    total_files = sum(files.values())
+    total_test = sum(test_added.values())
+
+    rows: list[dict[str, Any]] = []
+    for language, lines_added in sorted(added.items(), key=lambda kv: (-kv[1], kv[0])):
+        rows.append(
+            {
+                "language": language,
+                "files": files.get(language, 0),
+                "lines_added": lines_added,
+                "lines_deleted": deleted.get(language, 0),
+                "test_pct": round(100 * test_added.get(language, 0) / lines_added, 1)
+                if lines_added
+                else 0.0,
+                "share_pct": round(100 * lines_added / total_added, 1) if total_added else 0.0,
+            }
+        )
+    if rows:
+        rows.append(
+            {
+                "language": "TOTAL",
+                "files": total_files,
+                "lines_added": total_added,
+                "lines_deleted": total_deleted,
+                "test_pct": round(100 * total_test / total_added, 1) if total_added else 0.0,
+                "share_pct": 100.0 if total_added else 0.0,
+            }
+        )
+
+    notes = [_source_note(ds)]
+    if not ds.output_files and not ds.output_tokens:
+        notes.append(
+            "No output-composition data -- re-run `prompt-analytics extract` "
+            "(these metrics ship with the latest extractor)."
+        )
+
+    # Prose vs code split of the generated output tokens, priced on the provider.
+    engine = CostEngine(provider, ds.pricing_path)
+    out_cost = _output_cost_by_prompt(ds, engine)
+    prose_tokens = code_tokens = 0
+    prose_cost = code_cost = 0.0
+    for row in ds.output_tokens:
+        prose = int(row.get("output_prose_tokens") or 0)
+        code = int(row.get("output_code_tokens") or 0)
+        prose_tokens += prose
+        code_tokens += code
+        weight = prose + code
+        pid_cost = out_cost.get(row["prompt_id"], 0.0)
+        share = pid_cost * prose / weight if weight else pid_cost
+        prose_cost += share
+        code_cost += pid_cost - share
+
+    if total_added:
+        notes.append(
+            f"Code vs tests: {round(100 * total_test / total_added, 1)}% of the "
+            f"{total_added:,} added lines are tests "
+            f"({total_added - total_test:,} code, {total_test:,} test)."
+        )
+    if prose_tokens or code_tokens:
+        gen_cost = prose_cost + code_cost
+        code_cost_share = round(100 * code_cost / gen_cost, 1) if gen_cost else 0.0
+        notes.append(
+            f"Generated output: {prose_tokens:,} prose tokens (${prose_cost:,.2f}) vs "
+            f"{code_tokens:,} code/tool tokens (${code_cost:,.2f}) -- "
+            f"{code_cost_share}% of generation cost is code."
+        )
+    if (note := engine.note()) is not None:
+        notes.append(note)
+    if (lc_note := engine.long_context_note()) is not None:
+        notes.append(lc_note)
+
+    return TableResult(
+        f"Output composition ({provider})",
+        [
+            Column("language", "Language"),
+            Column("files", "Files", "int"),
+            Column("lines_added", "Lines +", "int"),
+            Column("lines_deleted", "Lines −", "int"),
+            Column("test_pct", "Test %", "pct"),
+            Column("share_pct", "Lines %", "pct"),
         ],
         rows,
         notes,

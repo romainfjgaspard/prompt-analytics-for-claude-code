@@ -96,6 +96,21 @@ def test_by_category_dispatch_suggests_categorize(data, capsys):
     assert "categorize" in out
 
 
+def test_by_output_dispatch(fake_claude, capsys):
+    # session_output.jsonl writes src/parser.py (code) + tests/test_parser.py (test).
+    fake_claude.add("session_output.jsonl", project="out")
+    assert main(_args(fake_claude, "by-output")) == 0
+    out = capsys.readouterr().out
+    assert "Output composition" in out
+    assert "Python" in out
+    assert "Code vs tests" in out
+
+
+def test_by_output_empty_history_hints(fake_claude):
+    # No JSONL history at all -> the usual "no data" path (exit 1), not a crash.
+    assert main(_args(fake_claude, "by-output")) == 1
+
+
 def test_prompts_dispatch(data, capsys):
     assert main(_args(data, "prompts", "--top", "2")) == 0
     out = capsys.readouterr().out

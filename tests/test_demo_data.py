@@ -85,6 +85,39 @@ def test_demo_requests_sums_match_tokens_per_prompt():
             assert request_sums[pid][token_type] == count, (pid, token_type)
 
 
+def test_committed_output_composition_matches_generator(generated):
+    """output_files.csv / output_tokens.csv stay in sync with the generator."""
+    assert len(_read_csv("output_files.csv")) == len(generated["output_files"])
+    assert len(_read_csv("output_tokens.csv")) == len(generated["output_tokens"])
+
+
+def test_demo_output_split_reconciles_with_output_tokens():
+    """Axe C invariant on the committed demo: prose + code == prompt output."""
+    output_by_prompt: dict[str, int] = defaultdict(int)
+    for row in _read_csv("tokens.csv"):
+        if row["token_type"] == "output" and row["is_sidechain"] == "0":
+            output_by_prompt[row["prompt_id"]] += int(row["token_count"])
+
+    split = _read_csv("output_tokens.csv")
+    assert split, "the demo must ship an output_tokens.csv"
+    for row in split:
+        prose = int(row["output_prose_tokens"])
+        code = int(row["output_code_tokens"])
+        assert prose + code == output_by_prompt[row["prompt_id"]], row["prompt_id"]
+
+
+def test_demo_output_files_are_metrics_only():
+    """No source code / file paths leak into output_files.csv (privacy guard)."""
+    prompt_ids = {r["prompt_id"] for r in _read_csv("prompts.csv")}
+    rows = _read_csv("output_files.csv")
+    assert rows
+    for row in rows:
+        # File rows exist for real prompts only, and carry positive line counts.
+        assert row["prompt_id"] in prompt_ids
+        assert row["kind"] in ("code", "test")
+        assert int(row["lines_added"]) >= 0 and int(row["files"]) >= 1
+
+
 def test_demo_represents_the_new_dimensions():
     tokens = _read_csv("tokens.csv")
     requests = _read_csv("requests.csv")
