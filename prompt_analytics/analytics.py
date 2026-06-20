@@ -45,6 +45,7 @@ __all__ = [
     "dataset_from_csvs",
     "filter_project",
     "filter_dates",
+    "filter_prompt_ids",
     "known_providers",
     "summary",
     "by_project",
@@ -52,6 +53,9 @@ __all__ = [
     "by_token_type",
     "by_category",
     "by_output",
+    "output_composition",
+    "OutputComposition",
+    "LanguageComposition",
     "top_prompts",
     "sessions_table",
     "session_depth",
@@ -412,6 +416,29 @@ def filter_dates(ds: Dataset, since: str | None, until: str | None) -> Dataset:
         # Output rows exist for real prompts only -> follow their prompt_id.
         output_files=[row for row in ds.output_files if row["prompt_id"] in kept_prompt_ids],
         output_tokens=[row for row in ds.output_tokens if row["prompt_id"] in kept_prompt_ids],
+    )
+
+
+def filter_prompt_ids(ds: Dataset, prompt_ids: set[str] | frozenset[str]) -> Dataset:
+    """A view of ``ds`` restricted to a set of prompt ids (dashboard cross-filter).
+
+    The dashboard applies its sidebar / chart-click selection on the pandas
+    frames, then hands the surviving prompt ids here so the output-composition
+    view honours the very same filter as every other tab. The Axe-C analyses
+    read only prompts / tokens / output rows, so sessions and requests ride
+    along unnarrowed (cheaper, and they are not consulted).
+    """
+    kept = set(prompt_ids)
+    return Dataset(
+        sessions=ds.sessions,
+        prompts=[row for row in ds.prompts if row.get("prompt_id") in kept],
+        tokens=[row for row in ds.tokens if row.get("prompt_id") in kept],
+        categories=ds.categories,
+        source=ds.source,
+        pricing_path=ds.pricing_path,
+        requests=ds.requests,
+        output_files=[row for row in ds.output_files if row.get("prompt_id") in kept],
+        output_tokens=[row for row in ds.output_tokens if row.get("prompt_id") in kept],
     )
 
 
@@ -921,6 +948,136 @@ def _output_cost_by_prompt(ds: Dataset, engine: CostEngine) -> dict[str, float]:
     return costs
 
 
+@dataclass(frozen=True)
+class LanguageComposition:
+    """One language's slice of what the assistant produced (Axe C).
+
+    ``test_added`` is the share of ``lines_added`` that landed in tests;
+    ``code_cost`` is the output spend attributed to this language (the code
+    half of the prose/code split, distributed across the languages a prompt
+    edited by line churn).
+    """
+
+    language: str
+    files: int
+    lines_added: int
+    lines_deleted: int
+    test_added: int
+    code_cost: float
+
+
+@dataclass(frozen=True)
+class OutputComposition:
+    """Structured Axe-C output-composition metrics (shared by CLI + dashboard).
+
+    ``languages`` is sorted by lines produced (added), descending. The cost
+    split prorates each prompt's real ``output`` cost by its local-tokenizer
+    prose/code weight (the honest estimate the plan settled on); the code half
+    is then attributed across the languages a prompt edited, by line churn.
+    Code spend with no file edit (Bash / Read / Grep only) lands in
+    ``tooling_cost``, so the per-language costs plus ``tooling_cost`` reconcile
+    to ``code_cost``. Metrics only -- no source code is read here.
+    """
+
+    provider: str
+    languages: list[LanguageComposition]
+    total_files: int
+    total_added: int
+    total_deleted: int
+    total_test: int
+    prose_tokens: int
+    code_tokens: int
+    prose_cost: float
+    code_cost: float
+    tooling_cost: float
+
+    @property
+    def has_data(self) -> bool:
+        """True when there is any line-diff or prose/code-token metric to show."""
+        return bool(self.languages) or bool(self.prose_tokens or self.code_tokens)
+
+
+def output_composition(ds: Dataset, provider: str) -> OutputComposition:
+    """Compute the Axe-C output-composition metrics (see :class:`OutputComposition`).
+
+    Aggregates the per-prompt file-edit rows by language (lines +/-, files,
+    test share) and prorates the generated output cost into a prose half and a
+    code half, the latter attributed back to languages by line churn. The pure
+    numbers feed both :func:`by_output` (the CLI table + notes) and the
+    dashboard's Composition view, so the two never drift.
+    """
+    added: Counter[str] = Counter()
+    deleted: Counter[str] = Counter()
+    files: Counter[str] = Counter()
+    test_added: Counter[str] = Counter()
+    # Per-prompt language churn (added + deleted), the weight used to attribute
+    # each prompt's code cost across the languages it touched.
+    prompt_churn: dict[str, Counter[str]] = defaultdict(Counter)
+    for row in ds.output_files:
+        language = row.get("language") or "(unknown)"
+        la = int(row.get("lines_added") or 0)
+        ld = int(row.get("lines_deleted") or 0)
+        added[language] += la
+        deleted[language] += ld
+        files[language] += int(row.get("files") or 0)
+        if (row.get("kind") or "") == "test":
+            test_added[language] += la
+        prompt_churn[row["prompt_id"]][language] += la + ld
+
+    engine = CostEngine(provider, ds.pricing_path)
+    out_cost = _output_cost_by_prompt(ds, engine)
+
+    prose_tokens = code_tokens = 0
+    prose_cost = code_cost = tooling_cost = 0.0
+    lang_cost: dict[str, float] = defaultdict(float)
+    for row in ds.output_tokens:
+        prose = int(row.get("output_prose_tokens") or 0)
+        code = int(row.get("output_code_tokens") or 0)
+        prose_tokens += prose
+        code_tokens += code
+        weight = prose + code
+        pid = row["prompt_id"]
+        pid_cost = out_cost.get(pid, 0.0)
+        prose_share = pid_cost * prose / weight if weight else pid_cost
+        code_share = pid_cost - prose_share
+        prose_cost += prose_share
+        code_cost += code_share
+        churn = prompt_churn.get(pid)
+        total_churn = sum(churn.values()) if churn else 0
+        if churn and total_churn:
+            for language, c in churn.items():
+                lang_cost[language] += code_share * c / total_churn
+        else:
+            # Code tokens with no file edit (Bash / Read / Grep only): no
+            # language to attribute to, so they form an honest tooling bucket.
+            tooling_cost += code_share
+
+    languages = [
+        LanguageComposition(
+            language=language,
+            files=files.get(language, 0),
+            lines_added=lines_added,
+            lines_deleted=deleted.get(language, 0),
+            test_added=test_added.get(language, 0),
+            code_cost=round(lang_cost.get(language, 0.0), 6),
+        )
+        for language, lines_added in sorted(added.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    return OutputComposition(
+        provider=provider,
+        languages=languages,
+        total_files=sum(files.values()),
+        total_added=sum(added.values()),
+        total_deleted=sum(deleted.values()),
+        total_test=sum(test_added.values()),
+        prose_tokens=prose_tokens,
+        code_tokens=code_tokens,
+        prose_cost=round(prose_cost, 6),
+        code_cost=round(code_cost, 6),
+        tooling_cost=round(tooling_cost, 6),
+    )
+
+
 def by_output(ds: Dataset, provider: str) -> TableResult:
     """Output composition (Axe C): what the assistant actually produced.
 
@@ -931,50 +1088,34 @@ def by_output(ds: Dataset, provider: str) -> TableResult:
     the produced lines, and the **prose vs code** split of the generated output
     tokens priced on ``provider`` (each prompt's output cost prorated by its
     local-tokenizer prose/code weight). Metrics only -- no source code is ever
-    read here, just the integer rows ``extract`` derived.
+    read here, just the integer rows ``extract`` derived. The pure computation
+    lives in :func:`output_composition` (shared with the dashboard).
     """
-    # Per (language) aggregation over the file-edit metrics, splitting the
-    # added lines by kind so a single table answers both "language mix" and
-    # "code vs tests".
-    added: Counter[str] = Counter()
-    deleted: Counter[str] = Counter()
-    files: Counter[str] = Counter()
-    test_added: Counter[str] = Counter()
-    for row in ds.output_files:
-        language = row.get("language") or "(unknown)"
-        la = int(row.get("lines_added") or 0)
-        added[language] += la
-        deleted[language] += int(row.get("lines_deleted") or 0)
-        files[language] += int(row.get("files") or 0)
-        if (row.get("kind") or "") == "test":
-            test_added[language] += la
-
-    total_added = sum(added.values())
-    total_deleted = sum(deleted.values())
-    total_files = sum(files.values())
-    total_test = sum(test_added.values())
+    comp = output_composition(ds, provider)
+    total_added = comp.total_added
+    total_test = comp.total_test
 
     rows: list[dict[str, Any]] = []
-    for language, lines_added in sorted(added.items(), key=lambda kv: (-kv[1], kv[0])):
+    for lang in comp.languages:
         rows.append(
             {
-                "language": language,
-                "files": files.get(language, 0),
-                "lines_added": lines_added,
-                "lines_deleted": deleted.get(language, 0),
-                "test_pct": round(100 * test_added.get(language, 0) / lines_added, 1)
-                if lines_added
+                "language": lang.language,
+                "files": lang.files,
+                "lines_added": lang.lines_added,
+                "lines_deleted": lang.lines_deleted,
+                "test_pct": round(100 * lang.test_added / lang.lines_added, 1)
+                if lang.lines_added
                 else 0.0,
-                "share_pct": round(100 * lines_added / total_added, 1) if total_added else 0.0,
+                "share_pct": round(100 * lang.lines_added / total_added, 1) if total_added else 0.0,
             }
         )
     if rows:
         rows.append(
             {
                 "language": "TOTAL",
-                "files": total_files,
+                "files": comp.total_files,
                 "lines_added": total_added,
-                "lines_deleted": total_deleted,
+                "lines_deleted": comp.total_deleted,
                 "test_pct": round(100 * total_test / total_added, 1) if total_added else 0.0,
                 "share_pct": 100.0 if total_added else 0.0,
             }
@@ -987,34 +1128,19 @@ def by_output(ds: Dataset, provider: str) -> TableResult:
             "(these metrics ship with the latest extractor)."
         )
 
-    # Prose vs code split of the generated output tokens, priced on the provider.
     engine = CostEngine(provider, ds.pricing_path)
-    out_cost = _output_cost_by_prompt(ds, engine)
-    prose_tokens = code_tokens = 0
-    prose_cost = code_cost = 0.0
-    for row in ds.output_tokens:
-        prose = int(row.get("output_prose_tokens") or 0)
-        code = int(row.get("output_code_tokens") or 0)
-        prose_tokens += prose
-        code_tokens += code
-        weight = prose + code
-        pid_cost = out_cost.get(row["prompt_id"], 0.0)
-        share = pid_cost * prose / weight if weight else pid_cost
-        prose_cost += share
-        code_cost += pid_cost - share
-
     if total_added:
         notes.append(
             f"Code vs tests: {round(100 * total_test / total_added, 1)}% of the "
             f"{total_added:,} added lines are tests "
             f"({total_added - total_test:,} code, {total_test:,} test)."
         )
-    if prose_tokens or code_tokens:
-        gen_cost = prose_cost + code_cost
-        code_cost_share = round(100 * code_cost / gen_cost, 1) if gen_cost else 0.0
+    if comp.prose_tokens or comp.code_tokens:
+        gen_cost = comp.prose_cost + comp.code_cost
+        code_cost_share = round(100 * comp.code_cost / gen_cost, 1) if gen_cost else 0.0
         notes.append(
-            f"Generated output: {prose_tokens:,} prose tokens (${prose_cost:,.2f}) vs "
-            f"{code_tokens:,} code/tool tokens (${code_cost:,.2f}) -- "
+            f"Generated output: {comp.prose_tokens:,} prose tokens (${comp.prose_cost:,.2f}) vs "
+            f"{comp.code_tokens:,} code/tool tokens (${comp.code_cost:,.2f}) -- "
             f"{code_cost_share}% of generation cost is code."
         )
     if (note := engine.note()) is not None:

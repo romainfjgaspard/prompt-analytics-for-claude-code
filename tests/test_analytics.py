@@ -689,3 +689,50 @@ def test_by_output_empty_dataset_hints_to_extract():
     result = analytics.by_output(empty, "anthropic")
     assert result.rows == []
     assert any("No output-composition data" in n for n in result.notes)
+
+
+def test_output_composition_language_costs_reconcile_to_code_cost():
+    comp = analytics.output_composition(_output_ds(), "anthropic")
+    # p1: $1.00 code cost, all Python (churn 110+50=160 all Python) -> Python $1.00.
+    # p3: $0.40 code cost, all SQL -> SQL $0.40. No tooling (both edited files).
+    by_lang = {lng.language: lng for lng in comp.languages}
+    assert by_lang["Python"].code_cost == pytest.approx(1.00, abs=1e-6)
+    assert by_lang["SQL"].code_cost == pytest.approx(0.40, abs=1e-6)
+    assert comp.tooling_cost == pytest.approx(0.0, abs=1e-9)
+    # Per-language code costs + tooling reconcile to the total code cost.
+    summed = sum(lng.code_cost for lng in comp.languages) + comp.tooling_cost
+    assert summed == pytest.approx(comp.code_cost, abs=1e-6)
+    assert comp.code_cost == pytest.approx(1.40, abs=1e-6)
+    assert comp.prose_cost == pytest.approx(1.60, abs=1e-6)
+
+
+def test_output_composition_code_tokens_without_file_edit_go_to_tooling():
+    # A prompt that spent output tokens on tooling (Bash/Read) but edited no file:
+    # no output_files row, so its code cost lands in the tooling bucket.
+    ds = Dataset(
+        sessions=[{"session_id": "s1"}],
+        prompts=[{"session_id": "s1", "prompt_id": "p1", "model": OPUS}],
+        tokens=[_token("s1", "p1", OPUS, "output", 100_000)],
+        categories={},
+        source="test data",
+        output_files=[],
+        output_tokens=[
+            {"prompt_id": "p1", "output_prose_tokens": 50_000, "output_code_tokens": 50_000}
+        ],
+    )
+    comp = analytics.output_composition(ds, "anthropic")
+    assert comp.languages == []
+    assert comp.tooling_cost == pytest.approx(comp.code_cost, abs=1e-9)
+    assert comp.code_cost > 0
+
+
+def test_filter_prompt_ids_narrows_output_rows():
+    ds = _output_ds()
+    kept = analytics.filter_prompt_ids(ds, {"p1"})
+    assert {r["prompt_id"] for r in kept.prompts} == {"p1"}
+    assert {r["prompt_id"] for r in kept.output_files} == {"p1"}
+    assert {r["prompt_id"] for r in kept.output_tokens} == {"p1"}
+    assert {r["prompt_id"] for r in kept.tokens} == {"p1"}
+    # The narrowed dataset feeds the composition view: only Python survives.
+    comp = analytics.output_composition(kept, "anthropic")
+    assert [lng.language for lng in comp.languages] == ["Python"]

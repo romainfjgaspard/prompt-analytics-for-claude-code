@@ -358,6 +358,10 @@ def _run() -> None:
         st.Page("pages/5_sessions.py", title="Sessions", icon="🗂️"),
         st.Page("pages/4_session_depth.py", title="Session depth", icon="📐"),
         st.Page("pages/3_prompts.py", title="Prompts", icon="💬"),
+        # Composition narrates the "where the cost goes, by content" spine; it
+        # respects the global filters, so it sits in the filter-driven block next
+        # to Prompts (the input side of the same story).
+        st.Page("pages/8_composition.py", title="Composition", icon="🧩"),
         # Explorer respects the global filters, so it closes the filter-driven
         # analytics block; the pages that ignore the sidebar filters (Optimize is
         # request-grain, Quotas and How it works have none) come after.

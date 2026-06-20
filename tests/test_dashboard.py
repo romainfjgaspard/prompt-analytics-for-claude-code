@@ -329,6 +329,37 @@ def test_project_color_map_specials_always_present_and_grey() -> None:
     assert mapping["alpha"] not in {"#9CA3AF", "#D1D5DB"}
 
 
+# ---------------------------------------------------------------------------
+# theme.language_color_map: curated hues for known languages, stable cycle else.
+# ---------------------------------------------------------------------------
+
+
+def test_language_color_map_uses_curated_hues() -> None:
+    from prompt_analytics.dashboard import theme
+
+    mapping = theme.language_color_map(["Python", "TypeScript"])
+    assert mapping["Python"] == theme.LANGUAGE_COLORS["Python"]
+    assert mapping["TypeScript"] == theme.LANGUAGE_COLORS["TypeScript"]
+
+
+def test_language_color_map_tooling_bucket_is_grey_and_distinct() -> None:
+    from prompt_analytics.dashboard import theme
+
+    mapping = theme.language_color_map(["Python", "(other tooling)"])
+    assert mapping["(other tooling)"] == "#64748B"
+    assert mapping["Python"] != mapping["(other tooling)"]
+
+
+def test_language_color_map_unknown_languages_get_distinct_stable_hues() -> None:
+    from prompt_analytics.dashboard import theme
+
+    langs = ["zig", "nim", "crystal"]  # none curated
+    mapping = theme.language_color_map(langs)
+    hues = [mapping[lang] for lang in langs]
+    assert len(set(hues)) == len(hues)  # distinct for small N
+    assert theme.language_color_map(langs) == theme.language_color_map(reversed(langs))  # stable
+
+
 def test_box_stats_uses_p5_p95_whiskers() -> None:
     """Robust whiskers: the 5-number summary uses p5/p95, not min/max."""
     from prompt_analytics.dashboard import data as data_mod
