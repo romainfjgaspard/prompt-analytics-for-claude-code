@@ -972,9 +972,7 @@ def collect(
             if not no_text:
                 text_rows.append({"prompt_id": pid, "prompt_text": prompt["text"]})
             # Axe C output composition (real prompts only; metrics only).
-            output_file_rows.extend(
-                aggregate_output_files(pid, file_edits_by_prompt.get(pid, []))
-            )
+            output_file_rows.extend(aggregate_output_files(pid, file_edits_by_prompt.get(pid, [])))
             if agg.output_prose or agg.output_code:
                 output_token_rows.append(
                     OutputTokenRow(

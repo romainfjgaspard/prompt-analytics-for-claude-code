@@ -241,9 +241,7 @@ def tool_edit(tool_id: str, name: str, raw_input: Any, cwd: str) -> ToolEdit | N
         added = deleted = 0
         for item in raw_input.get("edits") or []:
             if isinstance(item, dict):
-                a, d = diff_lines(
-                    str(item.get("old_string", "")), str(item.get("new_string", ""))
-                )
+                a, d = diff_lines(str(item.get("old_string", "")), str(item.get("new_string", "")))
                 added += a
                 deleted += d
     else:  # NotebookEdit
@@ -260,9 +258,7 @@ def tool_edit(tool_id: str, name: str, raw_input: Any, cwd: str) -> ToolEdit | N
     )
 
 
-def analyze_assistant_content(
-    content: Any, cwd: str
-) -> tuple[int, int, list[ToolEdit]]:
+def analyze_assistant_content(content: Any, cwd: str) -> tuple[int, int, list[ToolEdit]]:
     """Split one assistant message's content into output-composition metrics.
 
     Returns ``(prose_tokens, code_tokens, file_edits)``:

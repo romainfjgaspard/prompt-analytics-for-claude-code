@@ -100,7 +100,9 @@ def test_tool_edit_ignores_non_editing_tools_and_pathless_inputs():
 
 
 def test_tool_edit_outside_project_falls_back_to_basename():
-    edit = compose.tool_edit("t6", "Write", {"file_path": "/elsewhere/x.py", "content": "y"}, "/proj")
+    edit = compose.tool_edit(
+        "t6", "Write", {"file_path": "/elsewhere/x.py", "content": "y"}, "/proj"
+    )
     assert edit is not None
     assert edit["path"] == "x.py"  # no absolute machine path leaks
 
@@ -111,7 +113,12 @@ def test_analyze_splits_prose_and_code(monkeypatch):
     content = [
         {"type": "text", "text": "abcd"},  # 4 prose chars
         {"type": "tool_use", "id": "tu1", "name": "Read", "input": {"x": 1}},
-        {"type": "tool_use", "id": "tu2", "name": "Write", "input": {"file_path": "/p/a.py", "content": "z"}},
+        {
+            "type": "tool_use",
+            "id": "tu2",
+            "name": "Write",
+            "input": {"file_path": "/p/a.py", "content": "z"},
+        },
     ]
     prose, code, edits = compose.analyze_assistant_content(content, "/p")
     assert prose == 4
@@ -128,12 +135,30 @@ def test_analyze_handles_string_content(monkeypatch):
 
 def test_aggregate_output_files_counts_distinct_files():
     edits = [
-        ToolEdit(tool_id="a", path="src/x.py", language="Python", kind="code",
-                 lines_added=5, lines_deleted=0),
-        ToolEdit(tool_id="b", path="src/x.py", language="Python", kind="code",
-                 lines_added=2, lines_deleted=1),
-        ToolEdit(tool_id="c", path="tests/t.py", language="Python", kind="test",
-                 lines_added=3, lines_deleted=0),
+        ToolEdit(
+            tool_id="a",
+            path="src/x.py",
+            language="Python",
+            kind="code",
+            lines_added=5,
+            lines_deleted=0,
+        ),
+        ToolEdit(
+            tool_id="b",
+            path="src/x.py",
+            language="Python",
+            kind="code",
+            lines_added=2,
+            lines_deleted=1,
+        ),
+        ToolEdit(
+            tool_id="c",
+            path="tests/t.py",
+            language="Python",
+            kind="test",
+            lines_added=3,
+            lines_deleted=0,
+        ),
     ]
     rows = compose.aggregate_output_files("p1", edits)
     by_kind = {r["kind"]: r for r in rows}
