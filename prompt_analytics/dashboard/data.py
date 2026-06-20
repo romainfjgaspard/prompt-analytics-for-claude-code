@@ -54,12 +54,12 @@ _DATA_FILES = (
 
 REPO_URL = "https://github.com/romainfjgaspard/prompt-analytics-for-claude-code"
 # The full recipe to get *this* dashboard on the visitor's own logs, shown in the
-# "run it yourself" popover. `run --categorize` uses the local heuristic (no API
-# key); `dashboard` then reads the categorized CSVs. Kept in sync with the README.
+# "run it yourself" popover. `dashboard` refreshes the data first (extract +
+# snapshot + local heuristic categorize, no API key) and then opens the board, so
+# two commands are enough. Kept in sync with the README.
 SELF_HOST_CMDS = (
     'uv tool install "prompt-analytics-for-claude-code[dashboard]" # CLI + dashboard extra, on your PATH\n'
-    "prompt-analytics run --categorize # extract + snapshot + local categorize → ./output\n"
-    "prompt-analytics dashboard # open the dashboard at http://localhost:8501"
+    "prompt-analytics dashboard # refresh your data, then open the board at http://localhost:8501"
 )
 
 
@@ -109,7 +109,7 @@ def render_demo_banner() -> None:
         "**📊 Get this dashboard on your own usage** — same board, your real "
         "Claude Code data, 100% local."
     )
-    with bar.popover("▶ Show me how (3 commands)", width="stretch", type="primary"):
+    with bar.popover("▶ Show me how (2 commands)", width="stretch", type="primary"):
         st.markdown("**Same dashboard, your real usage** — no API key:")
         st.code(SELF_HOST_CMDS, language="bash")
     bar.link_button("⭐ Star it on GitHub", REPO_URL, width="stretch")

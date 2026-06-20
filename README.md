@@ -82,9 +82,10 @@ Prefer a UI? Install with the `dashboard` extra and point it at your own data:
 
 ```bash
 uv tool install "prompt-analytics-for-claude-code[dashboard]"
-prompt-analytics run --categorize   # extract + snapshot + local categorize → ./output
-prompt-analytics dashboard          # launches Streamlit on http://localhost:8501
+prompt-analytics dashboard          # refresh your data, then launch Streamlit on http://localhost:8501
 ```
+
+`dashboard` refreshes the data first (extract + snapshot + local categorize, no API key) and then opens the board — so a fresh launch never shows stale numbers. Pass `--no-refresh` to skip that and open on the existing CSVs.
 
 No data yet, or just curious? The [**live demo**](https://prompt-analytics-demo.streamlit.app) runs the same dashboard on synthetic data. Install, data-dir resolution, and a tour of every page are in the wiki ([Dashboard](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Dashboard)).
 

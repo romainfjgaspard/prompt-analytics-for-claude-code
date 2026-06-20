@@ -641,8 +641,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_config_init.set_defaults(func=_handle_config_init)
 
     # dashboard
-    p_dashboard = subparsers.add_parser("dashboard", help="Launch the Streamlit dashboard.")
+    p_dashboard = subparsers.add_parser(
+        "dashboard",
+        help="Refresh the data, then launch the Streamlit dashboard.",
+    )
     _add_output_dir(p_dashboard)
+    p_dashboard.add_argument(
+        "--no-refresh",
+        action="store_true",
+        help="Skip the pre-launch extract/snapshot/categorize; open on the existing CSVs.",
+    )
     p_dashboard.set_defaults(func=_handle_dashboard)
 
     return parser
@@ -1326,10 +1334,36 @@ def _handle_config_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refresh_for_dashboard(output_dir: Path) -> None:
+    """Refresh the CSVs the dashboard reads, just before launching it.
+
+    Runs extract -> snapshot -> heuristic categorize so the dashboard opens on
+    the current ``~/.claude`` history without the user having to click the
+    sidebar "Refresh data" button (or run ``run --categorize`` in a terminal
+    first). This is what collapses the self-host recipe to two commands. The
+    heuristic categorizer is local (no API key, no cost); the LLM classifier
+    stays a deliberate terminal action. Never fatal: on any failure print a hint
+    and let Streamlit launch on whatever CSVs already exist.
+    """
+    import sys
+
+    from . import categorize, extract, snapshot
+
+    print("Refreshing data from ~/.claude before launch...")
+    try:
+        report = extract.run_extract(output_dir)
+        snapshot.run_snapshot(output_dir)
+        categorize.run_categorize(output_dir=str(output_dir))
+        print(f"  Extracted {report.prompts:,} prompts across {report.sessions:,} sessions.")
+    except (ValueError, OSError) as exc:
+        print(f"  (refresh skipped: {exc}; launching on the existing data)", file=sys.stderr)
+
+
 def _handle_dashboard(args: argparse.Namespace) -> int:
     """Dispatch the ``dashboard`` subcommand.
 
-    Resolves the output directory, exposes it to the dashboard process via the
+    Refreshes the data (unless ``--no-refresh`` or the demo dataset), resolves
+    the output directory, exposes it to the dashboard process via the
     ``PROMPT_ANALYTICS_OUTPUT_DIR`` environment variable, and launches the
     Streamlit app located in the installed package.
     """
@@ -1340,6 +1374,12 @@ def _handle_dashboard(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     output_dir = Path(args.output_dir).resolve()
+
+    # Pull in the latest history before opening the board, so a fresh launch
+    # never shows stale numbers. Skipped on the demo dataset (no logs to extract,
+    # and it must never overwrite the committed demo_data) and behind --no-refresh.
+    if not getattr(args, "no_refresh", False) and os.environ.get("CCA_DEMO") != "1":
+        _refresh_for_dashboard(output_dir)
 
     # Locate app.py via importlib.resources so it works from an installed wheel.
     pkg_files = importlib.resources.files("prompt_analytics.dashboard")

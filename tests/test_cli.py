@@ -368,7 +368,9 @@ def test_dashboard_dispatch(data, monkeypatch):
     import subprocess
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert main(_args(data, "dashboard")) == 0
+    # --no-refresh keeps this test focused on dispatch (the refresh path has its
+    # own test); without it the command would extract before launching.
+    assert main(_args(data, "dashboard", "--no-refresh")) == 0
     assert "streamlit" in calls["cmd"]
     assert calls["env"]["PROMPT_ANALYTICS_OUTPUT_DIR"].endswith("out")
 
@@ -387,9 +389,43 @@ def test_dashboard_forwards_unknown_flags_to_streamlit(data, monkeypatch):
     import subprocess
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert main(_args(data, "dashboard", "--server.port", "8599")) == 0
+    assert main(_args(data, "dashboard", "--no-refresh", "--server.port", "8599")) == 0
     # Streamlit config flags are appended after the script path, untouched.
     assert calls["cmd"][-2:] == ["--server.port", "8599"]
+
+
+def test_dashboard_refreshes_data_before_launch(data, monkeypatch):
+    """Without --no-refresh, `dashboard` extracts into the output dir first."""
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert main(_args(data, "dashboard")) == 0
+    # The refresh ran the extract step, so the CSVs the dashboard reads exist.
+    assert (data.out / "prompts.csv").exists()
+    assert (data.out / "sessions.csv").exists()
+
+
+def test_dashboard_skips_refresh_on_demo(data, monkeypatch):
+    """CCA_DEMO=1 must never overwrite data (the demo dataset is committed)."""
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setenv("CCA_DEMO", "1")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert main(_args(data, "dashboard")) == 0
+    # No extraction happened, so the output dir stays untouched.
+    assert not (data.out / "prompts.csv").exists()
 
 
 def test_unknown_flag_on_non_dashboard_still_exits_2(data):
