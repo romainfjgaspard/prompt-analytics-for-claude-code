@@ -38,6 +38,7 @@ examples:
   prompt-analytics by-token-type                 context rent vs generation in the bill
   prompt-analytics by-output                     what Claude produced: language mix, code vs tests
   prompt-analytics by-context                    what fills the cache: loading vs rent per source
+  prompt-analytics by-file                       per-file footprint: edits + reads + context cost
   prompt-analytics sessions --depth              marginal prompt cost vs session depth
   prompt-analytics context                       accumulated context per turn (when to /compact)
   prompt-analytics ttl                           what pauses cost in cache re-writes
@@ -192,6 +193,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _provider_arg(p_by_context)
     p_by_context.set_defaults(func=_handle_by_context)
+
+    p_by_file = subparsers.add_parser(
+        "by-file",
+        parents=[analytics_parent],
+        help="Per-file footprint: edits + line diff (output) crossed with reads + context cost.",
+    )
+    _provider_arg(p_by_file)
+    p_by_file.set_defaults(func=_handle_by_file)
 
     p_prompts = subparsers.add_parser(
         "prompts",
@@ -756,6 +765,19 @@ def _handle_by_context(args: argparse.Namespace) -> int:
     if ds is None:
         return code
     render(analytics.by_context(ds, args.provider), args.format)
+    return 0
+
+
+def _handle_by_file(args: argparse.Namespace) -> int:
+    from . import analytics
+    from .render import render
+
+    if code := _check_providers([args.provider], _pricing_path(args)):
+        return code
+    ds, code = _dataset_or_fail(args)
+    if ds is None:
+        return code
+    render(analytics.file_footprint(ds, args.provider), args.format)
     return 0
 
 

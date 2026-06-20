@@ -32,6 +32,7 @@ from .tokenizer import count_tokens
 __all__ = [
     "detect_language",
     "detect_kind",
+    "relativize",
     "diff_lines",
     "serialize_tool_input",
     "tool_edit",
@@ -201,11 +202,12 @@ def serialize_tool_input(value: Any) -> str:
         return str(value)
 
 
-def _relativize(path: str, cwd: str) -> str:
+def relativize(path: str, cwd: str) -> str:
     """Project-relative path identity (basename if outside the project tree).
 
-    Used solely to count *distinct* files; never written to a CSV. Keeping it
-    relative avoids carrying absolute machine paths into the parse cache.
+    The file identity that joins Axe C (edits) to Axe D (reads) in the unified
+    per-file view. Kept relative so no absolute machine path is ever persisted
+    (DASH4 / D5-D6). Shared by ``tool_edit`` (C) and ``context`` (D).
     """
     norm = _posix(path)
     if cwd:
@@ -250,7 +252,7 @@ def tool_edit(tool_id: str, name: str, raw_input: Any, cwd: str) -> ToolEdit | N
 
     return ToolEdit(
         tool_id=tool_id,
-        path=_relativize(file_path, cwd),
+        path=relativize(file_path, cwd),
         language=detect_language(file_path),
         kind=detect_kind(file_path),
         lines_added=added,
@@ -296,30 +298,34 @@ def analyze_assistant_content(content: Any, cwd: str) -> tuple[int, int, list[To
 
 
 def aggregate_output_files(prompt_id: str, edits: list[ToolEdit]) -> list[OutputFileRow]:
-    """Collapse a prompt's edits into long ``(language, kind)`` rows.
+    """Collapse a prompt's edits into one long row per **file** (path).
 
-    ``files`` counts *distinct* paths in the group (re-editing one file is still
-    one file); the line counts sum across edits. Rows are sorted for a stable
-    CSV.
+    Re-editing one file in the prompt stays one row; ``edits`` counts those edit
+    tool calls and the line counts sum across them. ``language``/``kind`` come
+    from the path (stable per file). The relative path is the identity that joins
+    to Axe D's reads in the unified per-file view. Rows are sorted for a stable
+    CSV; metrics only -- no source code.
     """
-    groups: dict[tuple[str, str], tuple[set[str], list[int]]] = {}
+    groups: dict[str, tuple[str, str, list[int]]] = {}
     for edit in edits:
-        key = (edit["language"], edit["kind"])
-        paths, totals = groups.setdefault(key, (set(), [0, 0]))
-        paths.add(edit["path"])
-        totals[0] += edit["lines_added"]
-        totals[1] += edit["lines_deleted"]
+        _lang, _kind, totals = groups.setdefault(
+            edit["path"], (edit["language"], edit["kind"], [0, 0, 0])
+        )
+        totals[0] += 1  # one edit tool call
+        totals[1] += edit["lines_added"]
+        totals[2] += edit["lines_deleted"]
 
     rows = [
         OutputFileRow(
             prompt_id=prompt_id,
+            path=path,
             language=language,
             kind=kind,
-            files=len(paths),
-            lines_added=totals[0],
-            lines_deleted=totals[1],
+            edits=totals[0],
+            lines_added=totals[1],
+            lines_deleted=totals[2],
         )
-        for (language, kind), (paths, totals) in groups.items()
+        for path, (language, kind, totals) in groups.items()
     ]
-    rows.sort(key=lambda r: (r["language"], r["kind"]))
+    rows.sort(key=lambda r: r["path"])
     return rows

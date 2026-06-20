@@ -164,11 +164,21 @@ CATEGORIES_COLS = [
 QUOTA_LOG_COLS = ["snapshot_at", "field", "utilization_pct", "resets_at"]
 
 # Output composition (Axe C). ``output_files.csv`` is long: one row per
-# ``(prompt_id, language, kind)`` so a multi-language prompt is preserved, in
-# the spirit of ``tokens.csv``. ``files`` counts distinct files touched in the
-# group; the line counts are exact LCS diffs. Metrics only -- no source code,
-# no file paths, ever reach this CSV.
-OUTPUT_FILES_COLS = ["prompt_id", "language", "kind", "files", "lines_added", "lines_deleted"]
+# ``(prompt_id, path)`` -- the project-relative file path is the identity that
+# crosses Axe C (edits) and Axe D (reads) in the unified per-file view (DASH4 /
+# D5-D6: relative path, never absolute, so no machine path leaks). ``edits``
+# counts the edit tool calls to that file in the prompt; the line counts are
+# exact LCS diffs; ``language``/``kind`` are derived from the path. Metrics only
+# -- no source code ever reaches this CSV, just the relative path and integers.
+OUTPUT_FILES_COLS = [
+    "prompt_id",
+    "path",
+    "language",
+    "kind",
+    "edits",
+    "lines_added",
+    "lines_deleted",
+]
 
 # Per-prompt prose/code split of the generated output tokens (Axe C). The real
 # ``output_tokens`` are prorated by the local-tokenizer weight of the message's
@@ -177,32 +187,37 @@ OUTPUT_FILES_COLS = ["prompt_id", "language", "kind", "files", "lines_added", "l
 OUTPUT_TOKENS_COLS = ["prompt_id", "output_prose_tokens", "output_code_tokens"]
 
 # Context composition (Axe D, static snapshot). Long: one row per
-# ``(session_id, source, language)``. ``source`` is one of the four context
+# ``(session_id, source, language, path)``. ``source`` is one of the four context
 # buckets (``conversation`` / ``file_read`` / ``tool_output`` / ``config``);
-# ``language`` is the file language for ``file_read`` rows (``-`` otherwise).
+# ``language`` is the file language for ``file_read`` rows (``-`` otherwise);
+# ``path`` is the project-relative file path for ``file_read`` rows (``-``
+# otherwise), the identity that joins to Axe C in the unified per-file view.
 # ``tokens`` is the local-tokenizer size of every distinct piece of that content
 # the session ever put in context, and ``items`` counts those pieces (distinct
-# tool results, attachments, prompts + assistant turns). A single local
-# tokenizer measures every source, so the per-source *share* is an honest ratio
-# (the API never reports a per-element token count). Metrics only -- no content,
-# no file paths, ever reach this CSV.
-CONTEXT_SOURCES_COLS = ["session_id", "source", "language", "tokens", "items"]
+# tool results, attachments, prompts + assistant turns) -- for a file that is the
+# number of times it was read. A single local tokenizer measures every source,
+# so the per-source *share* is an honest ratio (the API never reports a
+# per-element token count). Metrics only -- no content ever reaches this CSV.
+CONTEXT_SOURCES_COLS = ["session_id", "source", "language", "path", "tokens", "items"]
 
 # Context cost-over-time (Axe D, the "real cost of a context element"). Long: one
-# row per ``(session_id, source, language, model)``. The real per-request cache
-# tokens of the main chain are attributed across the context elements present
-# that turn -- ``rent_read_tokens`` is the cumulative ``cache_read`` (the rent an
-# element pays every turn it stays in context: size x turns of presence),
+# row per ``(session_id, source, language, path, model)``. The real per-request
+# cache tokens of the main chain are attributed across the context elements
+# present that turn -- ``rent_read_tokens`` is the cumulative ``cache_read`` (the
+# rent an element pays every turn it stays in context: size x turns of presence),
 # ``load_write_5m_tokens``/``load_write_1h_tokens`` the one-off ``cache_write``
-# of loading it. ``model`` is carried (like ``tokens.csv``) because pricing is
-# per model. Cache that lands on a turn with no measured element (chiefly the
+# of loading it. ``path`` is the project-relative file path for ``file_read``
+# rows (``-`` otherwise) -- the per-file cost that joins to Axe C edits in the
+# unified view. ``model`` is carried (like ``tokens.csv``) because pricing is per
+# model. Cache that lands on a turn with no measured element (chiefly the
 # synthetic post-compaction summary) is kept under the ``(unattributed)`` source
 # so the per-source split still reconciles to the billed total exactly. Metrics
-# only -- raw token counts, no content, no file paths, priced at read time.
+# only -- raw token counts, no content, relative paths only, priced at read time.
 CONTEXT_COST_COLS = [
     "session_id",
     "source",
     "language",
+    "path",
     "model",
     "rent_read_tokens",
     "load_write_5m_tokens",
@@ -255,8 +270,8 @@ class ToolEdit(TypedDict):
     """Metrics derived from one file-editing ``tool_use`` block (Axe C).
 
     Carries no source code: only the derived language/kind, the exact line
-    diff, and a project-relative path kept solely to count *distinct* files
-    (never written to any CSV).
+    diff, and a project-relative path -- the file identity persisted to
+    ``output_files.csv`` so a file's edits (Axe C) join its reads (Axe D).
     """
 
     tool_id: str
@@ -274,17 +289,18 @@ class ContextItem(TypedDict):
     attachments (skill/tool listings, file references). The dialogue itself
     (prompts + assistant turns) is *not* an item -- it is summed from the
     prompts and the deduplicated usage records, which already carry their token
-    weights. Carries no content: only the source bucket, the (file) language,
-    the local-tokenizer ``tokens`` size, the prompt + ``post_compact``
-    membership reconstructed from the ``parentUuid`` chain, and a ``dedup_id``
-    (the tool-use id or attachment uuid) so a replayed session is not
-    double-counted.
+    weights. Carries no content: only the source bucket, the (file) language and
+    project-relative ``path`` (both ``-`` outside ``file_read``), the
+    local-tokenizer ``tokens`` size, the prompt + ``post_compact`` membership
+    reconstructed from the ``parentUuid`` chain, and a ``dedup_id`` (the tool-use
+    id or attachment uuid) so a replayed session is not double-counted.
     """
 
     prompt_id: str
     post_compact: bool
     source: str
     language: str
+    path: str
     tokens: int
     dedup_id: str
 
@@ -410,12 +426,18 @@ class RequestRow(TypedDict):
 
 
 class OutputFileRow(TypedDict):
-    """One row of ``output_files.csv`` (Axe C, long by language/kind)."""
+    """One row of ``output_files.csv`` (Axe C, long by file path).
+
+    ``path`` is the project-relative file identity (it joins to Axe D's reads in
+    the unified per-file view); ``edits`` counts the edit tool calls to it in the
+    prompt. ``language``/``kind`` are derived from the path. Metrics only.
+    """
 
     prompt_id: str
+    path: str
     language: str
     kind: str
-    files: int
+    edits: int
     lines_added: int
     lines_deleted: int
 
@@ -429,27 +451,35 @@ class OutputTokenRow(TypedDict):
 
 
 class ContextSourceRow(TypedDict):
-    """One row of ``context_sources.csv`` (Axe D, long by source/language)."""
+    """One row of ``context_sources.csv`` (Axe D, long by source/language/path).
 
-    session_id: str
-    source: str
-    language: str
-    tokens: int
-    items: int
-
-
-class ContextCostRow(TypedDict):
-    """One row of ``context_cost.csv`` (Axe D, cost-over-time by source/model).
-
-    ``rent_read_tokens`` is the real ``cache_read`` of the session's main chain
-    attributed to this ``(source, language)`` across every turn it stayed in
-    context (size x turns of presence); the two ``load_write_*`` columns are the
-    one-off ``cache_write`` of caching it. Raw counts, priced at read time.
+    ``path`` is the project-relative file for ``file_read`` rows (``-``
+    otherwise); ``items`` is how many distinct pieces entered context -- for a
+    file, the number of times it was read. Metrics only.
     """
 
     session_id: str
     source: str
     language: str
+    path: str
+    tokens: int
+    items: int
+
+
+class ContextCostRow(TypedDict):
+    """One row of ``context_cost.csv`` (Axe D, cost-over-time by source/path/model).
+
+    ``rent_read_tokens`` is the real ``cache_read`` of the session's main chain
+    attributed to this ``(source, language, path)`` across every turn it stayed in
+    context (size x turns of presence); the two ``load_write_*`` columns are the
+    one-off ``cache_write`` of caching it. ``path`` is the project-relative file
+    for ``file_read`` rows (``-`` otherwise). Raw counts, priced at read time.
+    """
+
+    session_id: str
+    source: str
+    language: str
+    path: str
     model: str
     rent_read_tokens: int
     load_write_5m_tokens: int

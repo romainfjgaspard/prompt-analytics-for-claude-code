@@ -107,15 +107,17 @@ def test_demo_output_split_reconciles_with_output_tokens():
 
 
 def test_demo_output_files_are_metrics_only():
-    """No source code / file paths leak into output_files.csv (privacy guard)."""
+    """output_files.csv carries relative paths + metrics only (no source code)."""
     prompt_ids = {r["prompt_id"] for r in _read_csv("prompts.csv")}
     rows = _read_csv("output_files.csv")
     assert rows
     for row in rows:
-        # File rows exist for real prompts only, and carry positive line counts.
+        # File rows exist for real prompts only, and carry positive metrics.
         assert row["prompt_id"] in prompt_ids
         assert row["kind"] in ("code", "test")
-        assert int(row["lines_added"]) >= 0 and int(row["files"]) >= 1
+        assert int(row["lines_added"]) >= 0 and int(row["edits"]) >= 1
+        # The path is a project-relative identity (never absolute).
+        assert row["path"] and not row["path"].startswith("/")
 
 
 def test_committed_context_composition_matches_generator(generated):

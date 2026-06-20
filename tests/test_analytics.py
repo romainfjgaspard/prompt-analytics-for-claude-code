@@ -606,27 +606,40 @@ def _output_ds() -> Dataset:
         _token("s1", "p3", HAIKU, "output", 100_000),
     ]
     output_files = [
+        # p1 edits two Python code files (100/+10 total) and one Python test file.
         {
             "prompt_id": "p1",
+            "path": "src/a.py",
             "language": "Python",
             "kind": "code",
-            "files": 2,
-            "lines_added": 100,
-            "lines_deleted": 10,
+            "edits": 1,
+            "lines_added": 50,
+            "lines_deleted": 5,
         },
         {
             "prompt_id": "p1",
+            "path": "src/b.py",
+            "language": "Python",
+            "kind": "code",
+            "edits": 1,
+            "lines_added": 50,
+            "lines_deleted": 5,
+        },
+        {
+            "prompt_id": "p1",
+            "path": "tests/t.py",
             "language": "Python",
             "kind": "test",
-            "files": 1,
+            "edits": 1,
             "lines_added": 50,
             "lines_deleted": 0,
         },
         {
             "prompt_id": "p3",
+            "path": "q.sql",
             "language": "SQL",
             "kind": "code",
-            "files": 1,
+            "edits": 1,
             "lines_added": 20,
             "lines_deleted": 0,
         },
@@ -724,6 +737,124 @@ def test_output_composition_code_tokens_without_file_edit_go_to_tooling():
     assert comp.languages == []
     assert comp.tooling_cost == pytest.approx(comp.code_cost, abs=1e-9)
     assert comp.code_cost > 0
+
+
+# ---------------------------------------------------------------------------
+# file_footprint: the unified per-file view (DASH4), Axe C joined to Axe D.
+# ---------------------------------------------------------------------------
+
+
+def _footprint_ds() -> Dataset:
+    """A file edited *and* read (app.py) plus a read-only file (config.json)."""
+    return Dataset(
+        sessions=[{"session_id": "s1"}],
+        prompts=[{"session_id": "s1", "prompt_id": "p1", "project": "a", "model": OPUS}],
+        tokens=[],
+        categories={},
+        source="test data",
+        output_files=[
+            {
+                "prompt_id": "p1",
+                "path": "src/app.py",
+                "language": "Python",
+                "kind": "code",
+                "edits": 3,
+                "lines_added": 120,
+                "lines_deleted": 40,
+            }
+        ],
+        output_tokens=[],
+        context_sources=[
+            {
+                "session_id": "s1",
+                "source": "file_read",
+                "language": "Python",
+                "path": "src/app.py",
+                "tokens": 5000,
+                "items": 4,
+            },
+            {
+                "session_id": "s1",
+                "source": "file_read",
+                "language": "JSON",
+                "path": "config.json",
+                "tokens": 2000,
+                "items": 2,
+            },
+            {
+                "session_id": "s1",
+                "source": "conversation",
+                "language": "-",
+                "path": "-",
+                "tokens": 9000,
+                "items": 10,
+            },
+        ],
+        context_cost=[
+            {
+                "session_id": "s1",
+                "source": "file_read",
+                "language": "Python",
+                "path": "src/app.py",
+                "model": OPUS,
+                "rent_read_tokens": 800_000,
+                "load_write_5m_tokens": 50_000,
+                "load_write_1h_tokens": 0,
+            },
+            {
+                "session_id": "s1",
+                "source": "file_read",
+                "language": "JSON",
+                "path": "config.json",
+                "model": OPUS,
+                "rent_read_tokens": 400_000,
+                "load_write_5m_tokens": 0,
+                "load_write_1h_tokens": 0,
+            },
+            {
+                "session_id": "s1",
+                "source": "conversation",
+                "language": "-",
+                "path": "-",
+                "model": OPUS,
+                "rent_read_tokens": 300_000,
+                "load_write_5m_tokens": 0,
+                "load_write_1h_tokens": 0,
+            },
+        ],
+    )
+
+
+def test_file_footprint_crosses_edits_and_context_cost():
+    rows = analytics.file_footprint(_footprint_ds(), "anthropic").rows
+    by_path = {r["path"]: r for r in rows}
+    # app.py shows BOTH halves: edits + line diff (C) and reads + context cost (D).
+    app = by_path["src/app.py"]
+    assert app["language"] == "Python" and app["kind"] == "code"
+    assert (app["edits"], app["lines_added"], app["lines_deleted"]) == (3, 120, 40)
+    assert app["reads"] == 4
+    assert app["load_usd"] > 0 and app["rent_usd"] > 0
+    assert app["context_usd"] == pytest.approx(app["load_usd"] + app["rent_usd"], abs=1e-9)
+    # The read-only manifest has a pure D footprint (no edits) -- the cut candidate.
+    cfg = by_path["config.json"]
+    assert cfg["edits"] == 0 and cfg["reads"] == 2 and cfg["rent_usd"] > 0
+    # conversation is not a file -> no per-file row.
+    assert "-" not in by_path
+
+
+def test_file_footprint_sorted_by_context_cost_with_note():
+    result = analytics.file_footprint(_footprint_ds(), "anthropic")
+    # app.py (more rent) sorts before config.json.
+    assert [r["path"] for r in result.rows] == ["src/app.py", "config.json"]
+    note = next(n for n in result.notes if "files:" in n)
+    assert "1 edited" in note and "1 read but never edited" in note
+
+
+def test_file_footprint_empty_dataset_hints_to_extract():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test data")
+    result = analytics.file_footprint(empty, "anthropic")
+    assert result.rows == []
+    assert any("No per-file data" in n for n in result.notes)
 
 
 # ---------------------------------------------------------------------------

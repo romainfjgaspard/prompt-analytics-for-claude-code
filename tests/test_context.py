@@ -6,6 +6,7 @@ import random
 
 from prompt_analytics.context import (
     NO_LANGUAGE,
+    NO_PATH,
     ContextElement,
     ContextRequest,
     assistant_tool_metas,
@@ -34,10 +35,10 @@ def test_result_text_handles_both_shapes():
     assert result_text(42) == ""
 
 
-def test_assistant_tool_metas_maps_id_to_source_and_language():
+def test_assistant_tool_metas_maps_id_to_source_language_and_path():
     content = [
         {"type": "text", "text": "working"},
-        {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "/p/app.py"}},
+        {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "/p/src/app.py"}},
         {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "ls"}},
         {
             "type": "tool_use",
@@ -45,29 +46,32 @@ def test_assistant_tool_metas_maps_id_to_source_and_language():
             "name": "NotebookRead",
             "input": {"notebook_path": "/p/x.ipynb"},
         },
-        # A read without a usable path keeps the file_read source, no language.
+        # A read without a usable path keeps the file_read source, no language/path.
         {"type": "tool_use", "id": "r2", "name": "Read", "input": {}},
         {"type": "tool_use", "name": "Grep", "input": {}},  # no id -> skipped
     ]
-    metas = assistant_tool_metas(content)
-    assert metas["r1"] == ("file_read", "Python")
-    assert metas["b1"] == ("tool_output", NO_LANGUAGE)
-    assert metas["n1"] == ("file_read", "Jupyter Notebook")
-    assert metas["r2"] == ("file_read", NO_LANGUAGE)
+    metas = assistant_tool_metas(content, cwd="/p")
+    # file_read carries the file's language and its project-relative path.
+    assert metas["r1"] == ("file_read", "Python", "src/app.py")
+    assert metas["b1"] == ("tool_output", NO_LANGUAGE, NO_PATH)
+    assert metas["n1"] == ("file_read", "Jupyter Notebook", "x.ipynb")
+    assert metas["r2"] == ("file_read", NO_LANGUAGE, NO_PATH)
     assert len(metas) == 4  # the id-less Grep call is not recorded
     assert assistant_tool_metas("not a list") == {}
 
 
 def test_attachment_item_classifies_files_config_and_references():
-    # A bodied attachment with a filename -> file_read in the file's language.
-    src = attachment_item({"type": "file", "filename": "/p/a.ts", "content": "export const x = 1"})
-    assert src == ("file_read", "TypeScript", "export const x = 1")
-    # A bodied attachment without a filename -> config.
+    # A bodied attachment with a filename -> file_read in the file's language/path.
+    src = attachment_item(
+        {"type": "file", "filename": "/p/src/a.ts", "content": "export const x = 1"}, cwd="/p"
+    )
+    assert src == ("file_read", "TypeScript", "src/a.ts", "export const x = 1")
+    # A bodied attachment without a filename -> config (no language/path).
     listing = attachment_item({"type": "skill_listing", "content": "- verify: ..."})
-    assert listing == ("config", NO_LANGUAGE, "- verify: ...")
+    assert listing == ("config", NO_LANGUAGE, NO_PATH, "- verify: ...")
     # A list field (the deferred-tool listing) becomes config text.
     delta = attachment_item({"type": "deferred_tools_delta", "addedLines": ["A", "B"]})
-    assert delta == ("config", NO_LANGUAGE, "A\nB")
+    assert delta == ("config", NO_LANGUAGE, NO_PATH, "A\nB")
     # Reference-only attachments (no body) and non-dicts -> nothing in context.
     assert attachment_item({"type": "opened_file_in_ide", "filename": "/p/a.py"}) is None
     assert attachment_item({"type": "task_reminder", "content": []}) is None
@@ -104,14 +108,14 @@ def test_attribution_realizes_size_times_turns_of_presence():
     # Two equal-size elements, each entering with its own prompt; three turns of
     # identical cache_read. e1 (p1) is present for all 3 turns, e2 (p2) for 2.
     elements = [
-        ContextElement("p1", "file_read", "Python", 100),
-        ContextElement("p2", "file_read", "Python", 100),
+        ContextElement("p1", "file_read", "Python", "a.py", 100),
+        ContextElement("p2", "file_read", "Python", "a.py", 100),
     ]
     requests = [_R("p1", read=300), _R("p1", read=300), _R("p2", read=300)]
     result = attribute_context_cost(requests, elements)
-    rent = result[("file_read", "Python", "m")][0]
-    # All rent lands on the one (source, language, model) bucket; it equals the
-    # billed total exactly (size x turns is captured inside the single bucket).
+    rent = result[("file_read", "Python", "a.py", "m")][0]
+    # All rent lands on the one (source, language, path, model) bucket; it equals
+    # the billed total exactly (size x turns is captured inside the single bucket).
     assert rent == 900
     assert sum(v[0] for v in result.values()) == 900
 
@@ -119,21 +123,22 @@ def test_attribution_realizes_size_times_turns_of_presence():
 def test_attribution_load_is_one_off_per_entering_prompt():
     """cache_write is split across the prompt's own elements (loading), once."""
     elements = [
-        ContextElement("p1", "file_read", "Python", 300),
-        ContextElement("p1", "conversation", NO_LANGUAGE, 100),
+        ContextElement("p1", "file_read", "Python", "a.py", 300),
+        ContextElement("p1", "conversation", NO_LANGUAGE, NO_PATH, 100),
     ]
     requests = [_R("p1", w5m=400, w1h=80)]
     result = attribute_context_cost(requests, elements)
     # 400 split 300:100 -> 300/100; 80 split -> 60/20.
-    assert result[("file_read", "Python", "m")][1:] == [300, 60]
-    assert result[("conversation", NO_LANGUAGE, "m")][1:] == [100, 20]
+    assert result[("file_read", "Python", "a.py", "m")][1:] == [300, 60]
+    assert result[("conversation", NO_LANGUAGE, NO_PATH, "m")][1:] == [100, 20]
 
 
 def test_attribution_reconciles_to_the_billed_total():
     """Every cache token is distributed: attributed + residual == the bill."""
     rng = random.Random(7)
     elements = [
-        ContextElement(f"p{i}", "file_read", "Python", rng.randint(1, 999)) for i in range(1, 6)
+        ContextElement(f"p{i}", "file_read", "Python", f"f{i}.py", rng.randint(1, 999))
+        for i in range(1, 6)
     ]
     requests = [
         _R(f"p{i}", read=rng.randint(0, 9000), w5m=rng.randint(0, 4000), w1h=rng.randint(0, 1000))
@@ -148,8 +153,8 @@ def test_attribution_reconciles_to_the_billed_total():
 def test_attribution_compaction_resets_the_present_set():
     """A 0->1 post_compact transition drops the prior context from the rent base."""
     elements = [
-        ContextElement("p1", "file_read", "Python", 100),
-        ContextElement("c1", "conversation", NO_LANGUAGE, 100),  # the summary turn
+        ContextElement("p1", "file_read", "Python", "a.py", 100),
+        ContextElement("c1", "conversation", NO_LANGUAGE, NO_PATH, 100),  # the summary turn
     ]
     requests = [
         _R("p1", read=100),  # pre-compaction: only p1 present
@@ -158,21 +163,21 @@ def test_attribution_compaction_resets_the_present_set():
     result = attribute_context_cost(requests, elements)
     # The 500 post-compaction read goes entirely to the summary's conversation,
     # not to the dropped Python file (whose only rent is the pre-compaction 100).
-    assert result[("conversation", NO_LANGUAGE, "m")][0] == 500
-    assert result[("file_read", "Python", "m")][0] == 100
+    assert result[("conversation", NO_LANGUAGE, NO_PATH, "m")][0] == 500
+    assert result[("file_read", "Python", "a.py", "m")][0] == 100
 
 
 def test_attribution_unattributed_when_no_element_present():
     """Cache on a turn with no measured element accrues to (unattributed)."""
     requests = [_R("ghost", read=400, w5m=50)]
     result = attribute_context_cost(requests, elements=[])
-    assert result[(UNATTRIBUTED_SOURCE, NO_LANGUAGE, "m")] == [400, 50, 0]
+    assert result[(UNATTRIBUTED_SOURCE, NO_LANGUAGE, NO_PATH, "m")] == [400, 50, 0]
 
 
 def test_attribution_keeps_models_apart():
     """Rent is attributed per request model (pricing is per model)."""
-    elements = [ContextElement("p1", "file_read", "Python", 100)]
+    elements = [ContextElement("p1", "file_read", "Python", "a.py", 100)]
     requests = [_R("p1", read=200, model="opus"), _R("p1", read=200, model="haiku")]
     result = attribute_context_cost(requests, elements)
-    assert result[("file_read", "Python", "opus")][0] == 200
-    assert result[("file_read", "Python", "haiku")][0] == 200
+    assert result[("file_read", "Python", "a.py", "opus")][0] == 200
+    assert result[("file_read", "Python", "a.py", "haiku")][0] == 200

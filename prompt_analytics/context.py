@@ -27,12 +27,13 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, NamedTuple
 
-from .compose import detect_language, serialize_tool_input
+from .compose import detect_language, relativize, serialize_tool_input
 from .schema import UNATTRIBUTED_SOURCE
 
 __all__ = [
     "CONTEXT_SOURCES",
     "NO_LANGUAGE",
+    "NO_PATH",
     "tool_result_source",
     "result_text",
     "assistant_tool_metas",
@@ -54,6 +55,10 @@ _FILE_READ_TOOLS = frozenset({"Read", "NotebookRead"})
 
 # ``language`` sentinel for sources that carry no file language.
 NO_LANGUAGE = "-"
+
+# ``path`` sentinel for sources that are not a single file (conversation, tool
+# output, config) -- only ``file_read`` carries a project-relative file path.
+NO_PATH = "-"
 
 
 def tool_result_source(tool_name: str) -> str:
@@ -79,14 +84,16 @@ def result_text(content: Any) -> str:
     return "\n".join(parts)
 
 
-def assistant_tool_metas(content: Any) -> dict[str, tuple[str, str]]:
-    """Map each ``tool_use`` id in a message to ``(source, language)``.
+def assistant_tool_metas(content: Any, cwd: str = "") -> dict[str, tuple[str, str, str]]:
+    """Map each ``tool_use`` id in a message to ``(source, language, path)``.
 
     Built from the assistant's tool calls so the matching ``tool_result`` (which
     only carries the id) can be classified: ``Read``/``NotebookRead`` become
-    ``file_read`` with the file's language, everything else ``tool_output``.
+    ``file_read`` with the file's language and its project-relative path (the
+    identity the unified per-file view joins on), everything else ``tool_output``
+    with no language/path.
     """
-    metas: dict[str, tuple[str, str]] = {}
+    metas: dict[str, tuple[str, str, str]] = {}
     if not isinstance(content, list):
         return metas
     for block in content:
@@ -98,13 +105,15 @@ def assistant_tool_metas(content: Any) -> dict[str, tuple[str, str]]:
         name = str(block.get("name") or "")
         source = tool_result_source(name)
         language = NO_LANGUAGE
+        path = NO_PATH
         if source == "file_read":
             raw = block.get("input")
             if isinstance(raw, dict):
-                path = raw.get("file_path") or raw.get("notebook_path")
-                if isinstance(path, str) and path:
-                    language = detect_language(path)
-        metas[tool_id] = (source, language)
+                raw_path = raw.get("file_path") or raw.get("notebook_path")
+                if isinstance(raw_path, str) and raw_path:
+                    language = detect_language(raw_path)
+                    path = relativize(raw_path, cwd)
+        metas[tool_id] = (source, language, path)
     return metas
 
 
@@ -128,13 +137,14 @@ def _attachment_text(attachment: dict[str, Any]) -> str:
     return ""
 
 
-def attachment_item(attachment: Any) -> tuple[str, str, str] | None:
-    """Classify an attachment into ``(source, language, text)`` or ``None``.
+def attachment_item(attachment: Any, cwd: str = "") -> tuple[str, str, str, str] | None:
+    """Classify an attachment into ``(source, language, path, text)`` or ``None``.
 
     File-bearing attachments (a ``filename``/``displayPath`` with a body) are
-    ``file_read`` content in their file's language; bodied attachments without a
-    file (skill/tool listings, reminders) are ``config``. Reference-only
-    attachments with no body return ``None`` (nothing enters the context).
+    ``file_read`` content in their file's language, carrying its project-relative
+    path; bodied attachments without a file (skill/tool listings, reminders) are
+    ``config`` with no language/path. Reference-only attachments with no body
+    return ``None`` (nothing enters the context).
     """
     if not isinstance(attachment, dict):
         return None
@@ -143,8 +153,8 @@ def attachment_item(attachment: Any) -> tuple[str, str, str] | None:
         return None
     filename = attachment.get("filename") or attachment.get("displayPath")
     if isinstance(filename, str) and filename:
-        return "file_read", detect_language(filename), text
-    return "config", NO_LANGUAGE, text
+        return "file_read", detect_language(filename), relativize(filename, cwd), text
+    return "config", NO_LANGUAGE, NO_PATH, text
 
 
 # ---------------------------------------------------------------------------
@@ -179,13 +189,15 @@ class ContextElement(NamedTuple):
     """One measured piece of context, tagged with the prompt it enters with.
 
     ``prompt_id`` places the element on the ``parentUuid`` chain (it enters when
-    that prompt's first main-chain request runs); ``(source, language)`` is the
-    aggregation key; ``tokens`` is its local-tokenizer size. Metrics only.
+    that prompt's first main-chain request runs); ``(source, language, path)`` is
+    the aggregation key (``path`` is the project-relative file for ``file_read``,
+    ``NO_PATH`` otherwise); ``tokens`` is its local-tokenizer size. Metrics only.
     """
 
     prompt_id: str
     source: str
     language: str
+    path: str
     tokens: int
 
 
@@ -240,7 +252,7 @@ _CostTriple = list[int]
 def attribute_context_cost(
     requests: list[ContextRequest],
     elements: list[ContextElement],
-) -> dict[tuple[str, str, str], _CostTriple]:
+) -> dict[tuple[str, str, str, str], _CostTriple]:
     """Attribute one session's real cache tokens across its context elements.
 
     Walks ``requests`` in the given (chronological) order, maintaining the set
@@ -249,22 +261,22 @@ def attribute_context_cost(
     measured size (see the module note above).
 
     Returns:
-        ``(source, language, model) -> [rent_read, load_5m, load_1h]`` in tokens.
-        Cache that cannot be tied to a measured element is keyed under
-        ``(UNATTRIBUTED_SOURCE, NO_LANGUAGE, model)``. Summing every triple's
-        first column equals the total billed ``cache_read`` of ``requests``
-        exactly; the load columns likewise total the billed ``cache_write``.
+        ``(source, language, path, model) -> [rent_read, load_5m, load_1h]`` in
+        tokens. Cache that cannot be tied to a measured element is keyed under
+        ``(UNATTRIBUTED_SOURCE, NO_LANGUAGE, NO_PATH, model)``. Summing every
+        value's first column equals the total billed ``cache_read`` of
+        ``requests`` exactly; the load columns likewise total ``cache_write``.
     """
     elements_by_prompt: dict[str, list[ContextElement]] = defaultdict(list)
     for element in elements:
         if element.tokens > 0:
             elements_by_prompt[element.prompt_id].append(element)
 
-    result: dict[tuple[str, str, str], _CostTriple] = defaultdict(lambda: [0, 0, 0])
-    # Present context as (source, language) -> tokens, rebuilt as prompts enter
-    # and cleared at each compaction. ``entered`` guards against re-adding a
+    result: dict[tuple[str, str, str, str], _CostTriple] = defaultdict(lambda: [0, 0, 0])
+    # Present context as (source, language, path) -> tokens, rebuilt as prompts
+    # enter and cleared at each compaction. ``entered`` guards against re-adding a
     # prompt's elements (its requests span several turns).
-    present: dict[tuple[str, str], int] = defaultdict(int)
+    present: dict[tuple[str, str, str], int] = defaultdict(int)
     entered: set[str] = set()
     prev_post_compact = False
 
@@ -277,7 +289,7 @@ def attribute_context_cost(
         if req.prompt_id not in entered:
             entered.add(req.prompt_id)
             for element in prompt_elements:
-                present[(element.source, element.language)] += element.tokens
+                present[(element.source, element.language, element.path)] += element.tokens
 
         # Rent: split this turn's cache_read across everything currently present.
         if req.cache_read:
@@ -285,9 +297,9 @@ def attribute_context_cost(
             shares = split_int(req.cache_read, [present[k] for k in keys])
             if shares and sum(shares):
                 for key, share in zip(keys, shares, strict=True):
-                    result[(key[0], key[1], req.model)][0] += share
+                    result[(key[0], key[1], key[2], req.model)][0] += share
             else:
-                result[(UNATTRIBUTED_SOURCE, NO_LANGUAGE, req.model)][0] += req.cache_read
+                result[(UNATTRIBUTED_SOURCE, NO_LANGUAGE, NO_PATH, req.model)][0] += req.cache_read
 
         # Load: split this turn's cache_write across the prompt's own elements.
         for ttl_index, write in ((1, req.cache_write_5m), (2, req.cache_write_1h)):
@@ -296,8 +308,10 @@ def attribute_context_cost(
             shares = split_int(write, [element.tokens for element in prompt_elements])
             if shares and sum(shares):
                 for element, share in zip(prompt_elements, shares, strict=True):
-                    result[(element.source, element.language, req.model)][ttl_index] += share
+                    result[(element.source, element.language, element.path, req.model)][
+                        ttl_index
+                    ] += share
             else:
-                result[(UNATTRIBUTED_SOURCE, NO_LANGUAGE, req.model)][ttl_index] += write
+                result[(UNATTRIBUTED_SOURCE, NO_LANGUAGE, NO_PATH, req.model)][ttl_index] += write
 
     return result

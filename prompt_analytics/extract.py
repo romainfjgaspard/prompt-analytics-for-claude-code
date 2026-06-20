@@ -54,6 +54,7 @@ from . import paths
 from .compose import aggregate_output_files, analyze_assistant_content
 from .context import (
     NO_LANGUAGE,
+    NO_PATH,
     ContextElement,
     ContextRequest,
     assistant_tool_metas,
@@ -99,8 +100,10 @@ __all__ = ["run_extract", "collect", "parse_file", "ExtractReport", "ExtractResu
 # Bump whenever parse_file's output shape or logic changes: invalidates the
 # on-disk parse cache. V3 adds the Axe C per-record fields (prose/code token
 # weights + file-edit metrics); V4 adds the Axe D context items (sized tool
-# results + attachments) and the prompt ``text_tokens``.
-CACHE_VERSION = 4
+# results + attachments) and the prompt ``text_tokens``; V5 adds the
+# project-relative file ``path`` to edits (Axe C) and context items (Axe D) so
+# the unified per-file view joins a file's edits to its reads (DASH4 / D5-D6).
+CACHE_VERSION = 5
 
 PREVIEW_CHARS = 100
 
@@ -293,7 +296,7 @@ def parse_file(filepath: Path) -> ParsedFile:
     context_items: list[ContextItem] = []
     # Axe D: tool-use id -> (source, language), filled from assistant tool calls
     # so the later ``tool_result`` (which only carries the id) can be classified.
-    tool_use_meta: dict[str, tuple[str, str]] = {}
+    tool_use_meta: dict[str, tuple[str, str, str]] = {}
     lines_total = 0
     lines_invalid = 0
     event_types: Counter[str] = Counter()
@@ -362,7 +365,9 @@ def parse_file(filepath: Path) -> ParsedFile:
                         if not isinstance(block, dict) or block.get("type") != "tool_result":
                             continue
                         tool_id = str(block.get("tool_use_id") or "")
-                        source, language = tool_use_meta.get(tool_id, ("tool_output", NO_LANGUAGE))
+                        source, language, path = tool_use_meta.get(
+                            tool_id, ("tool_output", NO_LANGUAGE, NO_PATH)
+                        )
                         tokens_count = count_tokens(result_text(block.get("content")))
                         if tokens_count:
                             context_items.append(
@@ -371,6 +376,7 @@ def parse_file(filepath: Path) -> ParsedFile:
                                     post_compact=post_compact,
                                     source=source,
                                     language=language,
+                                    path=path,
                                     tokens=tokens_count,
                                     dedup_id=tool_id or event_uuid,
                                 )
@@ -411,10 +417,12 @@ def parse_file(filepath: Path) -> ParsedFile:
                 usage = message.get("usage")
                 tokens = _usage_tokens(usage) if isinstance(usage, dict) else {}
                 content = message.get("content")
-                # Axe D: remember each tool call's (source, language) so the
+                # Axe D: remember each tool call's (source, language, path) so the
                 # matching tool_result (carrying only the id) is classifiable.
                 if not event.get("isSidechain"):
-                    tool_use_meta.update(assistant_tool_metas(content))
+                    tool_use_meta.update(
+                        assistant_tool_metas(content, str(event.get("cwd") or session_cwd))
+                    )
                 tool_use_ids = [
                     str(block["id"])
                     for block in (content if isinstance(content, list) else [])
@@ -453,10 +461,12 @@ def parse_file(filepath: Path) -> ParsedFile:
                 # attachments count as file_read, bodied ones as config.
                 if event.get("isSidechain"):
                     continue
-                classified = attachment_item(event.get("attachment"))
+                classified = attachment_item(
+                    event.get("attachment"), str(event.get("cwd") or session_cwd)
+                )
                 if classified is None:
                     continue
-                source, language, text = classified
+                source, language, path, text = classified
                 tokens_count = count_tokens(text)
                 if tokens_count:
                     context_items.append(
@@ -465,6 +475,7 @@ def parse_file(filepath: Path) -> ParsedFile:
                             post_compact=post_compact,
                             source=source,
                             language=language,
+                            path=path,
                             tokens=tokens_count,
                             dedup_id=event_uuid,
                         )
@@ -1114,10 +1125,10 @@ def collect(
     # in the window. Within it the full composition is shown (the snapshot is a
     # session-level ratio, not sliced mid-session).
     seen_context_ids: set[str] = set()
-    context_by_session: dict[str, dict[tuple[str, str], list[int]]] = defaultdict(dict)
+    context_by_session: dict[str, dict[tuple[str, str, str], list[int]]] = defaultdict(dict)
     # Axe D (D2): the same deduplicated items at prompt grain feed the
-    # cost-over-time walk -- (session_id, prompt_id, source, language) -> tokens.
-    items_by_prompt: dict[str, Counter[tuple[str, str, str]]] = defaultdict(Counter)
+    # cost-over-time walk -- (prompt_id, source, language, path) -> tokens.
+    items_by_prompt: dict[str, Counter[tuple[str, str, str, str]]] = defaultdict(Counter)
     for session_id, item in pending_context:
         dedup_id = item["dedup_id"]
         if dedup_id:
@@ -1125,12 +1136,14 @@ def collect(
                 continue
             seen_context_ids.add(dedup_id)
         ctx_bucket = context_by_session[session_id].setdefault(
-            (item["source"], item["language"]), [0, 0]
+            (item["source"], item["language"], item["path"]), [0, 0]
         )
         ctx_bucket[0] += item["tokens"]
         ctx_bucket[1] += 1
         item_pid = item["prompt_id"] or continuation_prompt_id(session_id)
-        items_by_prompt[session_id][(item_pid, item["source"], item["language"])] += item["tokens"]
+        items_by_prompt[session_id][(item_pid, item["source"], item["language"], item["path"])] += (
+            item["tokens"]
+        )
 
     context_source_rows: list[ContextSourceRow] = []
     for session_id in included_sessions:
@@ -1140,11 +1153,12 @@ def collect(
                     session_id=session_id,
                     source="conversation",
                     language=NO_LANGUAGE,
+                    path=NO_PATH,
                     tokens=conv_tokens[session_id],
                     items=conv_items[session_id],
                 )
             )
-        for (source, language), (tokens_sum, items) in context_by_session.get(
+        for (source, language, path), (tokens_sum, items) in context_by_session.get(
             session_id, {}
         ).items():
             context_source_rows.append(
@@ -1152,6 +1166,7 @@ def collect(
                     session_id=session_id,
                     source=source,
                     language=language,
+                    path=path,
                     tokens=tokens_sum,
                     items=items,
                 )
@@ -1191,12 +1206,12 @@ def collect(
     context_cost_rows: list[ContextCostRow] = []
     for session_id in included_sessions:
         elements = [
-            ContextElement(prompt_id, "conversation", NO_LANGUAGE, tokens_count)
+            ContextElement(prompt_id, "conversation", NO_LANGUAGE, NO_PATH, tokens_count)
             for prompt_id, tokens_count in conv_by_session.get(session_id, [])
         ]
         elements.extend(
-            ContextElement(prompt_id, source, language, tokens_count)
-            for (prompt_id, source, language), tokens_count in items_by_prompt.get(
+            ContextElement(prompt_id, source, language, path, tokens_count)
+            for (prompt_id, source, language, path), tokens_count in items_by_prompt.get(
                 session_id, {}
             ).items()
         )
@@ -1204,13 +1219,14 @@ def collect(
             req for _, req in sorted(requests_by_session.get(session_id, []), key=lambda r: r[0])
         ]
         attributed = attribute_context_cost(requests, elements)
-        for (source, language, model), (rent, load_5m, load_1h) in attributed.items():
+        for (source, language, path, model), (rent, load_5m, load_1h) in attributed.items():
             if rent or load_5m or load_1h:
                 context_cost_rows.append(
                     ContextCostRow(
                         session_id=session_id,
                         source=source,
                         language=language,
+                        path=path,
                         model=model,
                         rent_read_tokens=rent,
                         load_write_5m_tokens=load_5m,
@@ -1240,10 +1256,12 @@ def collect(
         key=lambda r: (r["session_id"], r["timestamp"], r["prompt_id"], r["request_index"])
     )
     text_rows.sort(key=lambda r: r["prompt_id"])
-    output_file_rows.sort(key=lambda r: (r["prompt_id"], r["language"], r["kind"]))
+    output_file_rows.sort(key=lambda r: (r["prompt_id"], r["path"]))
     output_token_rows.sort(key=lambda r: r["prompt_id"])
-    context_source_rows.sort(key=lambda r: (r["session_id"], r["source"], r["language"]))
-    context_cost_rows.sort(key=lambda r: (r["session_id"], r["source"], r["language"], r["model"]))
+    context_source_rows.sort(key=lambda r: (r["session_id"], r["source"], r["language"], r["path"]))
+    context_cost_rows.sort(
+        key=lambda r: (r["session_id"], r["source"], r["language"], r["path"], r["model"])
+    )
 
     # --- Finalize the report. ------------------------------------------------
     report.sessions = len(session_rows)

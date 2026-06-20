@@ -702,10 +702,10 @@ def test_extract_never_touches_categories_csv(fake_claude):
 
 
 def _output_files_by_prompt(out):
-    """{prompt_id: {(language, kind): row}} from output_files.csv."""
-    result: dict[str, dict[tuple[str, str], dict[str, str]]] = {}
+    """{prompt_id: {path: row}} from output_files.csv."""
+    result: dict[str, dict[str, dict[str, str]]] = {}
     for row in _read_csv(out / "output_files.csv"):
-        result.setdefault(row["prompt_id"], {})[(row["language"], row["kind"])] = row
+        result.setdefault(row["prompt_id"], {})[row["path"]] = row
     return result
 
 
@@ -714,17 +714,19 @@ def test_output_files_language_kind_and_lines(fake_claude):
     run_extract(fake_claude.out)
 
     files = _output_files_by_prompt(fake_claude.out)
-    # pO1 writes then edits src/parser.py (one distinct Python code file).
-    po1 = files["pO1"][("Python", "code")]
-    assert po1["files"] == "1"
+    # pO1 writes then edits src/parser.py (one file, two edit calls).
+    po1 = files["pO1"]["src/parser.py"]
+    assert (po1["language"], po1["kind"]) == ("Python", "code")
+    assert po1["edits"] == "2"  # Write + Edit
     assert po1["lines_added"] == "7"  # Write 5 + Edit +2
     assert po1["lines_deleted"] == "1"  # Edit -1
     # pO2 writes tests/test_parser.py -> Python test.
-    po2 = files["pO2"][("Python", "test")]
-    assert po2["files"] == "1"
+    po2 = files["pO2"]["tests/test_parser.py"]
+    assert (po2["language"], po2["kind"]) == ("Python", "test")
+    assert po2["edits"] == "1"
     assert po2["lines_added"] == "3"
     assert po2["lines_deleted"] == "0"
-    assert ("Python", "code") not in files["pO2"]
+    assert "src/parser.py" not in files["pO2"]
 
 
 def test_output_tokens_split_reconciles_with_total_output(fake_claude):
@@ -762,7 +764,7 @@ def test_output_split_all_prose_when_no_tool_blocks(fake_claude):
 
 
 def test_output_csvs_carry_metrics_only_no_source_code(fake_claude):
-    """No file contents / edit strings / absolute paths ever reach the CSVs."""
+    """Relative paths are kept (the file identity); content / absolute paths are not."""
     fake_claude.add("session_output.jsonl", project="out")
     run_extract(fake_claude.out)
 
@@ -772,10 +774,11 @@ def test_output_csvs_carry_metrics_only_no_source_code(fake_claude):
     # Source fragments from the fixture must be absent.
     for secret in ("def parse", "return int", "import mod", "assert parse"):
         assert secret not in blob
-    # No path column at all in output_files.csv, and no leaked path string.
     header = files_text.splitlines()[0]
-    assert header == "prompt_id,language,kind,files,lines_added,lines_deleted"
-    assert "parser.py" not in blob
+    assert header == "prompt_id,path,language,kind,edits,lines_added,lines_deleted"
+    # The project-relative path IS the file identity (DASH4 / D5-D6); only the
+    # absolute machine path must never leak.
+    assert "src/parser.py" in files_text
     assert "/home/fake" not in blob
 
 
@@ -788,9 +791,9 @@ def test_output_files_dedup_across_resumed_replay(fake_claude):
     run_extract(fake_claude.out)
 
     files = _output_files_by_prompt(fake_claude.out)
-    po1 = files["pO1"][("Python", "code")]
+    po1 = files["pO1"]["src/parser.py"]
     assert po1["lines_added"] == "7"  # not 14
-    assert po1["files"] == "1"
+    assert po1["edits"] == "2"  # Write + Edit, counted once
 
 
 def test_output_csvs_respect_date_window(fake_claude):
@@ -946,16 +949,20 @@ def test_context_source_shares_sum_to_one(fake_claude):
 
 
 def test_context_sources_metrics_only_no_content(fake_claude):
-    """No file content / tool output / paths ever reach context_sources.csv."""
+    """No file content / tool output reaches context_sources.csv; relative paths do."""
     fake_claude.write("session_context.jsonl", _ctx_events(), project="ctx")
     run_extract(fake_claude.out)
 
     blob = (fake_claude.out / "context_sources.csv").read_text(encoding="utf-8")
     header = blob.splitlines()[0]
-    assert header == "session_id,source,language,tokens,items"
-    for secret in ("def parse", "return int", "3 passed", "def helper", "verify", "app.ts"):
+    assert header == "session_id,source,language,path,tokens,items"
+    # Content fragments (file bodies, tool output, skill listing) must be absent.
+    for secret in ("def parse", "return int", "3 passed", "def helper", "verify"):
         assert secret not in blob
-    assert "/home/fake" not in blob and "parser.py" not in blob
+    # The file-read path is kept as a project-relative identity; only the
+    # absolute machine path must never leak.
+    assert "src/parser.py" in blob and "web/app.ts" in blob
+    assert "/home/fake" not in blob
 
 
 def test_context_sources_dedup_across_resumed_replay(fake_claude):
@@ -1093,17 +1100,19 @@ def test_context_cost_reconciles_with_the_billed_main_chain(fake_claude):
 
 
 def test_context_cost_metrics_only_no_content(fake_claude):
-    """context_cost.csv carries raw token counts only -- no content, no paths."""
+    """context_cost.csv carries raw token counts + relative paths -- no content."""
     fake_claude.write("session_cost.jsonl", _cost_events(), project="cost")
     run_extract(fake_claude.out)
 
     blob = (fake_claude.out / "context_cost.csv").read_text(encoding="utf-8")
     assert blob.splitlines()[0] == (
-        "session_id,source,language,model,rent_read_tokens,"
+        "session_id,source,language,path,model,rent_read_tokens,"
         "load_write_5m_tokens,load_write_1h_tokens"
     )
-    for secret in ("def parse", "return int", "3 passed", "parser.py"):
+    # Content fragments must be absent; the relative file path is kept as identity.
+    for secret in ("def parse", "return int", "3 passed"):
         assert secret not in blob
+    assert "src/parser.py" in blob
     assert "/home/fake" not in blob
 
 

@@ -33,7 +33,8 @@ from pathlib import Path
 from typing import Any
 
 from . import extract, paths
-from .context import NO_LANGUAGE
+from .compose import detect_kind
+from .context import NO_LANGUAGE, NO_PATH
 from .pricing import get_model_pricing, get_per_request, is_long_context, load_pricing
 from .schema import (
     REQUESTS_COLS,
@@ -349,7 +350,7 @@ def dataset_from_csvs(
     _coerce_int(prompts, ("prompt_index", "char_count", "assistant_turns", "tool_calls"))
     _coerce_int(tokens, ("token_count", "is_sidechain"))
     _coerce_int(requests, _REQUEST_INT_COLS)
-    _coerce_int(output_files, ("files", "lines_added", "lines_deleted"))
+    _coerce_int(output_files, ("edits", "lines_added", "lines_deleted"))
     _coerce_int(output_tokens, ("output_prose_tokens", "output_code_tokens"))
     _coerce_int(context_sources, ("tokens", "items"))
     _coerce_int(
@@ -1048,7 +1049,7 @@ def output_composition(ds: Dataset, provider: str) -> OutputComposition:
     """
     added: Counter[str] = Counter()
     deleted: Counter[str] = Counter()
-    files: Counter[str] = Counter()
+    paths_by_lang: dict[str, set[str]] = defaultdict(set)
     test_added: Counter[str] = Counter()
     # Per-prompt language churn (added + deleted), the weight used to attribute
     # each prompt's code cost across the languages it touched.
@@ -1059,10 +1060,13 @@ def output_composition(ds: Dataset, provider: str) -> OutputComposition:
         ld = int(row.get("lines_deleted") or 0)
         added[language] += la
         deleted[language] += ld
-        files[language] += int(row.get("files") or 0)
+        # One row per file (path); count distinct files so a file edited across
+        # several prompts is still one file touched.
+        paths_by_lang[language].add(row.get("path") or "")
         if (row.get("kind") or "") == "test":
             test_added[language] += la
         prompt_churn[row["prompt_id"]][language] += la + ld
+    files: Counter[str] = Counter({lang: len(paths) for lang, paths in paths_by_lang.items()})
 
     engine = CostEngine(provider, ds.pricing_path)
     out_cost = _output_cost_by_prompt(ds, engine)
@@ -1424,6 +1428,125 @@ def by_context(ds: Dataset, provider: str) -> TableResult:
             Column("rent_usd", "Rent $", "money"),
             Column("total_usd", "Total $", "money"),
             Column("share_pct", "Share", "pct"),
+        ],
+        rows,
+        notes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unified per-file view (DASH4): a file's whole footprint, Axe C joined to D.
+# ---------------------------------------------------------------------------
+
+
+def file_footprint(ds: Dataset, provider: str) -> TableResult:
+    """One row per file crossing Axe C (edits) and Axe D (reads + context cost).
+
+    The Explorer-style scorecard: a file's total cost of ownership in a single
+    line -- how often it was **edited** and its exact +/- line diff (Axe C),
+    how often it was **read** into context and what that context cost (the one-off
+    **load** plus the **rent** it paid every turn it lingered, Axe D), keyed on
+    the project-relative path so a file edited *and* kept in context shows both
+    halves. Rows are sorted by context cost (the actionable "what to cut") then
+    line churn. Metrics only -- relative paths, never a byte of content.
+    """
+    engine = CostEngine(provider, ds.pricing_path)
+
+    edits: Counter[str] = Counter()
+    added: Counter[str] = Counter()
+    deleted: Counter[str] = Counter()
+    language: dict[str, str] = {}
+    kind: dict[str, str] = {}
+
+    def _note_lang(path: str, value: str | None) -> None:
+        if value and value != NO_LANGUAGE and path not in language:
+            language[path] = value
+
+    for row in ds.output_files:
+        path = row.get("path") or ""
+        if not path or path == NO_PATH:
+            continue
+        edits[path] += int(row.get("edits") or 0)
+        added[path] += int(row.get("lines_added") or 0)
+        deleted[path] += int(row.get("lines_deleted") or 0)
+        _note_lang(path, row.get("language"))
+        if path not in kind:
+            kind[path] = row.get("kind") or detect_kind(path)
+
+    reads: Counter[str] = Counter()
+    for row in ds.context_sources:
+        if (row.get("source") or "") != "file_read":
+            continue
+        path = row.get("path") or ""
+        if not path or path == NO_PATH:
+            continue
+        reads[path] += int(row.get("items") or 0)
+        _note_lang(path, row.get("language"))
+
+    load: dict[str, float] = defaultdict(float)
+    rent: dict[str, float] = defaultdict(float)
+    for row in ds.context_cost:
+        if (row.get("source") or "") != "file_read":
+            continue
+        path = row.get("path") or ""
+        if not path or path == NO_PATH:
+            continue
+        model = row.get("model") or ""
+        rent[path] += engine.cost(model, "cache_read", int(row.get("rent_read_tokens") or 0))
+        load[path] += engine.cost(
+            model, "cache_write_5m", int(row.get("load_write_5m_tokens") or 0)
+        ) + engine.cost(model, "cache_write_1h", int(row.get("load_write_1h_tokens") or 0))
+        _note_lang(path, row.get("language"))
+
+    all_paths = set(edits) | set(reads) | set(load) | set(rent)
+    rows: list[dict[str, Any]] = []
+    for path in all_paths:
+        context_usd = load.get(path, 0.0) + rent.get(path, 0.0)
+        rows.append(
+            {
+                "path": path,
+                "language": language.get(path, NO_LANGUAGE),
+                "kind": kind.get(path) or detect_kind(path),
+                "edits": edits.get(path, 0),
+                "lines_added": added.get(path, 0),
+                "lines_deleted": deleted.get(path, 0),
+                "reads": reads.get(path, 0),
+                "load_usd": round(load.get(path, 0.0), 4),
+                "rent_usd": round(rent.get(path, 0.0), 4),
+                "context_usd": round(context_usd, 4),
+            }
+        )
+    rows.sort(
+        key=lambda r: (-r["context_usd"], -(r["lines_added"] + r["lines_deleted"]), r["path"])
+    )
+
+    notes = [_source_note(ds)]
+    if not ds.output_files and not ds.context_cost:
+        notes.append(
+            "No per-file data -- re-run `prompt-analytics extract` "
+            "(the file identity ships with the latest extractor)."
+        )
+    elif rows:
+        edited = sum(1 for r in rows if r["edits"])
+        read_only = sum(1 for r in rows if not r["edits"] and r["reads"])
+        notes.append(
+            f"{len(rows):,} files: {edited:,} edited, {read_only:,} read but never edited "
+            "(pure context cost -- the first candidates to keep out of context)."
+        )
+
+    return TableResult(
+        f"Per-file footprint ({provider})",
+        [
+            Column("path", "File"),
+            Column("language", "Language"),
+            Column("kind", "Kind"),
+            Column("edits", "Edits", "int"),
+            Column("lines_added", "Lines +", "int"),
+            Column("lines_deleted", "Lines −", "int"),
+            Column("reads", "Reads", "int"),
+            Column("load_usd", "Load $", "money"),
+            Column("rent_usd", "Rent $", "money"),
+            Column("context_usd", "Context $", "money"),
         ],
         rows,
         notes,

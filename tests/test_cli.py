@@ -123,6 +123,20 @@ def test_by_context_empty_history_hints(fake_claude):
     assert main(_args(fake_claude, "by-context")) == 1
 
 
+def test_by_file_dispatch(fake_claude, capsys):
+    # session_output.jsonl edits src/parser.py -> a per-file footprint row. csv
+    # format keeps the path intact (the rich table folds it at narrow widths).
+    fake_claude.add("session_output.jsonl", project="out")
+    assert main(_args(fake_claude, "by-file", "--format", "csv")) == 0
+    out = capsys.readouterr().out
+    assert "src/parser.py" in out
+
+
+def test_by_file_empty_history_hints(fake_claude):
+    # No JSONL history at all -> the usual "no data" path (exit 1), not a crash.
+    assert main(_args(fake_claude, "by-file")) == 1
+
+
 def test_prompts_dispatch(data, capsys):
     assert main(_args(data, "prompts", "--top", "2")) == 0
     out = capsys.readouterr().out

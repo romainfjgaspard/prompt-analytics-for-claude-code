@@ -161,9 +161,11 @@ def test_aggregate_output_files_counts_distinct_files():
         ),
     ]
     rows = compose.aggregate_output_files("p1", edits)
-    by_kind = {r["kind"]: r for r in rows}
-    # x.py edited twice -> one file, lines summed.
-    assert by_kind["code"]["files"] == 1
-    assert (by_kind["code"]["lines_added"], by_kind["code"]["lines_deleted"]) == (7, 1)
-    assert by_kind["test"]["files"] == 1
+    by_path = {r["path"]: r for r in rows}
+    # x.py edited twice -> one row, edits counted, lines summed.
+    assert by_path["src/x.py"]["edits"] == 2
+    assert by_path["src/x.py"]["kind"] == "code"
+    assert (by_path["src/x.py"]["lines_added"], by_path["src/x.py"]["lines_deleted"]) == (7, 1)
+    assert by_path["tests/t.py"]["edits"] == 1
+    assert by_path["tests/t.py"]["kind"] == "test"
     assert all(r["prompt_id"] == "p1" for r in rows)

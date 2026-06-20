@@ -32,8 +32,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from prompt_analytics import schema
+from prompt_analytics.compose import detect_kind as schema_detect_kind
+from prompt_analytics.compose import detect_language as schema_detect_language
 from prompt_analytics.context import (
     NO_LANGUAGE,
+    NO_PATH,
     ContextElement,
     ContextRequest,
     attribute_context_cost,
@@ -176,6 +179,108 @@ CODE_SHARE: dict[str, tuple[float, float]] = {
 # others (question/plan/followup/other) produce no file rows -- only tokens.
 FILE_CATEGORIES = frozenset({"implementation", "refactor", "test", "debug", "ops", "docs"})
 
+# Per-project file pool: a small set of realistic project-relative paths the
+# assistant edits *and* reads, so the unified per-file view shows files with both
+# a C footprint (edits) and a D footprint (reads + context cost). Each project
+# uses its own directory layout so paths stay distinct across projects (relative
+# paths would otherwise conflate, exactly like real data). Language and kind are
+# derived from the path by the real detectors, so the demo can never drift from
+# them. Markdown docs are shared reading everywhere.
+_PROJECT_PATHS: dict[str, list[str]] = {
+    "webapp-frontend": [
+        "src/components/Button.tsx",
+        "src/components/Modal.tsx",
+        "src/pages/Home.tsx",
+        "src/api/client.ts",
+        "src/hooks/useAuth.ts",
+        "src/utils/format.ts",
+        "src/components/__tests__/Button.test.tsx",
+        "tests/api.spec.ts",
+        "src/styles/theme.css",
+        "src/styles/layout.css",
+        "docs/frontend.md",
+        "README.md",
+    ],
+    "data-pipeline": [
+        "pipelines/ingest.py",
+        "pipelines/transform.py",
+        "pipelines/load.py",
+        "pipelines/validate.py",
+        "tests/test_ingest.py",
+        "tests/test_transform.py",
+        "sql/schema.sql",
+        "sql/migrations.sql",
+        "docs/pipeline.md",
+        "README.md",
+    ],
+    "ml-experiments": [
+        "models/train.py",
+        "models/evaluate.py",
+        "data/features.py",
+        "tests/test_train.py",
+        "notebooks/eda.ipynb",
+        "notebooks/baseline.ipynb",
+        "docs/experiments.md",
+        "README.md",
+    ],
+    "infra-terraform": [
+        "modules/network/main.tf",
+        "modules/compute/main.tf",
+        "environments/prod.tf",
+        "environments/staging.tf",
+        "ci/pipeline.yml",
+        "config/values.yml",
+        "docs/infra.md",
+        "README.md",
+    ],
+    "mobile-app": [
+        "app/src/main/MainActivity.kt",
+        "app/src/main/LoginScreen.kt",
+        "app/src/ui/Theme.kt",
+        "app/src/test/MainActivityTest.kt",
+        "ios/AppDelegate.swift",
+        "ios/LoginView.swift",
+        "docs/mobile.md",
+        "README.md",
+    ],
+}
+
+# (project, language, kind) -> the matching paths, indexed once via the real
+# detectors so picks stay consistent with how extraction would classify them.
+_PATHS_BY_LANG_KIND: dict[tuple[str, str, str], list[str]] = {}
+for _project, _paths in _PROJECT_PATHS.items():
+    for _path in _paths:
+        _PATHS_BY_LANG_KIND.setdefault(
+            (_project, schema_detect_language(_path), schema_detect_kind(_path)), []
+        ).append(_path)
+
+
+# Files the assistant *reads* into context but never edits -- dependency
+# manifests, lockfiles, generated config. They have a pure D footprint (context
+# cost, no edits): the unified view's headline "read but never edited" insight,
+# the first candidates to keep out of context.
+_READONLY_PATHS: dict[str, list[str]] = {
+    "webapp-frontend": ["package.json", "tsconfig.json", "node_modules/react/index.d.ts"],
+    "data-pipeline": ["requirements.txt", "pyproject.toml", "config/settings.json"],
+    "ml-experiments": ["requirements.txt", "data/schema.json"],
+    "infra-terraform": ["terraform.tfstate", "versions.json"],
+    "mobile-app": ["build.gradle", "Package.resolved"],
+}
+
+
+def _paths_for(project: str, language: str, kind: str) -> list[str]:
+    """The project's pool paths matching a desired ``(language, kind)``."""
+    return _PATHS_BY_LANG_KIND.get((project, language, kind), [])
+
+
+def _split_lines(total: int, parts: int, rng: random.Random) -> list[int]:
+    """Split ``total`` lines across ``parts`` files (sums back to ``total``)."""
+    if parts <= 1 or total <= 0:
+        return [total] + [0] * (parts - 1)
+    cuts = sorted(rng.randint(0, total) for _ in range(parts - 1))
+    bounds = [0, *cuts, total]
+    return [bounds[i + 1] - bounds[i] for i in range(parts)]
+
 
 def _weighted_choice(rng: random.Random, weighted: dict[str, tuple[float, tuple[int, int]]]) -> str:
     names = list(weighted)
@@ -314,16 +419,31 @@ def _emit_requests(
 
 
 def _accum(
-    groups: dict[tuple[str, str], tuple[int, list[int]]],
+    files_acc: dict[str, list[int]],
+    rng: random.Random,
+    project: str,
     language: str,
     kind: str,
-    files: int,
+    n_files: int,
     added: int,
     deleted: int,
 ) -> None:
-    """Fold one file group into ``(language, kind) -> (files, [added, deleted])``."""
-    f, totals = groups.get((language, kind), (0, [0, 0]))
-    groups[(language, kind)] = (f + files, [totals[0] + added, totals[1] + deleted])
+    """Edit ``n_files`` concrete pool files of ``(language, kind)`` in this prompt.
+
+    Picks distinct project files and splits the line totals across them, folding
+    into ``path -> [edits, added, deleted]`` (re-editing a file bumps ``edits``).
+    """
+    paths = _paths_for(project, language, kind)
+    if not paths:
+        return
+    chosen = rng.sample(paths, min(max(1, n_files), len(paths)))
+    adds = _split_lines(added, len(chosen), rng)
+    dels = _split_lines(deleted, len(chosen), rng)
+    for path, a, d in zip(chosen, adds, dels, strict=True):
+        acc = files_acc.setdefault(path, [0, 0, 0])
+        acc[0] += 1
+        acc[1] += a
+        acc[2] += d
 
 
 def _output_composition(
@@ -374,17 +494,46 @@ def _output_composition(
         # File edits: only the categories that touch disk, and not every time.
         if category not in FILE_CATEGORIES or rng.random() < 0.2:
             continue
-        groups: dict[tuple[str, str], tuple[int, list[int]]] = {}
+        files_acc: dict[str, list[int]] = {}
         span = 8 + 14 * complexity
         if category == "test":
-            _accum(groups, code_lang, "test", rng.randint(1, 2), rng.randint(span, span * 3), 0)
+            _accum(
+                files_acc,
+                rng,
+                project,
+                code_lang,
+                "test",
+                rng.randint(1, 2),
+                rng.randint(span, span * 3),
+                0,
+            )
             if rng.random() < 0.4:
-                _accum(groups, code_lang, "code", 1, rng.randint(2, span), rng.randint(0, 6))
+                _accum(
+                    files_acc,
+                    rng,
+                    project,
+                    code_lang,
+                    "code",
+                    1,
+                    rng.randint(2, span),
+                    rng.randint(0, 6),
+                )
         elif category == "docs":
-            _accum(groups, "Markdown", "code", 1, rng.randint(5, 40), rng.randint(0, 15))
+            _accum(
+                files_acc,
+                rng,
+                project,
+                "Markdown",
+                "code",
+                1,
+                rng.randint(5, 40),
+                rng.randint(0, 15),
+            )
         elif category == "ops":
             _accum(
-                groups,
+                files_acc,
+                rng,
+                project,
                 second_lang,
                 "code",
                 rng.randint(1, 2),
@@ -393,7 +542,9 @@ def _output_composition(
             )
         else:  # implementation / refactor / debug
             _accum(
-                groups,
+                files_acc,
+                rng,
+                project,
                 code_lang,
                 "code",
                 rng.randint(1, 3),
@@ -401,23 +552,42 @@ def _output_composition(
                 rng.randint(0, span),
             )
             if rng.random() < 0.45:
-                _accum(groups, code_lang, "test", 1, rng.randint(span, span * 2), rng.randint(0, 4))
+                _accum(
+                    files_acc,
+                    rng,
+                    project,
+                    code_lang,
+                    "test",
+                    1,
+                    rng.randint(span, span * 2),
+                    rng.randint(0, 4),
+                )
             if rng.random() < 0.25:
-                _accum(groups, second_lang, "code", 1, rng.randint(2, span), rng.randint(0, 6))
+                _accum(
+                    files_acc,
+                    rng,
+                    project,
+                    second_lang,
+                    "code",
+                    1,
+                    rng.randint(2, span),
+                    rng.randint(0, 6),
+                )
 
-        for (language, kind), (files, totals) in groups.items():
+        for path, (edits, added, deleted) in files_acc.items():
             output_files.append(
                 {
                     "prompt_id": pid,
-                    "language": language,
-                    "kind": kind,
-                    "files": files,
-                    "lines_added": totals[0],
-                    "lines_deleted": totals[1],
+                    "path": path,
+                    "language": schema_detect_language(path),
+                    "kind": schema_detect_kind(path),
+                    "edits": edits,
+                    "lines_added": added,
+                    "lines_deleted": deleted,
                 }
             )
 
-    output_files.sort(key=lambda r: (str(r["prompt_id"]), str(r["language"]), str(r["kind"])))
+    output_files.sort(key=lambda r: (str(r["prompt_id"]), str(r["path"])))
     output_tokens.sort(key=lambda r: str(r["prompt_id"]))
     return output_files, output_tokens
 
@@ -447,17 +617,26 @@ def _context_composition(
 
     # Per-session measured context elements (one ``ContextElement`` per piece).
     elements_by_session: dict[str, list[ContextElement]] = {}
-    snapshot: dict[tuple[str, str, str], list[int]] = {}  # (sid,source,lang)->[tokens,items]
+    # (sid, source, lang, path) -> [tokens, items]
+    snapshot: dict[tuple[str, str, str, str], list[int]] = {}
 
-    def _add(sid: str, pid: str, source: str, language: str, tokens: int) -> None:
+    def _add(sid: str, pid: str, source: str, language: str, path: str, tokens: int) -> None:
         if tokens <= 0:
             return
         elements_by_session.setdefault(sid, []).append(
-            ContextElement(prompt_id=pid, source=source, language=language, tokens=tokens)
+            ContextElement(
+                prompt_id=pid, source=source, language=language, path=path, tokens=tokens
+            )
         )
-        bucket = snapshot.setdefault((sid, source, language), [0, 0])
+        bucket = snapshot.setdefault((sid, source, language, path), [0, 0])
         bucket[0] += tokens
         bucket[1] += 1
+
+    def _read(sid: str, pid: str, project: str, language: str, tokens: int) -> None:
+        """Read one concrete pool file of ``language`` into context (file_read)."""
+        pool = _paths_for(project, language, "code") + _paths_for(project, language, "test")
+        if pool:
+            _add(sid, pid, "file_read", language, rng.choice(pool), tokens)
 
     for prompt in prompts:
         sid = str(prompt["session_id"])
@@ -474,21 +653,37 @@ def _context_composition(
             pid,
             "conversation",
             NO_LANGUAGE,
+            NO_PATH,
             int(prompt["char_count"]) // 4 + rng.randint(60, 500),
         )
         # A one-off fixed prefix (system + CLAUDE.md + MCP) read in on turn 1.
         if depth == 1:
-            _add(sid, pid, "config", NO_LANGUAGE, rng.randint(9000, 22000))
-        # Files read into context: code-heavy work reads the most.
+            _add(sid, pid, "config", NO_LANGUAGE, NO_PATH, rng.randint(9000, 22000))
+        # Files read into context: code-heavy work reads the most. The same pool
+        # files get edited, so the unified view shows files with both footprints.
         if category in FILE_CATEGORIES or rng.random() < 0.5:
-            _add(sid, pid, "file_read", code_lang, int(rng.randint(700, 5200) * scale))
+            _read(sid, pid, project, code_lang, int(rng.randint(700, 5200) * scale))
             if rng.random() < 0.55:
-                _add(sid, pid, "file_read", "Markdown", rng.randint(300, 2600))
+                _read(sid, pid, project, "Markdown", rng.randint(300, 2600))
             if rng.random() < 0.3:
-                _add(sid, pid, "file_read", second_lang, rng.randint(200, 2400))
+                _read(sid, pid, project, second_lang, rng.randint(200, 2400))
+            # A read-only manifest/lockfile pulled in but never edited (its whole
+            # footprint is context cost -- the "what to keep out of context" case).
+            if rng.random() < 0.35:
+                ro = _READONLY_PATHS.get(project, [])
+                if ro:
+                    path = rng.choice(ro)
+                    _add(
+                        sid,
+                        pid,
+                        "file_read",
+                        schema_detect_language(path),
+                        path,
+                        rng.randint(400, 3000),
+                    )
         # Tool output (Bash / Grep / Glob) for prompts that ran tools.
         if int(prompt["tool_calls"]) > 0 and rng.random() < 0.8:
-            _add(sid, pid, "tool_output", NO_LANGUAGE, rng.randint(150, 2200))
+            _add(sid, pid, "tool_output", NO_LANGUAGE, NO_PATH, rng.randint(150, 2200))
 
     # Pseudo-prompt (continuation) requests carry a compacted conversation that
     # still gets re-read: give them a conversation element so the post-compaction
@@ -499,7 +694,7 @@ def _context_composition(
         sid = str(req["session_id"])
         if ":_continuation" in pid and (sid, pid) not in seen_pseudo:
             seen_pseudo.add((sid, pid))
-            _add(sid, pid, "conversation", NO_LANGUAGE, rng.randint(2000, 9000))
+            _add(sid, pid, "conversation", NO_LANGUAGE, NO_PATH, rng.randint(2000, 9000))
 
     # Main-chain requests per session, chronological (where the cache is billed).
     reqs_by_session: dict[str, list[tuple[str, ContextRequest]]] = {}
@@ -525,24 +720,28 @@ def _context_composition(
             "session_id": sid,
             "source": source,
             "language": language,
+            "path": path,
             "tokens": tokens,
             "items": items,
         }
-        for (sid, source, language), (tokens, items) in snapshot.items()
+        for (sid, source, language, path), (tokens, items) in snapshot.items()
     ]
-    context_sources.sort(key=lambda r: (str(r["session_id"]), str(r["source"]), str(r["language"])))
+    context_sources.sort(
+        key=lambda r: (str(r["session_id"]), str(r["source"]), str(r["language"]), str(r["path"]))
+    )
 
     context_cost: list[dict[str, object]] = []
     for sid, elements in elements_by_session.items():
         ordered = [req for _, req in sorted(reqs_by_session.get(sid, []), key=lambda r: r[0])]
         attributed = attribute_context_cost(ordered, elements)
-        for (source, language, model), (rent, load_5m, load_1h) in attributed.items():
+        for (source, language, path, model), (rent, load_5m, load_1h) in attributed.items():
             if rent or load_5m or load_1h:
                 context_cost.append(
                     {
                         "session_id": sid,
                         "source": source,
                         "language": language,
+                        "path": path,
                         "model": model,
                         "rent_read_tokens": rent,
                         "load_write_5m_tokens": load_5m,
@@ -554,6 +753,7 @@ def _context_composition(
             str(r["session_id"]),
             str(r["source"]),
             str(r["language"]),
+            str(r["path"]),
             str(r["model"]),
         )
     )
