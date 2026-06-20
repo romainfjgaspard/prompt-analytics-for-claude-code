@@ -36,7 +36,9 @@ __all__ = [
     "QUOTA_LOG_COLS",
     "OUTPUT_FILES_COLS",
     "OUTPUT_TOKENS_COLS",
+    "CONTEXT_SOURCES_COLS",
     "ToolEdit",
+    "ContextItem",
     "ParsedPrompt",
     "UsageRecord",
     "ParsedFile",
@@ -46,6 +48,7 @@ __all__ = [
     "RequestRow",
     "OutputFileRow",
     "OutputTokenRow",
+    "ContextSourceRow",
     "continuation_prompt_id",
 ]
 
@@ -170,6 +173,18 @@ OUTPUT_FILES_COLS = ["prompt_id", "language", "kind", "files", "lines_added", "l
 # output tokens in ``tokens.csv`` (estimate on the split, exact on the total).
 OUTPUT_TOKENS_COLS = ["prompt_id", "output_prose_tokens", "output_code_tokens"]
 
+# Context composition (Axe D, static snapshot). Long: one row per
+# ``(session_id, source, language)``. ``source`` is one of the four context
+# buckets (``conversation`` / ``file_read`` / ``tool_output`` / ``config``);
+# ``language`` is the file language for ``file_read`` rows (``-`` otherwise).
+# ``tokens`` is the local-tokenizer size of every distinct piece of that content
+# the session ever put in context, and ``items`` counts those pieces (distinct
+# tool results, attachments, prompts + assistant turns). A single local
+# tokenizer measures every source, so the per-source *share* is an honest ratio
+# (the API never reports a per-element token count). Metrics only -- no content,
+# no file paths, ever reach this CSV.
+CONTEXT_SOURCES_COLS = ["session_id", "source", "language", "tokens", "items"]
+
 
 def continuation_prompt_id(session_id: str) -> str:
     """Pseudo prompt_id gathering a session's unattributable usage.
@@ -201,6 +216,9 @@ class ParsedPrompt(TypedDict):
     entrypoint: str
     version: str
     text: str
+    # Local-tokenizer size of ``text`` (Axe D): the prompt's contribution to the
+    # ``conversation`` context source, counted at parse time so it is cached.
+    text_tokens: int
 
 
 class ToolEdit(TypedDict):
@@ -217,6 +235,28 @@ class ToolEdit(TypedDict):
     kind: str
     lines_added: int
     lines_deleted: int
+
+
+class ContextItem(TypedDict):
+    """One piece of content that entered the context, sized in tokens (Axe D).
+
+    Emitted for tool results (file reads, command/search output) and injected
+    attachments (skill/tool listings, file references). The dialogue itself
+    (prompts + assistant turns) is *not* an item -- it is summed from the
+    prompts and the deduplicated usage records, which already carry their token
+    weights. Carries no content: only the source bucket, the (file) language,
+    the local-tokenizer ``tokens`` size, the prompt + ``post_compact``
+    membership reconstructed from the ``parentUuid`` chain, and a ``dedup_id``
+    (the tool-use id or attachment uuid) so a replayed session is not
+    double-counted.
+    """
+
+    prompt_id: str
+    post_compact: bool
+    source: str
+    language: str
+    tokens: int
+    dedup_id: str
 
 
 class UsageRecord(TypedDict):
@@ -265,6 +305,7 @@ class ParsedFile(TypedDict):
     first_timestamp: str
     prompts: list[ParsedPrompt]
     usage: list[UsageRecord]
+    context_items: list[ContextItem]
     lines_total: int
     lines_invalid: int
     event_types: dict[str, int]
@@ -355,3 +396,13 @@ class OutputTokenRow(TypedDict):
     prompt_id: str
     output_prose_tokens: int
     output_code_tokens: int
+
+
+class ContextSourceRow(TypedDict):
+    """One row of ``context_sources.csv`` (Axe D, long by source/language)."""
+
+    session_id: str
+    source: str
+    language: str
+    tokens: int
+    items: int

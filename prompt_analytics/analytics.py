@@ -168,6 +168,10 @@ class Dataset:
     # reading a pre-Axe-C extract (the `by-output` view degrades gracefully).
     output_files: list[dict[str, Any]] = field(default_factory=list)
     output_tokens: list[dict[str, Any]] = field(default_factory=list)
+    # Context composition (Axe D, static snapshot). Long per
+    # (session_id, source, language): the local-tokenizer size of each context
+    # source. Empty when reading a pre-Axe-D extract.
+    context_sources: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
@@ -292,6 +296,7 @@ def load_dataset(
         requests=[dict(row) for row in result.requests],
         output_files=[dict(row) for row in result.output_files],
         output_tokens=[dict(row) for row in result.output_tokens],
+        context_sources=[dict(row) for row in result.context_sources],
     )
 
 
@@ -323,11 +328,13 @@ def dataset_from_csvs(
     requests = _rows("requests.csv")
     output_files = _rows("output_files.csv")
     output_tokens = _rows("output_tokens.csv")
+    context_sources = _rows("context_sources.csv")
     _coerce_int(prompts, ("prompt_index", "char_count", "assistant_turns", "tool_calls"))
     _coerce_int(tokens, ("token_count", "is_sidechain"))
     _coerce_int(requests, _REQUEST_INT_COLS)
     _coerce_int(output_files, ("files", "lines_added", "lines_deleted"))
     _coerce_int(output_tokens, ("output_prose_tokens", "output_code_tokens"))
+    _coerce_int(context_sources, ("tokens", "items"))
     if source is None:
         window = _window_label(data_dir)
         source = f"{data_dir} CSVs ({window})" if window else f"{data_dir} CSVs"
@@ -341,6 +348,7 @@ def dataset_from_csvs(
         requests=requests,
         output_files=output_files,
         output_tokens=output_tokens,
+        context_sources=context_sources,
     )
 
 
@@ -367,6 +375,7 @@ def filter_project(ds: Dataset, project: str) -> Dataset:
         requests=[row for row in ds.requests if row["session_id"] in session_ids],
         output_files=[row for row in ds.output_files if row["prompt_id"] in kept_prompt_ids],
         output_tokens=[row for row in ds.output_tokens if row["prompt_id"] in kept_prompt_ids],
+        context_sources=[row for row in ds.context_sources if row["session_id"] in session_ids],
     )
 
 
@@ -416,6 +425,10 @@ def filter_dates(ds: Dataset, since: str | None, until: str | None) -> Dataset:
         # Output rows exist for real prompts only -> follow their prompt_id.
         output_files=[row for row in ds.output_files if row["prompt_id"] in kept_prompt_ids],
         output_tokens=[row for row in ds.output_tokens if row["prompt_id"] in kept_prompt_ids],
+        # Context rows are per session -> keep those whose session keeps a prompt.
+        context_sources=[
+            row for row in ds.context_sources if row["session_id"] in kept_session_ids
+        ],
     )
 
 
@@ -439,6 +452,8 @@ def filter_prompt_ids(ds: Dataset, prompt_ids: set[str] | frozenset[str]) -> Dat
         requests=ds.requests,
         output_files=[row for row in ds.output_files if row.get("prompt_id") in kept],
         output_tokens=[row for row in ds.output_tokens if row.get("prompt_id") in kept],
+        # Session-grain context rows ride along unnarrowed, like sessions.
+        context_sources=ds.context_sources,
     )
 
 

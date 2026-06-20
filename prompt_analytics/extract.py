@@ -52,8 +52,15 @@ from zoneinfo import ZoneInfo
 
 from . import paths
 from .compose import aggregate_output_files, analyze_assistant_content
+from .context import (
+    NO_LANGUAGE,
+    assistant_tool_metas,
+    attachment_item,
+    result_text,
+)
 from .pricing import get_model_pricing
 from .schema import (
+    CONTEXT_SOURCES_COLS,
     OUTPUT_FILES_COLS,
     OUTPUT_TOKENS_COLS,
     PROMPT_TEXT_COLS,
@@ -65,6 +72,8 @@ from .schema import (
     TOKEN_TYPES,
     TOKEN_TYPES_COLS,
     TOKENS_COLS,
+    ContextItem,
+    ContextSourceRow,
     OutputFileRow,
     OutputTokenRow,
     ParsedFile,
@@ -78,13 +87,15 @@ from .schema import (
     continuation_prompt_id,
 )
 from .storage import atomic_write_csv, atomic_write_json
+from .tokenizer import count_tokens
 
 __all__ = ["run_extract", "collect", "parse_file", "ExtractReport", "ExtractResult"]
 
 # Bump whenever parse_file's output shape or logic changes: invalidates the
 # on-disk parse cache. V3 adds the Axe C per-record fields (prose/code token
-# weights + file-edit metrics).
-CACHE_VERSION = 3
+# weights + file-edit metrics); V4 adds the Axe D context items (sized tool
+# results + attachments) and the prompt ``text_tokens``.
+CACHE_VERSION = 4
 
 PREVIEW_CHARS = 100
 
@@ -274,6 +285,10 @@ def parse_file(filepath: Path) -> ParsedFile:
     first_timestamp = ""
     prompts: list[ParsedPrompt] = []
     usage_records: list[UsageRecord] = []
+    context_items: list[ContextItem] = []
+    # Axe D: tool-use id -> (source, language), filled from assistant tool calls
+    # so the later ``tool_result`` (which only carries the id) can be classified.
+    tool_use_meta: dict[str, tuple[str, str]] = {}
     lines_total = 0
     lines_invalid = 0
     event_types: Counter[str] = Counter()
@@ -332,6 +347,29 @@ def parse_file(filepath: Path) -> ParsedFile:
             if etype == "mode":
                 current_mode = str(event.get("mode") or current_mode)
             elif etype == "user":
+                message = event.get("message")
+                content = message.get("content") if isinstance(message, dict) else None
+                # Axe D: tool results are file reads / command output entering the
+                # context. Classify each by its originating tool (skip sidechain:
+                # the main-thread context is the snapshot). Metrics only.
+                if isinstance(content, list) and not event.get("isSidechain"):
+                    for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "tool_result":
+                            continue
+                        tool_id = str(block.get("tool_use_id") or "")
+                        source, language = tool_use_meta.get(tool_id, ("tool_output", NO_LANGUAGE))
+                        tokens_count = count_tokens(result_text(block.get("content")))
+                        if tokens_count:
+                            context_items.append(
+                                ContextItem(
+                                    prompt_id=pid,
+                                    post_compact=post_compact,
+                                    source=source,
+                                    language=language,
+                                    tokens=tokens_count,
+                                    dedup_id=tool_id or event_uuid,
+                                )
+                            )
                 if not is_human_message(event):
                     continue  # tool results and other non-human user events
                 text = extract_text(event.get("message", {}).get("content", ""))
@@ -358,6 +396,7 @@ def parse_file(filepath: Path) -> ParsedFile:
                         entrypoint=str(event.get("entrypoint") or ""),
                         version=str(event.get("version") or ""),
                         text=text,
+                        text_tokens=count_tokens(text),
                     )
                 )
             elif etype == "assistant":
@@ -367,6 +406,10 @@ def parse_file(filepath: Path) -> ParsedFile:
                 usage = message.get("usage")
                 tokens = _usage_tokens(usage) if isinstance(usage, dict) else {}
                 content = message.get("content")
+                # Axe D: remember each tool call's (source, language) so the
+                # matching tool_result (carrying only the id) is classifiable.
+                if not event.get("isSidechain"):
+                    tool_use_meta.update(assistant_tool_metas(content))
                 tool_use_ids = [
                     str(block["id"])
                     for block in (content if isinstance(content, list) else [])
@@ -399,6 +442,28 @@ def parse_file(filepath: Path) -> ParsedFile:
                         file_edits=file_edits,
                     )
                 )
+            elif etype == "attachment":
+                # Axe D: harness-injected setup (skill/tool listings, file
+                # references, reminders) that consumes context. File-bearing
+                # attachments count as file_read, bodied ones as config.
+                if event.get("isSidechain"):
+                    continue
+                classified = attachment_item(event.get("attachment"))
+                if classified is None:
+                    continue
+                source, language, text = classified
+                tokens_count = count_tokens(text)
+                if tokens_count:
+                    context_items.append(
+                        ContextItem(
+                            prompt_id=pid,
+                            post_compact=post_compact,
+                            source=source,
+                            language=language,
+                            tokens=tokens_count,
+                            dedup_id=event_uuid,
+                        )
+                    )
 
     return ParsedFile(
         session_id=session_id or filepath.stem,
@@ -407,6 +472,7 @@ def parse_file(filepath: Path) -> ParsedFile:
         first_timestamp=first_timestamp,
         prompts=prompts,
         usage=usage_records,
+        context_items=context_items,
         lines_total=lines_total,
         lines_invalid=lines_invalid,
         event_types=dict(event_types),
@@ -692,6 +758,7 @@ class ExtractResult:
     texts: list[dict[str, str]]
     output_files: list[OutputFileRow]
     output_tokens: list[OutputTokenRow]
+    context_sources: list[ContextSourceRow]
 
 
 def collect(
@@ -750,6 +817,12 @@ def collect(
     models: Counter[str] = Counter()
     versions: set[str] = set()
     pending_usage: list[tuple[str, UsageRecord]] = []  # (session_id, record)
+    # Axe D: context items (file reads / tool output / config) paired with their
+    # session, deduplicated later; plus the running conversation size (prompts +
+    # main-thread assistant turns), summed straight from the deduplicated rows.
+    pending_context: list[tuple[str, ContextItem]] = []
+    conv_tokens: Counter[str] = Counter()  # session_id -> conversation tokens
+    conv_items: Counter[str] = Counter()  # session_id -> conversation pieces
 
     def _in_window(ts: datetime | None) -> bool:
         if ts is None:
@@ -798,9 +871,18 @@ def collect(
                 continue
             prompt_aggs[pid] = _PromptAgg(session_id=session_id, parsed=prompt)
             prompt_order.append(pid)
+            # Axe D: the prompt text is the user's contribution to conversation.
+            conv_tokens[session_id] += prompt["text_tokens"]
+            conv_items[session_id] += 1
 
         for record in parsed["usage"]:
             pending_usage.append((session_id, record))
+
+        # Axe D: a subagent transcript's reads/output belong to the subagent's
+        # own context, not the parent thread's snapshot -- skip them entirely.
+        if not _subagent_parent_session(filepath):
+            for item in parsed["context_items"]:
+                pending_context.append((session_id, item))
 
     if use_cache:
         digests = {
@@ -855,6 +937,14 @@ def collect(
         report.usage_records += 1
         if record["model"]:
             models[record["model"]] += 1
+        # Axe D: a main-thread assistant turn (its text + tool_use blocks, sized
+        # by the local tokenizer) stays in context as conversation. Sidechain
+        # turns live in the subagent's context and are excluded.
+        if not record["is_sidechain"]:
+            turn_tokens = record["prose_tokens"] + record["code_tokens"]
+            if turn_tokens:
+                conv_tokens[session_id] += turn_tokens
+                conv_items[session_id] += 1
 
         pid = record["prompt_id"]
         agg = prompt_aggs.get(pid)
@@ -1002,6 +1092,52 @@ def collect(
             _request_rows(session_id, pseudo, request_records.get((session_id, pseudo), []))
         )
 
+    # --- Axe D context composition (session x source x language). ------------
+    # Deduplicate items by their tool-use id / attachment uuid (replayed
+    # sessions repeat them), then aggregate per session. The dialogue source
+    # (``conversation``) is summed separately from prompts + assistant turns.
+    # A session is included on the same rule as everywhere else: it has activity
+    # in the window. Within it the full composition is shown (the snapshot is a
+    # session-level ratio, not sliced mid-session).
+    seen_context_ids: set[str] = set()
+    context_by_session: dict[str, dict[tuple[str, str], list[int]]] = defaultdict(dict)
+    for session_id, item in pending_context:
+        dedup_id = item["dedup_id"]
+        if dedup_id:
+            if dedup_id in seen_context_ids:
+                continue
+            seen_context_ids.add(dedup_id)
+        ctx_bucket = context_by_session[session_id].setdefault(
+            (item["source"], item["language"]), [0, 0]
+        )
+        ctx_bucket[0] += item["tokens"]
+        ctx_bucket[1] += 1
+
+    context_source_rows: list[ContextSourceRow] = []
+    for session_id in included_sessions:
+        if conv_tokens[session_id]:
+            context_source_rows.append(
+                ContextSourceRow(
+                    session_id=session_id,
+                    source="conversation",
+                    language=NO_LANGUAGE,
+                    tokens=conv_tokens[session_id],
+                    items=conv_items[session_id],
+                )
+            )
+        for (source, language), (tokens_sum, items) in context_by_session.get(
+            session_id, {}
+        ).items():
+            context_source_rows.append(
+                ContextSourceRow(
+                    session_id=session_id,
+                    source=source,
+                    language=language,
+                    tokens=tokens_sum,
+                    items=items,
+                )
+            )
+
     session_rows: list[SessionRow] = []
     for session_id in included_sessions:
         row = sessions.get(session_id)
@@ -1026,6 +1162,7 @@ def collect(
     text_rows.sort(key=lambda r: r["prompt_id"])
     output_file_rows.sort(key=lambda r: (r["prompt_id"], r["language"], r["kind"]))
     output_token_rows.sort(key=lambda r: r["prompt_id"])
+    context_source_rows.sort(key=lambda r: (r["session_id"], r["source"], r["language"]))
 
     # --- Finalize the report. ------------------------------------------------
     report.sessions = len(session_rows)
@@ -1056,6 +1193,7 @@ def collect(
         texts=text_rows,
         output_files=output_file_rows,
         output_tokens=output_token_rows,
+        context_sources=context_source_rows,
     )
 
 
@@ -1112,6 +1250,11 @@ def run_extract(
     # Axe C output composition (metrics only -- no source code, no file paths).
     atomic_write_csv(output_dir / "output_files.csv", OUTPUT_FILES_COLS, result.output_files)
     atomic_write_csv(output_dir / "output_tokens.csv", OUTPUT_TOKENS_COLS, result.output_tokens)
+    # Axe D context composition (metrics only -- token sizes by source, never
+    # the content nor any file path).
+    atomic_write_csv(
+        output_dir / "context_sources.csv", CONTEXT_SOURCES_COLS, result.context_sources
+    )
     # Window marker (1.5): a windowed extract must never be served later as if
     # it covered the full history -- readers append it to their Source line.
     atomic_write_json(
