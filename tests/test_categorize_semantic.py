@@ -53,7 +53,9 @@ def test_system_prompt_is_rendered_from_anchors() -> None:
 
 
 def test_build_system_prompt_from_custom_anchors() -> None:
-    custom = {"plan": {"definition": "do the planning thing", "role": "semantic", "examples": ["x"]}}
+    custom = {
+        "plan": {"definition": "do the planning thing", "role": "semantic", "examples": ["x"]}
+    }
     prompt = build_system_prompt(custom)
     assert "- plan: do the planning thing" in prompt
     assert "Complexity (1-5):" in prompt  # the curated tail is still appended
@@ -260,7 +262,9 @@ def test_run_categorize_semantic_writes_stamped_categories(tmp_path: Path) -> No
 def test_run_categorize_semantic_is_idempotent(tmp_path: Path) -> None:
     out = _setup(tmp_path)
     run_categorize(output_dir=str(out), use_semantic=True, embedder=HashingEmbedder(dim=256))
-    again = run_categorize(output_dir=str(out), use_semantic=True, embedder=HashingEmbedder(dim=256))
+    again = run_categorize(
+        output_dir=str(out), use_semantic=True, embedder=HashingEmbedder(dim=256)
+    )
     assert again == 0  # current version → nothing to redo
 
 

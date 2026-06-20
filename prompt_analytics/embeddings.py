@@ -117,9 +117,7 @@ class HashingEmbedder:
         self.name = f"hashing:dim={dim}:seed={seed}"
 
     def _token_vector(self, token: str) -> npt.NDArray[np.float64]:
-        digest = hashlib.blake2b(
-            f"{self.seed}:{token}".encode(), digest_size=8
-        ).digest()
+        digest = hashlib.blake2b(f"{self.seed}:{token}".encode(), digest_size=8).digest()
         rng = np.random.default_rng(int.from_bytes(digest, "big"))
         return rng.standard_normal(self.dim)
 
@@ -252,9 +250,7 @@ class EmbeddingCache:
     def _save(self) -> None:
         if self._matrix is None:
             return
-        keys = np.array(
-            sorted(self._index, key=lambda k: self._index[k]), dtype=np.str_
-        )
+        keys = np.array(sorted(self._index, key=lambda k: self._index[k]), dtype=np.str_)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with tmp.open("wb") as handle:

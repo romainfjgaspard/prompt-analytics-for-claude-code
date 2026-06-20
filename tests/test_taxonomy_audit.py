@@ -47,9 +47,7 @@ def _corpus() -> tuple[list[str], list[str], dict[str, str]]:
 
 def _report() -> taxonomy_audit.AuditReport:
     ids, texts, cats = _corpus()
-    return build_report(
-        HashingEmbedder(dim=256), ids, texts, cats, min_cluster_size=3
-    )
+    return build_report(HashingEmbedder(dim=256), ids, texts, cats, min_cluster_size=3)
 
 
 # ── clustering + labelling ────────────────────────────────────────────────────
@@ -100,9 +98,7 @@ def _cluster(cid: int, counts: dict[str, int], terms: list[str] | None = None) -
 
 def test_detect_merges_flags_blended_clusters() -> None:
     # A cluster that is half test, half implementation → the classic merge.
-    merges = taxonomy_audit._detect_merges(
-        [_cluster(0, {"test": 5, "implementation": 5})]
-    )
+    merges = taxonomy_audit._detect_merges([_cluster(0, {"test": 5, "implementation": 5})])
     assert len(merges) == 1
     assert set(merges[0].categories) == {"test", "implementation"}
     # A pure cluster, or one only diluted by "other", is not a merge.

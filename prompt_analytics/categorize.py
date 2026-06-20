@@ -217,8 +217,7 @@ def build_system_prompt(anchors: dict[str, dict[str, Any]] | None = None) -> str
     anchors = anchors if anchors is not None else load_anchors()
     # Collapse any folded/multi-line YAML definition into one prompt line.
     cat_lines = [
-        f"- {name}: {' '.join(str(spec['definition']).split())}"
-        for name, spec in anchors.items()
+        f"- {name}: {' '.join(str(spec['definition']).split())}" for name, spec in anchors.items()
     ]
     return "\n".join(
         [
@@ -714,14 +713,14 @@ class SemanticClassifier:
             owners.extend([idx] * len(examples))
         self._proto_owner = np.asarray(owners, dtype=np.intp)
         self._proto_matrix: FloatMatrix = (
-            embedder.embed(proto_texts)
-            if proto_texts
-            else np.zeros((0, 0), dtype=np.float32)
+            embedder.embed(proto_texts) if proto_texts else np.zeros((0, 0), dtype=np.float32)
         )
 
         # Lexical prime patterns, reused verbatim from the heuristic rules so the
         # two modes share the same regex (single source of lexical truth).
-        lexical_cats = [c for c in _LEXICAL_PRIME_CATEGORIES if anchors.get(c, {}).get("role") == _ROLE_LEXICAL]
+        lexical_cats = [
+            c for c in _LEXICAL_PRIME_CATEGORIES if anchors.get(c, {}).get("role") == _ROLE_LEXICAL
+        ]
         compiled = {cat: pats for cat, pats, _w in _compile_rules()}
         self._lexical_patterns: dict[str, list[re.Pattern[str]]] = {
             cat: compiled[cat] for cat in lexical_cats if cat in compiled
@@ -1119,11 +1118,7 @@ def build_client(
     model: str = "",
     use_batch: bool = False,
 ) -> (
-    _AnthropicClassifier
-    | _OpenRouterClassifier
-    | _OllamaClassifier
-    | _AzureOpenAIClassifier
-    | None
+    _AnthropicClassifier | _OpenRouterClassifier | _OllamaClassifier | _AzureOpenAIClassifier | None
 ):
     """Build an LLM Classifier from environment variables.
 
@@ -1385,8 +1380,7 @@ def run_categorize(
     to_classify = [
         r
         for r in real_prompts
-        if not categories.get(r["prompt_id"], {}).get("category")
-        or _supersedable(r["prompt_id"])
+        if not categories.get(r["prompt_id"], {}).get("category") or _supersedable(r["prompt_id"])
     ]
 
     # No stored text (extract --no-text): classifying "" would file everything
@@ -1431,7 +1425,8 @@ def run_categorize(
         # Precedence: explicit CLI flag > config.yml > calibrated default.
         resolved_tau = tau if tau is not None else float(cfg.get("tau", DEFAULT_TAU))
         resolved_pw = (
-            prime_weight if prime_weight is not None
+            prime_weight
+            if prime_weight is not None
             else float(cfg.get("prime_weight", DEFAULT_PRIME_WEIGHT))
         )
         resolved_top_k = top_k if top_k is not None else int(cfg.get("top_k", DEFAULT_TOP_K))

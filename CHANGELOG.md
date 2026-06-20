@@ -12,6 +12,20 @@ breakage is treated as expected and reflected in the version.
 - `--since YYYY-MM-DD` / `--until YYYY-MM-DD` on every analysis command (inclusive
   date range, e.g. `summary --since 2026-06-01`).
 - `timeline` command: cost / prompts / tokens grouped by `--by day|week|month`.
+- `categorize --semantic`: an offline, mono-label semantic classifier built on
+  multilingual static embeddings (`model2vec`, torch-free, shipped in the core
+  package — no extra to install, no API key, nothing leaves your machine). It
+  fuses cosine similarity to per-category FR+EN prototypes with a lexical prime,
+  and falls back to `other` below a calibrated threshold. **Opt-in**: the
+  heuristic stays the default (it edged out the semantic mode on the demo
+  litmus/LLM-judge evaluation). Tunable via `--tau` / `--prime-weight` /
+  `--top-k` or a `semantic:` section in `config.yml`.
+- `categorize --audit-categories`: a diagnostic that clusters the whole corpus
+  (HDBSCAN) and compares the natural clusters to the thirteen categories
+  (alignment matrix, c-TF-IDF labels, candidate merges/splits). Writes a report
+  + CSV only; never changes `categories.csv`.
+- `categorize --llm --provider azure`: Azure OpenAI as an LLM provider for the
+  optional refinement pass.
 
 ### Changed
 - `by-project` now always shows the cumulative % column; the `--pareto` flag is

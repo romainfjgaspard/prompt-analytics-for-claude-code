@@ -88,20 +88,122 @@ _TERM_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 _STOPWORDS = frozenset(
     {
         # English
-        "the", "and", "for", "with", "that", "this", "you", "your", "are", "but",
-        "not", "can", "all", "any", "from", "have", "has", "was", "will", "what",
-        "why", "how", "when", "which", "should", "would", "could", "into", "out",
-        "then", "than", "them", "they", "there", "here", "its", "our", "use",
-        "using", "make", "made", "get", "got", "want", "need", "like", "just",
-        "also", "more", "most", "some", "one", "two", "now", "new", "add", "put",
-        "let", "see", "via", "per", "yes", "okay",
+        "the",
+        "and",
+        "for",
+        "with",
+        "that",
+        "this",
+        "you",
+        "your",
+        "are",
+        "but",
+        "not",
+        "can",
+        "all",
+        "any",
+        "from",
+        "have",
+        "has",
+        "was",
+        "will",
+        "what",
+        "why",
+        "how",
+        "when",
+        "which",
+        "should",
+        "would",
+        "could",
+        "into",
+        "out",
+        "then",
+        "than",
+        "them",
+        "they",
+        "there",
+        "here",
+        "its",
+        "our",
+        "use",
+        "using",
+        "make",
+        "made",
+        "get",
+        "got",
+        "want",
+        "need",
+        "like",
+        "just",
+        "also",
+        "more",
+        "most",
+        "some",
+        "one",
+        "two",
+        "now",
+        "new",
+        "add",
+        "put",
+        "let",
+        "see",
+        "via",
+        "per",
+        "yes",
+        "okay",
         # French (accent-tolerant: the corpus is often unaccented)
-        "les", "des", "une", "que", "qui", "pour", "dans", "avec", "sur", "pas",
-        "est", "sont", "fait", "faire", "fais", "plus", "moins", "mais", "donc",
-        "car", "comme", "tout", "tous", "toute", "cette", "ces", "son", "ses",
-        "leur", "vous", "nous", "elle", "ici", "etre", "etait", "avoir", "deja",
-        "encore", "bien", "tres", "peux", "peut", "veux", "veut", "oui", "non",
-        "ton", "tes", "mon", "mes", "par", "aux",
+        "les",
+        "des",
+        "une",
+        "que",
+        "qui",
+        "pour",
+        "dans",
+        "avec",
+        "sur",
+        "pas",
+        "est",
+        "sont",
+        "fait",
+        "faire",
+        "fais",
+        "plus",
+        "moins",
+        "mais",
+        "donc",
+        "car",
+        "comme",
+        "tout",
+        "tous",
+        "toute",
+        "cette",
+        "ces",
+        "son",
+        "ses",
+        "leur",
+        "vous",
+        "nous",
+        "elle",
+        "ici",
+        "etre",
+        "etait",
+        "avoir",
+        "deja",
+        "encore",
+        "bien",
+        "tres",
+        "peux",
+        "peut",
+        "veux",
+        "veut",
+        "oui",
+        "non",
+        "ton",
+        "tes",
+        "mon",
+        "mes",
+        "par",
+        "aux",
     }
 )
 
@@ -268,15 +370,11 @@ def _detect_merges(clusters: list[Cluster]) -> list[MergeSignal]:
         ]
         if len(blended) >= 2:
             blended.sort(key=lambda c: -cluster.category_counts[c])
-            merges.append(
-                MergeSignal(cluster.cluster_id, blended, cluster.top_terms)
-            )
+            merges.append(MergeSignal(cluster.cluster_id, blended, cluster.top_terms))
     return merges
 
 
-def _detect_splits(
-    clusters: list[Cluster], categories: list[str]
-) -> list[SplitSignal]:
+def _detect_splits(clusters: list[Cluster], categories: list[str]) -> list[SplitSignal]:
     """Categories scattered across many clusters with no dominant home."""
     # category → {cluster_id: count} across non-noise clusters.
     spread: dict[str, dict[int, int]] = {cat: {} for cat in categories}
@@ -307,15 +405,21 @@ def _detect_themes(clusters: list[Cluster]) -> list[ThemeSignal]:
         if cluster.dominant_category == "other" and cluster.purity >= _LATENT_OTHER_PURITY:
             themes.append(
                 ThemeSignal(
-                    cluster.cluster_id, "latent-other", cluster.purity,
-                    cluster.dominant_category, cluster.top_terms,
+                    cluster.cluster_id,
+                    "latent-other",
+                    cluster.purity,
+                    cluster.dominant_category,
+                    cluster.top_terms,
                 )
             )
         elif cluster.purity < _CROSS_CUTTING_PURITY:
             themes.append(
                 ThemeSignal(
-                    cluster.cluster_id, "cross-cutting", cluster.purity,
-                    cluster.dominant_category, cluster.top_terms,
+                    cluster.cluster_id,
+                    "cross-cutting",
+                    cluster.purity,
+                    cluster.dominant_category,
+                    cluster.top_terms,
                 )
             )
     return themes
@@ -501,8 +605,13 @@ def format_report(report: AuditReport) -> list[str]:
 def write_audit_csv(path: Path, report: AuditReport) -> None:
     """Write the alignment matrix + cluster labels (one row per cluster)."""
     columns = [
-        "cluster_id", "size", "dominant_category", "purity",
-        "top_terms", "representatives", *report.categories,
+        "cluster_id",
+        "size",
+        "dominant_category",
+        "purity",
+        "top_terms",
+        "representatives",
+        *report.categories,
     ]
     rows: list[dict[str, Any]] = []
     for c in report.clusters:
