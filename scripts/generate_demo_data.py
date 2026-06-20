@@ -32,6 +32,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from prompt_analytics import schema
+from prompt_analytics.context import (
+    NO_LANGUAGE,
+    ContextElement,
+    ContextRequest,
+    attribute_context_cost,
+)
 
 SEED = 20260611
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -416,6 +422,144 @@ def _output_composition(
     return output_files, output_tokens
 
 
+# Context composition (Axe D). Per project, the dominant language of the files
+# the assistant *reads* into context (the snapshot's file_read mix). Markdown is
+# added on top for every project (docs/plans are read everywhere).
+def _context_composition(
+    prompts: list[dict[str, object]],
+    categories: list[dict[str, object]],
+    requests: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Derive context_sources.csv + context_cost.csv from the generated rows.
+
+    Runs on its own RNG (``SEED + 3``) over the already-built prompts/requests,
+    so adding Axe D never perturbs the token/request streams (the committed
+    totals stay byte-identical). Per prompt we invent metrics-only element sizes
+    (a conversation turn, files read, tool output, a one-off config chunk), then
+    feed them through the very same :func:`attribute_context_cost` walk the
+    extractor uses -- so context_cost.csv reconciles to the demo's billed
+    main-chain cache tokens by construction, exactly like real data.
+    """
+    rng = random.Random(SEED + 3)
+    cat_by_pid = {
+        str(c["prompt_id"]): (str(c["category"]), int(c["complexity"])) for c in categories
+    }
+
+    # Per-session measured context elements (one ``ContextElement`` per piece).
+    elements_by_session: dict[str, list[ContextElement]] = {}
+    snapshot: dict[tuple[str, str, str], list[int]] = {}  # (sid,source,lang)->[tokens,items]
+
+    def _add(sid: str, pid: str, source: str, language: str, tokens: int) -> None:
+        if tokens <= 0:
+            return
+        elements_by_session.setdefault(sid, []).append(
+            ContextElement(prompt_id=pid, source=source, language=language, tokens=tokens)
+        )
+        bucket = snapshot.setdefault((sid, source, language), [0, 0])
+        bucket[0] += tokens
+        bucket[1] += 1
+
+    for prompt in prompts:
+        sid = str(prompt["session_id"])
+        pid = str(prompt["prompt_id"])
+        depth = int(prompt["prompt_index"])
+        project = str(prompt["project"])
+        code_lang, second_lang = PROJECT_LANGUAGES[project]
+        category, complexity = cat_by_pid.get(pid, ("other", 1))
+        scale = 0.6 + 0.25 * complexity
+
+        # The dialogue turn itself (prompt + assistant reply).
+        _add(
+            sid,
+            pid,
+            "conversation",
+            NO_LANGUAGE,
+            int(prompt["char_count"]) // 4 + rng.randint(60, 500),
+        )
+        # A one-off fixed prefix (system + CLAUDE.md + MCP) read in on turn 1.
+        if depth == 1:
+            _add(sid, pid, "config", NO_LANGUAGE, rng.randint(9000, 22000))
+        # Files read into context: code-heavy work reads the most.
+        if category in FILE_CATEGORIES or rng.random() < 0.5:
+            _add(sid, pid, "file_read", code_lang, int(rng.randint(700, 5200) * scale))
+            if rng.random() < 0.55:
+                _add(sid, pid, "file_read", "Markdown", rng.randint(300, 2600))
+            if rng.random() < 0.3:
+                _add(sid, pid, "file_read", second_lang, rng.randint(200, 2400))
+        # Tool output (Bash / Grep / Glob) for prompts that ran tools.
+        if int(prompt["tool_calls"]) > 0 and rng.random() < 0.8:
+            _add(sid, pid, "tool_output", NO_LANGUAGE, rng.randint(150, 2200))
+
+    # Pseudo-prompt (continuation) requests carry a compacted conversation that
+    # still gets re-read: give them a conversation element so the post-compaction
+    # rent is attributable (otherwise it would all read as (unattributed)).
+    seen_pseudo: set[tuple[str, str]] = set()
+    for req in requests:
+        pid = str(req["prompt_id"])
+        sid = str(req["session_id"])
+        if ":_continuation" in pid and (sid, pid) not in seen_pseudo:
+            seen_pseudo.add((sid, pid))
+            _add(sid, pid, "conversation", NO_LANGUAGE, rng.randint(2000, 9000))
+
+    # Main-chain requests per session, chronological (where the cache is billed).
+    reqs_by_session: dict[str, list[tuple[str, ContextRequest]]] = {}
+    for req in requests:
+        if int(req["is_sidechain"]):
+            continue
+        reqs_by_session.setdefault(str(req["session_id"]), []).append(
+            (
+                str(req["timestamp"]),
+                ContextRequest(
+                    prompt_id=str(req["prompt_id"]),
+                    model=str(req["model"]),
+                    cache_read=int(req["cache_read_tokens"]),
+                    cache_write_5m=int(req["cache_write_5m_tokens"]),
+                    cache_write_1h=int(req["cache_write_1h_tokens"]),
+                    post_compact=bool(int(req["post_compact"])),
+                ),
+            )
+        )
+
+    context_sources = [
+        {
+            "session_id": sid,
+            "source": source,
+            "language": language,
+            "tokens": tokens,
+            "items": items,
+        }
+        for (sid, source, language), (tokens, items) in snapshot.items()
+    ]
+    context_sources.sort(key=lambda r: (str(r["session_id"]), str(r["source"]), str(r["language"])))
+
+    context_cost: list[dict[str, object]] = []
+    for sid, elements in elements_by_session.items():
+        ordered = [req for _, req in sorted(reqs_by_session.get(sid, []), key=lambda r: r[0])]
+        attributed = attribute_context_cost(ordered, elements)
+        for (source, language, model), (rent, load_5m, load_1h) in attributed.items():
+            if rent or load_5m or load_1h:
+                context_cost.append(
+                    {
+                        "session_id": sid,
+                        "source": source,
+                        "language": language,
+                        "model": model,
+                        "rent_read_tokens": rent,
+                        "load_write_5m_tokens": load_5m,
+                        "load_write_1h_tokens": load_1h,
+                    }
+                )
+    context_cost.sort(
+        key=lambda r: (
+            str(r["session_id"]),
+            str(r["source"]),
+            str(r["language"]),
+            str(r["model"]),
+        )
+    )
+    return context_sources, context_cost
+
+
 def generate() -> dict[str, list[dict[str, object]]]:
     """Build all rows in memory (deterministic for a fixed seed)."""
     rng = random.Random(SEED)
@@ -580,6 +724,10 @@ def generate() -> dict[str, list[dict[str, object]]]:
     # a dedicated RNG, so it never shifts the streams above.
     output_files, output_tokens = _output_composition(prompts, categories, tokens_acc)
 
+    # Context composition (Axe D) -- derived on a dedicated RNG, reconciled to the
+    # billed main-chain cache tokens by reusing the production attribution walk.
+    context_sources, context_cost = _context_composition(prompts, categories, requests)
+
     return {
         "sessions": sessions,
         "prompts": prompts,
@@ -590,6 +738,8 @@ def generate() -> dict[str, list[dict[str, object]]]:
         "quota_log": quota_log,
         "output_files": output_files,
         "output_tokens": output_tokens,
+        "context_sources": context_sources,
+        "context_cost": context_cost,
     }
 
 
@@ -658,6 +808,10 @@ def main() -> None:
     _write_csv(OUT_DIR / "quota_log.csv", schema.QUOTA_LOG_COLS, data["quota_log"])
     _write_csv(OUT_DIR / "output_files.csv", schema.OUTPUT_FILES_COLS, data["output_files"])
     _write_csv(OUT_DIR / "output_tokens.csv", schema.OUTPUT_TOKENS_COLS, data["output_tokens"])
+    _write_csv(
+        OUT_DIR / "context_sources.csv", schema.CONTEXT_SOURCES_COLS, data["context_sources"]
+    )
+    _write_csv(OUT_DIR / "context_cost.csv", schema.CONTEXT_COST_COLS, data["context_cost"])
 
     # A config.yml so the dashboard's gated pages (categorization, quota) light up.
     (OUT_DIR / "config.yml").write_text(
@@ -671,7 +825,9 @@ def main() -> None:
         f"{len(data['tokens'])} token rows, {len(data['requests'])} request rows, "
         f"{len(data['quota_log'])} quota snapshots, "
         f"{len(data['output_files'])} output-file rows, "
-        f"{len(data['output_tokens'])} output-token rows."
+        f"{len(data['output_tokens'])} output-token rows, "
+        f"{len(data['context_sources'])} context-source rows, "
+        f"{len(data['context_cost'])} context-cost rows."
     )
 
 

@@ -111,6 +111,18 @@ def test_by_output_empty_history_hints(fake_claude):
     assert main(_args(fake_claude, "by-output")) == 1
 
 
+def test_by_context_dispatch(fake_claude, capsys):
+    fake_claude.add("session_output.jsonl", project="out")
+    assert main(_args(fake_claude, "by-context")) == 0
+    out = capsys.readouterr().out
+    assert "Context cost over time" in out
+
+
+def test_by_context_empty_history_hints(fake_claude):
+    # No JSONL history at all -> the usual "no data" path (exit 1), not a crash.
+    assert main(_args(fake_claude, "by-context")) == 1
+
+
 def test_prompts_dispatch(data, capsys):
     assert main(_args(data, "prompts", "--top", "2")) == 0
     out = capsys.readouterr().out

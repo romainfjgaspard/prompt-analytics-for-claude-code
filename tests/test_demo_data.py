@@ -118,6 +118,41 @@ def test_demo_output_files_are_metrics_only():
         assert int(row["lines_added"]) >= 0 and int(row["files"]) >= 1
 
 
+def test_committed_context_composition_matches_generator(generated):
+    """context_sources.csv / context_cost.csv stay in sync with the generator."""
+    assert len(_read_csv("context_sources.csv")) == len(generated["context_sources"])
+    assert len(_read_csv("context_cost.csv")) == len(generated["context_cost"])
+
+
+def test_demo_context_cost_reconciles_with_billed_cache():
+    """Axe D invariant: attributed rent/load == billed main-chain cache, to the token."""
+    main = [r for r in _read_csv("requests.csv") if r["is_sidechain"] == "0"]
+    cost = _read_csv("context_cost.csv")
+    assert cost, "the demo must ship a context_cost.csv"
+    assert sum(int(r["rent_read_tokens"]) for r in cost) == sum(
+        int(r["cache_read_tokens"]) for r in main
+    )
+    assert sum(int(r["load_write_5m_tokens"]) for r in cost) == sum(
+        int(r["cache_write_5m_tokens"]) for r in main
+    )
+    assert sum(int(r["load_write_1h_tokens"]) for r in cost) == sum(
+        int(r["cache_write_1h_tokens"]) for r in main
+    )
+
+
+def test_demo_context_is_metrics_only():
+    """No content / file paths leak into the Axe D CSVs (privacy guard)."""
+    for name in ("context_sources.csv", "context_cost.csv"):
+        rows = _read_csv(name)
+        assert rows
+        for row in rows:
+            assert "/" not in row.get("session_id", "")
+    # File languages are labels, never paths or content.
+    langs = {r["language"] for r in _read_csv("context_sources.csv")}
+    assert "Python" in langs or "Markdown" in langs
+    assert not any("." in lang and "/" in lang for lang in langs)
+
+
 def test_demo_represents_the_new_dimensions():
     tokens = _read_csv("tokens.csv")
     requests = _read_csv("requests.csv")

@@ -726,6 +726,130 @@ def test_output_composition_code_tokens_without_file_edit_go_to_tooling():
     assert comp.code_cost > 0
 
 
+# ---------------------------------------------------------------------------
+# by_context: context cost over time (Axe D, D2).
+# ---------------------------------------------------------------------------
+
+
+def _context_cost_ds() -> Dataset:
+    """Context cost rows + the matching main-chain requests (opus rates).
+
+    opus: cache_read $0.5/1M, cache_write_5m $6.25/1M, cache_write_1h $10/1M.
+
+    * file_read Python: rent 2M ($1.00), load_5m 1M ($6.25) -> total $7.25
+    * conversation:     rent 1M ($0.50), load_1h 0.1M ($1.00) -> total $1.50
+    * (unattributed):   rent 0.2M ($0.10)
+
+    Bill: cache_read 3.2M ($1.60) + write_5m 1M ($6.25) + write_1h 0.1M ($1.00)
+    = $8.85, which the attributed $8.75 + $0.10 unattributed reconciles to.
+    """
+    context_cost = [
+        {
+            "session_id": "s1",
+            "source": "file_read",
+            "language": "Python",
+            "model": OPUS,
+            "rent_read_tokens": 2_000_000,
+            "load_write_5m_tokens": 1_000_000,
+            "load_write_1h_tokens": 0,
+        },
+        {
+            "session_id": "s1",
+            "source": "conversation",
+            "language": "-",
+            "model": OPUS,
+            "rent_read_tokens": 1_000_000,
+            "load_write_5m_tokens": 0,
+            "load_write_1h_tokens": 100_000,
+        },
+        {
+            "session_id": "s1",
+            "source": "(unattributed)",
+            "language": "-",
+            "model": OPUS,
+            "rent_read_tokens": 200_000,
+            "load_write_5m_tokens": 0,
+            "load_write_1h_tokens": 0,
+        },
+    ]
+    requests = [
+        {
+            "session_id": "s1",
+            "prompt_id": "p1",
+            "model": OPUS,
+            "is_sidechain": 0,
+            "cache_read_tokens": 3_200_000,
+            "cache_write_5m_tokens": 1_000_000,
+            "cache_write_1h_tokens": 100_000,
+        },
+        # A subagent request carries its own context: excluded from the bill.
+        {
+            "session_id": "s1",
+            "prompt_id": "p1",
+            "model": OPUS,
+            "is_sidechain": 1,
+            "cache_read_tokens": 9_000_000,
+            "cache_write_5m_tokens": 0,
+            "cache_write_1h_tokens": 0,
+        },
+    ]
+    return Dataset(
+        sessions=[{"session_id": "s1", "project": "alpha"}],
+        prompts=[{"session_id": "s1", "prompt_id": "p1", "project": "alpha", "model": OPUS}],
+        tokens=[],
+        categories={},
+        source="test data",
+        requests=requests,
+        context_cost=context_cost,
+    )
+
+
+def test_context_cost_splits_load_and_rent_per_element():
+    comp = analytics.context_cost(_context_cost_ds(), "anthropic")
+    by_src = {(e.source, e.language): e for e in comp.elements}
+    python = by_src[("file_read", "Python")]
+    assert python.load_cost == pytest.approx(6.25, abs=1e-6)
+    assert python.rent_cost == pytest.approx(1.00, abs=1e-6)
+    conv = by_src[("conversation", "-")]
+    assert conv.load_cost == pytest.approx(1.00, abs=1e-6)
+    assert conv.rent_cost == pytest.approx(0.50, abs=1e-6)
+    # (unattributed) is kept out of the elements but folded into the residual.
+    assert ("(unattributed)", "-") not in by_src
+    assert comp.unattributed_cost == pytest.approx(0.10, abs=1e-6)
+
+
+def test_context_cost_reconciles_to_the_billed_main_chain():
+    ds = _context_cost_ds()
+    comp = analytics.context_cost(ds, "anthropic")
+    engine = analytics.CostEngine("anthropic")
+    bill = analytics._main_chain_cache_cost(ds, engine)
+    assert comp.total_cost == pytest.approx(8.85, abs=1e-6)
+    assert comp.total_cost == pytest.approx(bill, abs=1e-6)  # subagent read excluded
+    assert comp.attributed_cost == pytest.approx(8.75, abs=1e-6)
+
+
+def test_by_context_table_sorted_with_total_and_unattributed():
+    result = analytics.by_context(_context_cost_ds(), "anthropic")
+    # Sorted by total cost: file_read Python ($7.25) before conversation ($1.50),
+    # then the (unattributed) line, then TOTAL last.
+    labels = [(r["source"], r["language"]) for r in result.rows]
+    assert labels[0] == ("Files read", "Python")
+    assert labels[1] == ("Conversation", "-")
+    assert ("(unattributed)", "-") in labels
+    assert labels[-1] == ("TOTAL", "")
+    total = result.rows[-1]
+    assert total["total_usd"] == pytest.approx(8.85, abs=1e-4)
+    recon = next(n for n in result.notes if n.startswith("Reconciliation"))
+    assert "$8.75" in recon and "$8.85" in recon
+
+
+def test_by_context_empty_dataset_hints_to_extract():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test data")
+    result = analytics.by_context(empty, "anthropic")
+    assert result.rows == []
+    assert any("No context-cost data" in n for n in result.notes)
+
+
 def test_filter_prompt_ids_narrows_output_rows():
     ds = _output_ds()
     kept = analytics.filter_prompt_ids(ds, {"p1"})

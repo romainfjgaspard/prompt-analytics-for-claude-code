@@ -37,6 +37,8 @@ __all__ = [
     "OUTPUT_FILES_COLS",
     "OUTPUT_TOKENS_COLS",
     "CONTEXT_SOURCES_COLS",
+    "CONTEXT_COST_COLS",
+    "UNATTRIBUTED_SOURCE",
     "ToolEdit",
     "ContextItem",
     "ParsedPrompt",
@@ -49,6 +51,7 @@ __all__ = [
     "OutputFileRow",
     "OutputTokenRow",
     "ContextSourceRow",
+    "ContextCostRow",
     "continuation_prompt_id",
 ]
 
@@ -184,6 +187,33 @@ OUTPUT_TOKENS_COLS = ["prompt_id", "output_prose_tokens", "output_code_tokens"]
 # (the API never reports a per-element token count). Metrics only -- no content,
 # no file paths, ever reach this CSV.
 CONTEXT_SOURCES_COLS = ["session_id", "source", "language", "tokens", "items"]
+
+# Context cost-over-time (Axe D, the "real cost of a context element"). Long: one
+# row per ``(session_id, source, language, model)``. The real per-request cache
+# tokens of the main chain are attributed across the context elements present
+# that turn -- ``rent_read_tokens`` is the cumulative ``cache_read`` (the rent an
+# element pays every turn it stays in context: size x turns of presence),
+# ``load_write_5m_tokens``/``load_write_1h_tokens`` the one-off ``cache_write``
+# of loading it. ``model`` is carried (like ``tokens.csv``) because pricing is
+# per model. Cache that lands on a turn with no measured element (chiefly the
+# synthetic post-compaction summary) is kept under the ``(unattributed)`` source
+# so the per-source split still reconciles to the billed total exactly. Metrics
+# only -- raw token counts, no content, no file paths, priced at read time.
+CONTEXT_COST_COLS = [
+    "session_id",
+    "source",
+    "language",
+    "model",
+    "rent_read_tokens",
+    "load_write_5m_tokens",
+    "load_write_1h_tokens",
+]
+
+# Source label for cache tokens that cannot be tied to a measured context
+# element (turns before any element entered, or the post-compaction summary we
+# never persist as content). It absorbs the residual so the reconciliation is
+# exact; its size is the honest measure of the ``parentUuid`` ~= API-context gap.
+UNATTRIBUTED_SOURCE = "(unattributed)"
 
 
 def continuation_prompt_id(session_id: str) -> str:
@@ -406,3 +436,21 @@ class ContextSourceRow(TypedDict):
     language: str
     tokens: int
     items: int
+
+
+class ContextCostRow(TypedDict):
+    """One row of ``context_cost.csv`` (Axe D, cost-over-time by source/model).
+
+    ``rent_read_tokens`` is the real ``cache_read`` of the session's main chain
+    attributed to this ``(source, language)`` across every turn it stayed in
+    context (size x turns of presence); the two ``load_write_*`` columns are the
+    one-off ``cache_write`` of caching it. Raw counts, priced at read time.
+    """
+
+    session_id: str
+    source: str
+    language: str
+    model: str
+    rent_read_tokens: int
+    load_write_5m_tokens: int
+    load_write_1h_tokens: int

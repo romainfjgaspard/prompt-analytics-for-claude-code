@@ -33,8 +33,15 @@ from pathlib import Path
 from typing import Any
 
 from . import extract, paths
+from .context import NO_LANGUAGE
 from .pricing import get_model_pricing, get_per_request, is_long_context, load_pricing
-from .schema import REQUESTS_COLS, TOKEN_TYPE_LABELS, TOKEN_TYPES, TOKENS_COLS
+from .schema import (
+    REQUESTS_COLS,
+    TOKEN_TYPE_LABELS,
+    TOKEN_TYPES,
+    TOKENS_COLS,
+    UNATTRIBUTED_SOURCE,
+)
 
 __all__ = [
     "Column",
@@ -56,6 +63,10 @@ __all__ = [
     "output_composition",
     "OutputComposition",
     "LanguageComposition",
+    "by_context",
+    "context_cost",
+    "ContextCost",
+    "ContextElementCost",
     "top_prompts",
     "sessions_table",
     "session_depth",
@@ -172,6 +183,10 @@ class Dataset:
     # (session_id, source, language): the local-tokenizer size of each context
     # source. Empty when reading a pre-Axe-D extract.
     context_sources: list[dict[str, Any]] = field(default_factory=list)
+    # Context cost over time (Axe D, D2). Long per (session, source, language,
+    # model): the real cache tokens attributed by size x turns of presence (rent)
+    # and one-off loading (write). Empty when reading a pre-D2 extract.
+    context_cost: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
@@ -297,6 +312,7 @@ def load_dataset(
         output_files=[dict(row) for row in result.output_files],
         output_tokens=[dict(row) for row in result.output_tokens],
         context_sources=[dict(row) for row in result.context_sources],
+        context_cost=[dict(row) for row in result.context_cost],
     )
 
 
@@ -329,12 +345,17 @@ def dataset_from_csvs(
     output_files = _rows("output_files.csv")
     output_tokens = _rows("output_tokens.csv")
     context_sources = _rows("context_sources.csv")
+    context_cost = _rows("context_cost.csv")
     _coerce_int(prompts, ("prompt_index", "char_count", "assistant_turns", "tool_calls"))
     _coerce_int(tokens, ("token_count", "is_sidechain"))
     _coerce_int(requests, _REQUEST_INT_COLS)
     _coerce_int(output_files, ("files", "lines_added", "lines_deleted"))
     _coerce_int(output_tokens, ("output_prose_tokens", "output_code_tokens"))
     _coerce_int(context_sources, ("tokens", "items"))
+    _coerce_int(
+        context_cost,
+        ("rent_read_tokens", "load_write_5m_tokens", "load_write_1h_tokens"),
+    )
     if source is None:
         window = _window_label(data_dir)
         source = f"{data_dir} CSVs ({window})" if window else f"{data_dir} CSVs"
@@ -349,6 +370,7 @@ def dataset_from_csvs(
         output_files=output_files,
         output_tokens=output_tokens,
         context_sources=context_sources,
+        context_cost=context_cost,
     )
 
 
@@ -376,6 +398,7 @@ def filter_project(ds: Dataset, project: str) -> Dataset:
         output_files=[row for row in ds.output_files if row["prompt_id"] in kept_prompt_ids],
         output_tokens=[row for row in ds.output_tokens if row["prompt_id"] in kept_prompt_ids],
         context_sources=[row for row in ds.context_sources if row["session_id"] in session_ids],
+        context_cost=[row for row in ds.context_cost if row["session_id"] in session_ids],
     )
 
 
@@ -429,6 +452,7 @@ def filter_dates(ds: Dataset, since: str | None, until: str | None) -> Dataset:
         context_sources=[
             row for row in ds.context_sources if row["session_id"] in kept_session_ids
         ],
+        context_cost=[row for row in ds.context_cost if row["session_id"] in kept_session_ids],
     )
 
 
@@ -454,6 +478,7 @@ def filter_prompt_ids(ds: Dataset, prompt_ids: set[str] | frozenset[str]) -> Dat
         output_tokens=[row for row in ds.output_tokens if row.get("prompt_id") in kept],
         # Session-grain context rows ride along unnarrowed, like sessions.
         context_sources=ds.context_sources,
+        context_cost=ds.context_cost,
     )
 
 
@@ -1172,6 +1197,233 @@ def by_output(ds: Dataset, provider: str) -> TableResult:
             Column("lines_deleted", "Lines −", "int"),
             Column("test_pct", "Test %", "pct"),
             Column("share_pct", "Lines %", "pct"),
+        ],
+        rows,
+        notes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axe D: context cost over time (D2) -- the real cost of a context element.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ContextElementCost:
+    """One context element's cost split into loading vs rent (Axe D).
+
+    ``rent_cost`` is the priced ``cache_read`` the element paid for staying in
+    context turn after turn (size x turns of presence); ``load_cost`` the one-off
+    ``cache_write`` of caching it. ``language`` is meaningful for ``file_read``
+    (``-`` otherwise).
+    """
+
+    source: str
+    language: str
+    load_cost: float
+    rent_cost: float
+
+    @property
+    def total_cost(self) -> float:
+        return self.load_cost + self.rent_cost
+
+
+@dataclass(frozen=True)
+class ContextCost:
+    """Structured Axe-D context cost-over-time metrics (shared by CLI + dashboard).
+
+    ``elements`` is sorted by total cost (descending), the real cache spend each
+    context source/language drove. The headline split is loading (one-off cache
+    writes) vs rent (cache reads paid every turn the element stays in context).
+    ``unattributed_cost`` is cache that landed on a turn with no measured element
+    (the post-compaction summary, pre-context turns): it keeps the total honest
+    so ``load + rent`` reconciles to the billed main-chain cache cost exactly.
+    """
+
+    provider: str
+    elements: list[ContextElementCost]
+    load_cost: float
+    rent_cost: float
+    unattributed_cost: float
+
+    @property
+    def total_cost(self) -> float:
+        return self.load_cost + self.rent_cost
+
+    @property
+    def attributed_cost(self) -> float:
+        return self.total_cost - self.unattributed_cost
+
+    @property
+    def has_data(self) -> bool:
+        return bool(self.elements)
+
+
+def context_cost(ds: Dataset, provider: str) -> ContextCost:
+    """Compute the Axe-D context cost-over-time metrics (see :class:`ContextCost`).
+
+    Prices the per-element cache tokens ``extract`` attributed (rent = the real
+    ``cache_read`` spread by size x turns of presence; load = the one-off
+    ``cache_write``) on ``provider``, aggregating per ``(source, language)``
+    across models. The pure numbers feed both :func:`by_context` (the CLI table)
+    and the dashboard, so the two never drift. Metrics only -- no content is read.
+    """
+    engine = CostEngine(provider, ds.pricing_path)
+    load: dict[tuple[str, str], float] = defaultdict(float)
+    rent: dict[tuple[str, str], float] = defaultdict(float)
+    for row in ds.context_cost:
+        model = row.get("model") or ""
+        key = (row.get("source") or "", row.get("language") or NO_LANGUAGE)
+        rent[key] += engine.cost(model, "cache_read", int(row.get("rent_read_tokens") or 0))
+        load[key] += engine.cost(
+            model, "cache_write_5m", int(row.get("load_write_5m_tokens") or 0)
+        ) + engine.cost(model, "cache_write_1h", int(row.get("load_write_1h_tokens") or 0))
+
+    keys = set(load) | set(rent)
+    elements = [
+        ContextElementCost(
+            source=source,
+            language=language,
+            load_cost=round(load.get((source, language), 0.0), 6),
+            rent_cost=round(rent.get((source, language), 0.0), 6),
+        )
+        for source, language in keys
+        if source != UNATTRIBUTED_SOURCE
+    ]
+    elements.sort(key=lambda e: (-e.total_cost, e.source, e.language))
+    unattributed = sum(
+        load.get(k, 0.0) + rent.get(k, 0.0) for k in keys if k[0] == UNATTRIBUTED_SOURCE
+    )
+    return ContextCost(
+        provider=provider,
+        elements=elements,
+        load_cost=round(sum(load.values()), 6),
+        rent_cost=round(sum(rent.values()), 6),
+        unattributed_cost=round(unattributed, 6),
+    )
+
+
+# Source -> human label for the context cost table (the four-bucket taxonomy).
+_CONTEXT_SOURCE_LABELS = {
+    "conversation": "Conversation",
+    "file_read": "Files read",
+    "tool_output": "Tool output",
+    "config": "Config / setup",
+    UNATTRIBUTED_SOURCE: "(unattributed)",
+}
+
+
+def _main_chain_cache_cost(ds: Dataset, engine: CostEngine) -> float:
+    """The billed cache cost (read + writes) of every non-sidechain request.
+
+    The ground truth the attributed context cost reconciles to: the bill for the
+    main conversation's context (subagent requests carry their own context and
+    are excluded from the snapshot, hence from here too)."""
+    total = 0.0
+    for row in ds.requests:
+        if row.get("is_sidechain"):
+            continue
+        model = row.get("model") or ""
+        total += engine.cost(model, "cache_read", int(row.get("cache_read_tokens") or 0))
+        total += _request_write_cost(engine, row)
+    return total
+
+
+def by_context(ds: Dataset, provider: str) -> TableResult:
+    """Context cost over time (Axe D): the real cost of what fills the context.
+
+    Each context source/language is one row, split into the one-off **loading**
+    cost (cache writes) and the **rent** it pays every turn it stays in context
+    (cache reads = size x turns of presence) -- the differentiator: "this file
+    cost $X to load and $Y of rent". The attributed totals reconcile to the
+    billed main-chain cache cost to the dollar; cache that cannot be tied to a
+    measured element (chiefly post-compaction summaries -- the ``parentUuid`` ~=
+    API-context caveat) is shown honestly as ``(unattributed)``. Metrics only.
+    The pure computation lives in :func:`context_cost` (shared with the dashboard).
+    """
+    comp = context_cost(ds, provider)
+    engine = CostEngine(provider, ds.pricing_path)
+
+    rows: list[dict[str, Any]] = []
+    total = comp.total_cost
+    for element in comp.elements:
+        rows.append(
+            {
+                "source": _CONTEXT_SOURCE_LABELS.get(element.source, element.source),
+                "language": element.language,
+                "load_usd": round(element.load_cost, 4),
+                "rent_usd": round(element.rent_cost, 4),
+                "total_usd": round(element.total_cost, 4),
+                "share_pct": round(100 * element.total_cost / total, 1) if total else 0.0,
+            }
+        )
+    if comp.unattributed_cost:
+        rows.append(
+            {
+                "source": _CONTEXT_SOURCE_LABELS[UNATTRIBUTED_SOURCE],
+                "language": NO_LANGUAGE,
+                "load_usd": None,
+                "rent_usd": None,
+                "total_usd": round(comp.unattributed_cost, 4),
+                "share_pct": round(100 * comp.unattributed_cost / total, 1) if total else 0.0,
+            }
+        )
+    if rows:
+        rows.append(
+            {
+                "source": "TOTAL",
+                "language": "",
+                "load_usd": round(comp.load_cost, 4),
+                "rent_usd": round(comp.rent_cost, 4),
+                "total_usd": round(total, 4),
+                "share_pct": 100.0 if total else 0.0,
+            }
+        )
+
+    notes = [_source_note(ds)]
+    if not ds.context_cost:
+        notes.append(
+            "No context-cost data -- re-run `prompt-analytics extract` "
+            "(these metrics ship with the latest extractor)."
+        )
+    if comp.has_data and total:
+        rent_share = round(100 * comp.rent_cost / total, 1)
+        notes.append(
+            f"Loading vs rent: ${comp.load_cost:,.2f} to cache the context once, "
+            f"${comp.rent_cost:,.2f} of rent re-reading it every turn it stays "
+            f"({rent_share}% of the cache bill is rent -- the cost of context that "
+            "lingers; that is what /compact and a leaner CLAUDE.md cut)."
+        )
+        top = comp.elements[0]
+        notes.append(
+            f"Top context cost: {_CONTEXT_SOURCE_LABELS.get(top.source, top.source)}"
+            + (f" ({top.language})" if top.language != NO_LANGUAGE else "")
+            + f" at ${top.total_cost:,.2f} "
+            f"(${top.load_cost:,.2f} load + ${top.rent_cost:,.2f} rent)."
+        )
+        bill = _main_chain_cache_cost(ds, engine)
+        unattr_share = round(100 * comp.unattributed_cost / total, 1) if total else 0.0
+        notes.append(
+            f"Reconciliation: attributed ${comp.attributed_cost:,.2f} + "
+            f"${comp.unattributed_cost:,.2f} unattributed = ${total:,.2f}, the billed "
+            f"main-chain cache cost (${bill:,.2f}). The {unattr_share}% unattributed is "
+            "cache on turns with no measured element (post-compaction summaries / "
+            "pre-context turns): the parentUuid chain approximates the API context."
+        )
+    if (note := engine.note()) is not None:
+        notes.append(note)
+    if (lc_note := engine.long_context_note()) is not None:
+        notes.append(lc_note)
+
+    return TableResult(
+        f"Context cost over time ({provider})",
+        [
+            Column("source", "Source"),
+            Column("language", "Language"),
+            Column("load_usd", "Load $", "money"),
+            Column("rent_usd", "Rent $", "money"),
+            Column("total_usd", "Total $", "money"),
+            Column("share_pct", "Share", "pct"),
         ],
         rows,
         notes,

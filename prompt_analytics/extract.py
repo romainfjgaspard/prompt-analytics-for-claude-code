@@ -54,12 +54,16 @@ from . import paths
 from .compose import aggregate_output_files, analyze_assistant_content
 from .context import (
     NO_LANGUAGE,
+    ContextElement,
+    ContextRequest,
     assistant_tool_metas,
     attachment_item,
+    attribute_context_cost,
     result_text,
 )
 from .pricing import get_model_pricing
 from .schema import (
+    CONTEXT_COST_COLS,
     CONTEXT_SOURCES_COLS,
     OUTPUT_FILES_COLS,
     OUTPUT_TOKENS_COLS,
@@ -72,6 +76,7 @@ from .schema import (
     TOKEN_TYPES,
     TOKEN_TYPES_COLS,
     TOKENS_COLS,
+    ContextCostRow,
     ContextItem,
     ContextSourceRow,
     OutputFileRow,
@@ -759,6 +764,7 @@ class ExtractResult:
     output_files: list[OutputFileRow]
     output_tokens: list[OutputTokenRow]
     context_sources: list[ContextSourceRow]
+    context_cost: list[ContextCostRow]
 
 
 def collect(
@@ -823,6 +829,10 @@ def collect(
     pending_context: list[tuple[str, ContextItem]] = []
     conv_tokens: Counter[str] = Counter()  # session_id -> conversation tokens
     conv_items: Counter[str] = Counter()  # session_id -> conversation pieces
+    # Axe D (D2): the conversation size at *prompt* grain, so the cost-over-time
+    # walk knows when each turn of dialogue entered context (the snapshot above
+    # only needs the per-session total). (session_id, prompt_id) -> tokens.
+    conv_by_prompt: Counter[tuple[str, str]] = Counter()
 
     def _in_window(ts: datetime | None) -> bool:
         if ts is None:
@@ -874,6 +884,7 @@ def collect(
             # Axe D: the prompt text is the user's contribution to conversation.
             conv_tokens[session_id] += prompt["text_tokens"]
             conv_items[session_id] += 1
+            conv_by_prompt[(session_id, pid)] += prompt["text_tokens"]
 
         for record in parsed["usage"]:
             pending_usage.append((session_id, record))
@@ -940,16 +951,17 @@ def collect(
         # Axe D: a main-thread assistant turn (its text + tool_use blocks, sized
         # by the local tokenizer) stays in context as conversation. Sidechain
         # turns live in the subagent's context and are excluded.
-        if not record["is_sidechain"]:
-            turn_tokens = record["prose_tokens"] + record["code_tokens"]
-            if turn_tokens:
-                conv_tokens[session_id] += turn_tokens
-                conv_items[session_id] += 1
+        turn_tokens = record["prose_tokens"] + record["code_tokens"]
+        if not record["is_sidechain"] and turn_tokens:
+            conv_tokens[session_id] += turn_tokens
+            conv_items[session_id] += 1
 
         pid = record["prompt_id"]
         agg = prompt_aggs.get(pid)
         side = 1 if record["is_sidechain"] else 0
         if agg is not None:
+            if not record["is_sidechain"] and turn_tokens:
+                conv_by_prompt[(agg.session_id, pid)] += turn_tokens
             # Sidechain usage is attached to the parent prompt's cost but
             # excluded from assistant_turns / tool_calls (3.6).
             for token_type, count in record["tokens"].items():
@@ -974,6 +986,8 @@ def collect(
             # Session overhead: continuation tails (no prompt id) keep the
             # ``:_continuation`` pseudo id; filtered fake prompts keep theirs.
             pseudo = pid or continuation_prompt_id(session_id)
+            if not record["is_sidechain"] and turn_tokens:
+                conv_by_prompt[(session_id, pseudo)] += turn_tokens
             bucket = overhead_tokens.setdefault((session_id, pseudo), Counter())
             for token_type, count in record["tokens"].items():
                 bucket[(record["model"], token_type, side)] += count
@@ -1101,6 +1115,9 @@ def collect(
     # session-level ratio, not sliced mid-session).
     seen_context_ids: set[str] = set()
     context_by_session: dict[str, dict[tuple[str, str], list[int]]] = defaultdict(dict)
+    # Axe D (D2): the same deduplicated items at prompt grain feed the
+    # cost-over-time walk -- (session_id, prompt_id, source, language) -> tokens.
+    items_by_prompt: dict[str, Counter[tuple[str, str, str]]] = defaultdict(Counter)
     for session_id, item in pending_context:
         dedup_id = item["dedup_id"]
         if dedup_id:
@@ -1112,6 +1129,8 @@ def collect(
         )
         ctx_bucket[0] += item["tokens"]
         ctx_bucket[1] += 1
+        item_pid = item["prompt_id"] or continuation_prompt_id(session_id)
+        items_by_prompt[session_id][(item_pid, item["source"], item["language"])] += item["tokens"]
 
     context_source_rows: list[ContextSourceRow] = []
     for session_id in included_sessions:
@@ -1138,6 +1157,67 @@ def collect(
                 )
             )
 
+    # --- Axe D context cost over time (D2: rent vs load per element). --------
+    # Group the conversation pieces and the main-chain requests by session, then
+    # walk each session: the real per-request cache tokens are attributed across
+    # the context elements present that turn (see context.attribute_context_cost).
+    # The result reconciles to the billed main-chain cache_read/cache_write of the
+    # session exactly; the (unattributed) bucket absorbs cache that lands on a
+    # turn with no measured element (the parentUuid ~= API-context gap, D2 caveat).
+    conv_by_session: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for (session_id, prompt_id), tokens_count in conv_by_prompt.items():
+        if tokens_count:
+            conv_by_session[session_id].append((prompt_id, tokens_count))
+    requests_by_session: dict[str, list[tuple[str, ContextRequest]]] = defaultdict(list)
+    for (session_id, prompt_id), records in request_records.items():
+        for record in records:
+            if record["is_sidechain"]:
+                continue  # the subagent's context is its own, not this snapshot's
+            tokens = record["tokens"]
+            requests_by_session[session_id].append(
+                (
+                    record["timestamp"],
+                    ContextRequest(
+                        prompt_id=prompt_id,
+                        model=record["model"],
+                        cache_read=tokens.get("cache_read", 0),
+                        cache_write_5m=tokens.get("cache_write_5m", 0),
+                        cache_write_1h=tokens.get("cache_write_1h", 0),
+                        post_compact=record["post_compact"],
+                    ),
+                )
+            )
+
+    context_cost_rows: list[ContextCostRow] = []
+    for session_id in included_sessions:
+        elements = [
+            ContextElement(prompt_id, "conversation", NO_LANGUAGE, tokens_count)
+            for prompt_id, tokens_count in conv_by_session.get(session_id, [])
+        ]
+        elements.extend(
+            ContextElement(prompt_id, source, language, tokens_count)
+            for (prompt_id, source, language), tokens_count in items_by_prompt.get(
+                session_id, {}
+            ).items()
+        )
+        requests = [
+            req for _, req in sorted(requests_by_session.get(session_id, []), key=lambda r: r[0])
+        ]
+        attributed = attribute_context_cost(requests, elements)
+        for (source, language, model), (rent, load_5m, load_1h) in attributed.items():
+            if rent or load_5m or load_1h:
+                context_cost_rows.append(
+                    ContextCostRow(
+                        session_id=session_id,
+                        source=source,
+                        language=language,
+                        model=model,
+                        rent_read_tokens=rent,
+                        load_write_5m_tokens=load_5m,
+                        load_write_1h_tokens=load_1h,
+                    )
+                )
+
     session_rows: list[SessionRow] = []
     for session_id in included_sessions:
         row = sessions.get(session_id)
@@ -1163,6 +1243,7 @@ def collect(
     output_file_rows.sort(key=lambda r: (r["prompt_id"], r["language"], r["kind"]))
     output_token_rows.sort(key=lambda r: r["prompt_id"])
     context_source_rows.sort(key=lambda r: (r["session_id"], r["source"], r["language"]))
+    context_cost_rows.sort(key=lambda r: (r["session_id"], r["source"], r["language"], r["model"]))
 
     # --- Finalize the report. ------------------------------------------------
     report.sessions = len(session_rows)
@@ -1194,6 +1275,7 @@ def collect(
         output_files=output_file_rows,
         output_tokens=output_token_rows,
         context_sources=context_source_rows,
+        context_cost=context_cost_rows,
     )
 
 
@@ -1255,6 +1337,9 @@ def run_extract(
     atomic_write_csv(
         output_dir / "context_sources.csv", CONTEXT_SOURCES_COLS, result.context_sources
     )
+    # Axe D cost over time (metrics only -- raw cache tokens attributed by size,
+    # priced at read time; reconciles to the billed main-chain cache totals).
+    atomic_write_csv(output_dir / "context_cost.csv", CONTEXT_COST_COLS, result.context_cost)
     # Window marker (1.5): a windowed extract must never be served later as if
     # it covered the full history -- readers append it to their Source line.
     atomic_write_json(

@@ -93,6 +93,7 @@ def test_full_extract_produces_all_csvs(fake_claude):
         "token_types.csv",
         "prompts_text.csv",
         "context_sources.csv",
+        "context_cost.csv",
         "extract_meta.json",
     ):
         assert (out / name).exists(), f"missing {name}"
@@ -975,3 +976,151 @@ def test_context_sources_respect_date_window(fake_claude):
     fake_claude.write("session_context.jsonl", _ctx_events(), project="ctx")
     run_extract(fake_claude.out, since="2026-07-01", timezone_name="UTC")
     assert _read_csv(fake_claude.out / "context_sources.csv") == []
+
+
+# ---------------------------------------------------------------------------
+# Axe D (D2): context cost over time (context_cost.csv) -- the rigour signature
+# is that the attributed cache tokens reconcile to the billed main chain.
+# ---------------------------------------------------------------------------
+
+
+def _cost_events(sid="sess-cost"):
+    """A multi-turn session carrying real cache usage across its requests."""
+
+    def a(uuid, parent, req, content, usage):
+        return {
+            "type": "assistant",
+            "uuid": uuid,
+            "parentUuid": parent,
+            "requestId": req,
+            "timestamp": f"2026-06-08T10:0{req[-1]}:01.000Z",
+            "sessionId": sid,
+            "cwd": _CTX_CWD,
+            "message": {
+                "id": f"m-{req}",
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "stop_reason": "end_turn",
+                "content": content,
+                "usage": usage,
+            },
+        }
+
+    def u(uuid, parent, content, **extra):
+        return {
+            "type": "user",
+            "uuid": uuid,
+            "parentUuid": parent,
+            "timestamp": "2026-06-08T10:00:00.000Z",
+            "sessionId": sid,
+            "cwd": _CTX_CWD,
+            "message": {"role": "user", "content": content},
+            **extra,
+        }
+
+    def result(tool_id, content):
+        return [{"type": "tool_result", "tool_use_id": tool_id, "content": content}]
+
+    return [
+        u("u1", None, _PROMPT_TEXT, promptId="pc1"),
+        # Turn 1: fresh input + big cache writes (loading the context).
+        a(
+            "a1",
+            "u1",
+            "req1",
+            _A_READ,
+            {
+                "input_tokens": 50,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 8000,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 6000,
+                    "ephemeral_1h_input_tokens": 2000,
+                },
+            },
+        ),
+        u("u2", "a1", result("tR1", _PY)),
+        # Turn 2: the context is hot, re-read as cache_read (rent).
+        a(
+            "a2",
+            "u2",
+            "req2",
+            _A_BASH,
+            {
+                "input_tokens": 5,
+                "output_tokens": 15,
+                "cache_read_input_tokens": 9000,
+                "cache_creation_input_tokens": 500,
+                "cache_creation": {"ephemeral_5m_input_tokens": 500},
+            },
+        ),
+        u("u3", "a2", result("tB1", _BASH_OUT)),
+        a(
+            "a3",
+            "u3",
+            "req3",
+            _A_DONE,
+            {"input_tokens": 5, "output_tokens": 30, "cache_read_input_tokens": 12000},
+        ),
+    ]
+
+
+def _context_cost_rows(out):
+    return _read_csv(out / "context_cost.csv")
+
+
+def test_context_cost_reconciles_with_the_billed_main_chain(fake_claude):
+    """Attributed rent/load equal the billed main-chain cache tokens, to the token."""
+    fake_claude.write("session_cost.jsonl", _cost_events(), project="cost")
+    run_extract(fake_claude.out)
+
+    cost = _context_cost_rows(fake_claude.out)
+    requests = _read_csv(fake_claude.out / "requests.csv")
+    main = [r for r in requests if r["is_sidechain"] == "0"]
+
+    assert sum(int(r["rent_read_tokens"]) for r in cost) == sum(
+        int(r["cache_read_tokens"]) for r in main
+    )
+    assert sum(int(r["load_write_5m_tokens"]) for r in cost) == sum(
+        int(r["cache_write_5m_tokens"]) for r in main
+    )
+    assert sum(int(r["load_write_1h_tokens"]) for r in cost) == sum(
+        int(r["cache_write_1h_tokens"]) for r in main
+    )
+    # The session loaded the context once (writes) then paid rent re-reading it.
+    assert sum(int(r["rent_read_tokens"]) for r in cost) == 21000
+    assert sum(int(r["load_write_5m_tokens"]) for r in cost) == 6500
+
+
+def test_context_cost_metrics_only_no_content(fake_claude):
+    """context_cost.csv carries raw token counts only -- no content, no paths."""
+    fake_claude.write("session_cost.jsonl", _cost_events(), project="cost")
+    run_extract(fake_claude.out)
+
+    blob = (fake_claude.out / "context_cost.csv").read_text(encoding="utf-8")
+    assert blob.splitlines()[0] == (
+        "session_id,source,language,model,rent_read_tokens,"
+        "load_write_5m_tokens,load_write_1h_tokens"
+    )
+    for secret in ("def parse", "return int", "3 passed", "parser.py"):
+        assert secret not in blob
+    assert "/home/fake" not in blob
+
+
+def test_context_cost_dedup_across_resumed_replay(fake_claude):
+    """A replayed session does not double-count the attributed cache cost."""
+    fake_claude.write("session_cost.jsonl", _cost_events(), project="cost")
+    run_extract(fake_claude.out)
+    once = sum(int(r["rent_read_tokens"]) for r in _context_cost_rows(fake_claude.out))
+
+    fake_claude.write("session_cost_resumed.jsonl", _cost_events(), project="cost2")
+    run_extract(fake_claude.out)
+    twice = sum(int(r["rent_read_tokens"]) for r in _context_cost_rows(fake_claude.out))
+    assert twice == once
+
+
+def test_context_cost_respects_date_window(fake_claude):
+    """Out-of-window sessions drop from the context cost entirely."""
+    fake_claude.write("session_cost.jsonl", _cost_events(), project="cost")
+    run_extract(fake_claude.out, since="2026-07-01", timezone_name="UTC")
+    assert _context_cost_rows(fake_claude.out) == []
