@@ -41,10 +41,12 @@ dependencies = [
     # Semantic layer (Axe B1): static, torch-free embeddings at the core so the
     # semantic features ship by default, not behind a heavy extra. `model2vec`
     # is pure numpy at inference (a few tens of MB on disk); `numpy` backs every
-    # vector op (it was previously only under [dashboard]). scikit-learn
-    # (HDBSCAN) joins later, at B1.2, when the taxonomy audit actually uses it.
+    # vector op (it was previously only under [dashboard]). `scikit-learn`
+    # (>=1.3 for sklearn.cluster.HDBSCAN) powers the taxonomy audit (B1.2) —
+    # density clustering of the whole corpus, no `k` to guess, isolates noise.
     "model2vec>=0.6",
     "numpy>=1.24",
+    "scikit-learn>=1.3",
     # Windows has no system IANA database; without this, --timezone fails there.
     "tzdata; sys_platform == 'win32'",
 ]
@@ -109,6 +111,9 @@ strict = true
 module = [
     "streamlit.*",
     "streamlit_echarts.*",
+    # scikit-learn ships no py.typed marker; the taxonomy audit (B1.2) only uses
+    # HDBSCAN.fit_predict, whose result we annotate ourselves.
+    "sklearn.*",
 ]
 ignore_missing_imports = true
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -68,7 +69,7 @@ def test_build_system_prompt_from_custom_anchors() -> None:
         {"categories": {"plan": {"role": "semantic", "examples": ["x"]}}},  # no definition
     ],
 )
-def test_load_anchors_rejects_malformed(tmp_path: Path, bad: dict) -> None:
+def test_load_anchors_rejects_malformed(tmp_path: Path, bad: dict[str, Any]) -> None:
     import yaml
 
     p = tmp_path / "anchors.yml"

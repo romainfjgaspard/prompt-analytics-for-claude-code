@@ -443,6 +443,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use the offline semantic classifier (embeddings, no API key).",
     )
+    categorize_mode.add_argument(
+        "--audit-categories",
+        action="store_true",
+        help="Diagnostic only: cluster the whole corpus (HDBSCAN) and compare the "
+        "natural clusters to the 13 categories. Writes a report + CSV; never "
+        "changes categories.csv.",
+    )
+    p_categorize.add_argument(
+        "--min-cluster-size",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Smallest natural cluster for --audit-categories (0 = the default).",
+    )
     p_categorize.add_argument(
         "--batch",
         action="store_true",
@@ -1092,6 +1106,14 @@ def _handle_snapshot(args: argparse.Namespace) -> int:
 def _handle_categorize(args: argparse.Namespace) -> int:
     """Dispatch the ``categorize`` subcommand."""
     from . import categorize
+
+    # Diagnostic branch: cluster the corpus and report, never write categories.
+    if getattr(args, "audit_categories", False):
+        from . import taxonomy_audit
+
+        mcs = args.min_cluster_size or taxonomy_audit.DEFAULT_MIN_CLUSTER_SIZE
+        code = taxonomy_audit.run_audit(output_dir=args.output_dir, min_cluster_size=mcs)
+        return 0 if code >= 0 else 1
 
     count = categorize.run_categorize(
         output_dir=args.output_dir,
