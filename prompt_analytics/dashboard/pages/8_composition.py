@@ -16,6 +16,7 @@ emit no cross-filter. Metrics only -- no source code is ever read here.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pandas as pd
@@ -40,6 +41,57 @@ def _fold_other(
     if tail_sum > 0:
         head.append((other_label, tail_sum))
     return head
+
+
+def _hbar(
+    title: str,
+    names: list[str],
+    values: list[float],
+    colors: list[str],
+    labels: list[str],
+    *,
+    money: bool = True,
+) -> dict[str, Any]:
+    """A horizontal bar with a per-bar text label (values shown, not just hidden).
+
+    Reading magnitudes off a labeled bar is far clearer than a donut whose only
+    on-chart text is a percentage -- here every bar carries its own ``$`` figure
+    on the right. Largest at the top (inverse category axis). Shared by the
+    prose-vs-code split and the cost-by-language breakdown.
+    """
+    c = echarts.colors()
+    option = echarts.base_option()
+    option["legend"] = {"show": False}
+    option["title"] = {
+        "text": title,
+        "left": 0,
+        "textStyle": {"color": c["text"], "fontSize": 16, "fontWeight": 600},
+    }
+    option["grid"] = {"left": 8, "right": 160, "top": 48, "bottom": 24, "containLabel": True}
+    option["tooltip"].update({"trigger": "item", "formatter": "{b}: ${c}" if money else "{b}: {c}"})
+    xaxis = echarts.value_axis(money=money)
+    xaxis["max"] = round(max(values) * 1.3, 2) if values else 1
+    option["xAxis"] = xaxis
+    option["yAxis"] = echarts.category_axis(names, inverse=True)
+    option["series"] = [
+        {
+            "type": "bar",
+            "data": [
+                {"value": v, "itemStyle": {"color": col}}
+                for v, col in zip(values, colors, strict=True)
+            ],
+            "itemStyle": {"borderRadius": [0, 4, 4, 0]},
+            "label": {
+                "show": True,
+                "position": "right",
+                "color": c["text"],
+                "formatter": echarts.js(
+                    "function(p){var L=" + json.dumps(labels) + ";return L[p.dataIndex];}"
+                ),
+            },
+        }
+    ]
+    return option
 
 
 def _language_mix_option(comp: analytics.OutputComposition) -> dict[str, Any] | None:
@@ -88,45 +140,32 @@ def _language_mix_option(comp: analytics.OutputComposition) -> dict[str, Any] | 
     return option
 
 
-def _donut(title: str, points: list[dict[str, Any]], money: bool = True) -> dict[str, Any]:
-    """A themed donut with percentage labels (shared by the two cost charts)."""
-    c = echarts.colors()
-    option = echarts.base_option()
-    option["title"] = {
-        "text": title,
-        "left": 0,
-        "textStyle": {"color": c["text"], "fontSize": 16, "fontWeight": 600},
-    }
-    fmt = "{b}: ${c} ({d}%)" if money else "{b}: {c} ({d}%)"
-    option["tooltip"] = {
-        "trigger": "item",
-        "backgroundColor": c["tooltip_bg"],
-        "borderColor": c["axis"],
-        "textStyle": {"color": c["text"]},
-        "formatter": fmt,
-    }
-    option["legend"] = {
-        "bottom": 0,
-        "textStyle": {"color": c["text"]},
-        "icon": "roundRect",
-        "type": "scroll",
-    }
-    option["series"] = [
-        {
-            "type": "pie",
-            "radius": ["46%", "72%"],
-            "center": ["50%", "48%"],
-            "avoidLabelOverlap": True,
-            "label": {"show": True, "formatter": "{d}%", "color": c["text"], "fontSize": 11},
-            "labelLine": {"length": 6, "length2": 6},
-            "data": points,
-        }
+def _prose_vs_code_option(comp: analytics.OutputComposition) -> dict[str, Any] | None:
+    """Two labeled bars: the prose half vs the code half of the output spend.
+
+    The headline of the page -- you see *both* parts of the output and the
+    dollars next to each (not a percentage hidden behind a hover). Prose on top
+    (cyan, "what comes out"), code below (coral).
+    """
+    prose, code = round(comp.prose_cost, 2), round(comp.code_cost, 2)
+    if prose <= 0 and code <= 0:
+        return None
+    total = prose + code
+    names = ["Prose / explanation", "Code / tooling"]
+    values = [prose, code]
+    colors = [theme.TOKEN_TYPE_COLORS["output"], theme.PALETTE[0]]
+    tokens = [comp.prose_tokens, comp.code_tokens]
+    labels = [
+        f"${v:,.2f}  ·  {pct:.0f}%  ·  {tok:,} tok"
+        for v, tok, pct in zip(
+            values, tokens, [100 * v / total if total else 0 for v in values], strict=True
+        )
     ]
-    return option
+    return _hbar(f"Output spend — prose vs code ({comp.provider})", names, values, colors, labels)
 
 
 def _cost_by_language_option(comp: analytics.OutputComposition) -> dict[str, Any] | None:
-    """Donut of the estimated output spend, by language (code side), + tooling."""
+    """Horizontal bars of the estimated output spend by language (code side) + tooling."""
     pairs: list[tuple[str, float]] = [
         (lng.language, round(lng.code_cost, 4)) for lng in comp.languages if lng.code_cost > 0
     ]
@@ -135,35 +174,14 @@ def _cost_by_language_option(comp: analytics.OutputComposition) -> dict[str, Any
     if not pairs:
         return None
     folded = _fold_other(pairs, _COST_TOP)
-    color_map = theme.language_color_map([name for name, _ in folded])
-    points = [
-        {
-            "name": name,
-            "value": round(value, 2),
-            "itemStyle": {"color": color_map.get(name, "#9CA3AF")},
-        }
-        for name, value in folded
-    ]
-    return _donut(f"Cost by language ({comp.provider})", points, money=True)
-
-
-def _prose_vs_code_option(comp: analytics.OutputComposition) -> dict[str, Any] | None:
-    """Donut of the generated output spend: prose (explanation) vs code/tooling."""
-    if comp.prose_cost <= 0 and comp.code_cost <= 0:
-        return None
-    points = [
-        {
-            "name": "Prose / explanation",
-            "value": round(comp.prose_cost, 2),
-            "itemStyle": {"color": theme.TOKEN_TYPE_COLORS["output"]},
-        },
-        {
-            "name": "Code / tooling",
-            "value": round(comp.code_cost, 2),
-            "itemStyle": {"color": theme.PALETTE[0]},
-        },
-    ]
-    return _donut(f"Prose vs code ({comp.provider})", points, money=True)
+    names = [name for name, _ in folded]
+    values = [round(value, 2) for _, value in folded]
+    color_map = theme.language_color_map(names)
+    colors = [color_map.get(name, "#9CA3AF") for name in names]
+    labels = [f"${v:,.2f}" for v in values]
+    return _hbar(
+        f"Where the code spend went, by language ({comp.provider})", names, values, colors, labels
+    )
 
 
 def _render_headline(comp: analytics.OutputComposition) -> None:
@@ -224,44 +242,51 @@ def main() -> None:
         )
         st.stop()
 
-    theme.section(
-        "Output — what Claude produced",
-        "The language mix and code/tests split come straight from the file edits "
-        "(exact line diffs). The cost split is an estimate: each prompt's real output "
-        "cost is prorated by a local tokenizer's prose/code weight, and the code half "
-        "is attributed across the languages it edited by line churn.",
-    )
+    theme.section("Output — what Claude produced")
 
     _render_headline(comp)
 
-    mix = _language_mix_option(comp)
-    if mix is not None:
-        echarts.render(mix, key="comp_language_mix", height="420px")
+    # 1) The headline split: the two halves of the output and their dollars,
+    # full width so they read at a glance.
+    prose_code = _prose_vs_code_option(comp)
+    if prose_code is not None:
+        echarts.render(prose_code, key="comp_prose_vs_code", height="220px")
+        gen_cost = comp.prose_cost + comp.code_cost
         st.caption(
-            f"{comp.total_added:,} lines added across {comp.total_files:,} files · "
-            f"{comp.total_test:,} of them in tests"
-            + ("" if len(comp.languages) <= _MIX_TOP else f" · top {_MIX_TOP} languages shown")
+            f"Every output message is part **explanation** (its text) and part "
+            f"**code/tooling** (its tool calls). Of the **${gen_cost:,.2f}** spent "
+            f"generating output, here is the split. _Estimate:_ each prompt's real "
+            f"output cost is prorated by a local tokenizer's prose/code token weight."
         )
     else:
-        st.info("No file-edit metrics in range (Claude produced prose only, or read-only tools).")
+        st.info("No generated-output tokens in range.")
 
+    # 2) Drill into the code half: where the code dollars went, by language, and
+    # how many lines (code vs tests) each language produced.
+    st.subheader("Inside the code")
     left, right = st.columns(2)
     with left:
         cost_lang = _cost_by_language_option(comp)
         if cost_lang is not None:
-            echarts.render(cost_lang, key="comp_cost_by_language", height="380px")
-            st.caption("Estimated output spend attributed to each language (code side).")
+            echarts.render(cost_lang, key="comp_cost_by_language", height="420px")
+            st.caption(
+                f"The **${comp.code_cost:,.2f}** code half, attributed to each language by "
+                "line churn (`(other tooling)` = code tokens spent on Bash/Read/etc., no "
+                "file edited)."
+            )
         else:
             st.info("No code spend to attribute to a language in range.")
     with right:
-        prose_code = _prose_vs_code_option(comp)
-        if prose_code is not None:
-            echarts.render(prose_code, key="comp_prose_vs_code", height="380px")
+        mix = _language_mix_option(comp)
+        if mix is not None:
+            echarts.render(mix, key="comp_language_mix", height="420px")
             st.caption(
-                f"{comp.prose_tokens:,} prose vs {comp.code_tokens:,} code/tool output tokens."
+                f"Exact line diffs: {comp.total_added:,} lines added across "
+                f"{comp.total_files:,} files · {comp.total_test:,} in tests"
+                + ("" if len(comp.languages) <= _MIX_TOP else f" · top {_MIX_TOP} shown")
             )
         else:
-            st.info("No generated-output tokens in range.")
+            st.info("No file-edit metrics in range (prose only, or read-only tools).")
 
     st.caption("👉 The same breakdown on the command line: `prompt-analytics by-output`.")
 
