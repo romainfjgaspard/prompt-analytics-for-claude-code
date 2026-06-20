@@ -69,6 +69,10 @@ __all__ = [
     "ContextCost",
     "ContextElementCost",
     "by_task",
+    "task_graph",
+    "TaskGraph",
+    "TaskNode",
+    "TaskSatellite",
     "top_prompts",
     "sessions_table",
     "session_depth",
@@ -1726,6 +1730,150 @@ def by_task(ds: Dataset, provider: str, *, top: int = 20) -> TableResult:
         ],
         rows,
         notes,
+    )
+
+
+@dataclass(frozen=True)
+class TaskNode:
+    """One task as a graph centre (Axe B2): a node sized by cost, hued by category.
+
+    ``cost`` is the task's full spend (input + output + context, reconciled to the
+    bill like :func:`by_task`); ``context_pct`` the share of it that is cache
+    rent/loading; ``category`` the dominant category among its prompts (the node
+    colour). ``name`` is a Claude-authored todo label or a blanked snippet, never
+    source content.
+    """
+
+    task_id: str
+    name: str
+    origin: str
+    category: str
+    prompts: int
+    cost: float
+    context_pct: float
+
+
+@dataclass(frozen=True)
+class TaskSatellite:
+    """One prompt orbiting its task (Axe B2): a small node linked to its centre.
+
+    Coloured by its own category, sized faintly by its own cost, so a task's
+    centre shows the category mix of the prompts that served it.
+    """
+
+    prompt_id: str
+    task_id: str
+    category: str
+    cost: float
+
+
+@dataclass(frozen=True)
+class TaskGraph:
+    """Structured task-graph data (Axe B2), shared shape for the dashboard view.
+
+    ``tasks`` are the top ``top`` task centres by cost; ``satellites`` the prompts
+    of exactly those tasks (so the graph stays legible). ``total_tasks`` /
+    ``todo_tasks`` describe the whole population behind the shown slice;
+    ``grand_total`` / ``context_total`` are the reconciled task spend and its
+    context share. The pure numbers mirror :func:`by_task` so the graph and the
+    CLI table never drift.
+    """
+
+    provider: str
+    tasks: list[TaskNode]
+    satellites: list[TaskSatellite]
+    total_tasks: int
+    todo_tasks: int
+    grand_total: float
+    context_total: float
+
+    @property
+    def has_data(self) -> bool:
+        """True when there is at least one task centre to draw."""
+        return bool(self.tasks)
+
+
+def task_graph(ds: Dataset, provider: str, *, top: int = 40) -> TaskGraph:
+    """Assemble the Axe-B2 task graph: task centres + their prompt satellites.
+
+    Prices every prompt once (reconciling to the bill by construction, like
+    :func:`by_task`), aggregates to tasks, keeps the top ``top`` by cost (0 =
+    all), then gathers the prompts of *those* tasks as satellites so the force
+    layout stays readable on a large corpus. The dashboard turns this into the
+    ECharts ``graph``; the data assembly lives here so it stays unit-testable.
+    """
+    engine = CostEngine(provider, ds.pricing_path)
+    task_of = {row["prompt_id"]: row["task_id"] for row in ds.task_prompts}
+
+    prompt_cost: defaultdict[str, float] = defaultdict(float)
+    prompt_ctx: defaultdict[str, float] = defaultdict(float)
+    for row in ds.tokens:
+        c = engine.cost(row.get("model") or "", row["token_type"], row["token_count"])
+        pid = row["prompt_id"]
+        prompt_cost[pid] += c
+        if row["token_type"] in _CONTEXT_TOKEN_TYPES:
+            prompt_ctx[pid] += c
+
+    task_cost: defaultdict[str, float] = defaultdict(float)
+    task_ctx: defaultdict[str, float] = defaultdict(float)
+    for pid, c in prompt_cost.items():
+        tid = task_of.get(pid)
+        if tid is None:  # continuation/compaction overhead, tied to no task
+            continue
+        task_cost[tid] += c
+        task_ctx[tid] += prompt_ctx.get(pid, 0.0)
+
+    dominant: dict[str, Counter[str]] = defaultdict(Counter)
+    for row in ds.task_prompts:
+        category = (ds.categories.get(row["prompt_id"]) or {}).get("category") or ""
+        if category:
+            dominant[row["task_id"]][category] += 1
+
+    grand_total = sum(task_cost.values())
+    context_total = sum(task_ctx.values())
+
+    nodes: list[TaskNode] = []
+    for task in ds.tasks:
+        tid = task["task_id"]
+        cost = task_cost.get(tid, 0.0)
+        ctx = task_ctx.get(tid, 0.0)
+        counter = dominant.get(tid)
+        nodes.append(
+            TaskNode(
+                task_id=tid,
+                name=task.get("name") or tid,
+                origin=task.get("origin", ""),
+                category=counter.most_common(1)[0][0] if counter else "(uncategorized)",
+                prompts=int(task.get("prompts") or 0),
+                cost=round(cost, 4),
+                context_pct=round(100 * ctx / cost, 1) if cost else 0.0,
+            )
+        )
+    nodes.sort(key=lambda n: (-n.cost, n.name))
+    if top:
+        nodes = nodes[:top]
+
+    kept = {n.task_id for n in nodes}
+    satellites = [
+        TaskSatellite(
+            prompt_id=row["prompt_id"],
+            task_id=row["task_id"],
+            category=(ds.categories.get(row["prompt_id"]) or {}).get("category")
+            or "(uncategorized)",
+            cost=round(prompt_cost.get(row["prompt_id"], 0.0), 4),
+        )
+        for row in ds.task_prompts
+        if row["task_id"] in kept
+    ]
+
+    return TaskGraph(
+        provider=provider,
+        tasks=nodes,
+        satellites=satellites,
+        total_tasks=len(ds.tasks),
+        todo_tasks=sum(1 for t in ds.tasks if t.get("origin") == "todo"),
+        grand_total=round(grand_total, 4),
+        context_total=round(context_total, 4),
     )
 
 

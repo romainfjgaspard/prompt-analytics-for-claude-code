@@ -5,7 +5,8 @@ Claude produced), **context** (what fills the cache it re-reads). This page is
 the narrated home of that spine, read as one whole: three sections in cost order
 (input -> output -> context), each with the same shape (a KPI row, a headline
 chart, a drill), then a unified **Files** table that crosses output and context
-per file.
+per file, and finally the **Tasks** graph that lifts the spine to the unit of
+work.
 
 * **Input** (categories) -- a cost-by-category recap of the Prompts page, so the
   spine starts here too (DASH1).
@@ -17,10 +18,15 @@ per file.
   total reconciles to the billed cache cost to the dollar.
 * **Files** (DASH4) -- one row per file crossing edits + line diff (output) with
   reads + context cost (loading + rent): a file's whole cost of ownership.
+* **Tasks** (Axe B2 / DASH5) -- the cost graph: tasks as centres of gravity
+  (size = cost, hue = dominant category) with their prompts orbiting as
+  satellites, drillable per task via an ECharts force layout. The unit of work,
+  the most telling level of the spine.
 
 Every section is a *view* over the same analytics the CLI prints
 (:func:`analytics.by_category` / :func:`output_composition` / :func:`context_cost`
-/ :func:`file_footprint`), narrowed to the global sidebar / chart-click selection
+/ :func:`file_footprint` / :func:`task_graph`), narrowed to the global sidebar /
+chart-click selection
 via :func:`analytics.filter_prompt_ids` so it honours the same filter as every
 other tab. Read-only: language/file are not global filter dimensions, so the
 charts emit no cross-filter. Metrics only -- no source code is ever read here.
@@ -541,6 +547,211 @@ def _render_files_section(ds: analytics.Dataset, provider: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tasks section (Axe B2 / DASH5) -- the cost graph: tasks as centres, prompts
+# as satellites, the most telling level of the "cost by content" spine.
+# ---------------------------------------------------------------------------
+
+# How many task centres the headline graph shows before the long tail is hidden
+# (a force layout stays legible at a few dozen nodes, not hundreds).
+_TASK_TOP = 40
+# Task-node radius band (px), mapped from cost by a sqrt scale so area ~ cost.
+_TASK_MIN_SIZE, _TASK_MAX_SIZE = 16.0, 56.0
+# Prompt-satellite radius band (px), much smaller so centres read as centres.
+_SAT_MIN_SIZE, _SAT_MAX_SIZE = 6.0, 16.0
+
+
+def _task_color(category: str) -> str:
+    """Category colour for a task/prompt node (shared with the Prompts page)."""
+    return theme.CATEGORY_COLORS.get(category, theme.CATEGORY_COLORS["(uncategorized)"])
+
+
+def _cat_label(category: str) -> str:
+    """Legend-friendly category label (``(uncategorized)`` stays as-is)."""
+    return category if category.startswith("(") else category.title()
+
+
+def _scaled_size(value: float, vmax: float, lo: float, hi: float) -> float:
+    """Map a cost to a radius on a sqrt scale (area ~ cost), clamped to [lo, hi]."""
+    if vmax <= 0:
+        return lo
+    return float(round(lo + (hi - lo) * (max(value, 0.0) / vmax) ** 0.5, 1))
+
+
+def _task_graph_option(
+    graph: analytics.TaskGraph, focus: str | None = None
+) -> dict[str, Any] | None:
+    """ECharts force-layout graph: task centres (size = cost, hue = category) with
+    their prompt satellites; ``focus`` narrows it to a single task and its prompts.
+
+    Colour is driven by ``categories`` (the legend), so toggling a category in the
+    legend dims every task and prompt of that intent at once. Tasks carry a label
+    and a rich tooltip; satellites stay quiet (colour + hover only).
+    """
+    tasks = [t for t in graph.tasks if focus is None or t.task_id == focus]
+    if not tasks:
+        return None
+    kept = {t.task_id for t in tasks}
+    sats = [s for s in graph.satellites if s.task_id in kept]
+
+    # Stable category -> legend index, in cost order so the legend reads top-down.
+    cats: list[str] = []
+    for cat in [t.category for t in tasks] + [s.category for s in sats]:
+        if cat not in cats:
+            cats.append(cat)
+    cat_index = {cat: i for i, cat in enumerate(cats)}
+
+    cost_max = max((t.cost for t in tasks), default=0.0)
+    sat_max = max((s.cost for s in sats), default=0.0)
+    # Focusing one task zooms in: give its centre and prompts more room.
+    task_lo, task_hi = (_TASK_MIN_SIZE, _TASK_MAX_SIZE) if focus is None else (40.0, 90.0)
+    sat_lo, sat_hi = (_SAT_MIN_SIZE, _SAT_MAX_SIZE) if focus is None else (12.0, 30.0)
+
+    nodes: list[dict[str, Any]] = []
+    for t in tasks:
+        label = t.name if len(t.name) <= 28 else t.name[:27] + "…"
+        nodes.append(
+            {
+                "id": t.task_id,
+                "name": t.name,
+                "kind": "task",
+                "category": cat_index[t.category],
+                "symbolSize": _scaled_size(t.cost, cost_max, task_lo, task_hi),
+                "value": round(t.cost, 2),
+                "cost": round(t.cost, 2),
+                "prompts": t.prompts,
+                "origin": t.origin,
+                "ctx": t.context_pct,
+                "itemStyle": {"color": _task_color(t.category), "borderColor": "#0B1220"},
+                "label": {"show": True, "formatter": label},
+            }
+        )
+    for s in sats:
+        nodes.append(
+            {
+                "id": s.prompt_id,
+                "name": s.category,
+                "kind": "prompt",
+                "category": cat_index[s.category],
+                "symbolSize": _scaled_size(s.cost, sat_max, sat_lo, sat_hi),
+                "value": round(s.cost, 2),
+                "cost": round(s.cost, 2),
+                "itemStyle": {"color": _task_color(s.category), "opacity": 0.85},
+                "label": {"show": False},
+            }
+        )
+    links = [{"source": s.task_id, "target": s.prompt_id} for s in sats]
+
+    c = echarts.colors()
+    option = echarts.base_option()
+    option["title"] = {
+        "text": "Cost by task — centres of gravity",
+        "left": 0,
+        "textStyle": {"color": c["text"], "fontSize": 16, "fontWeight": 600},
+    }
+    option["legend"] = {
+        "data": [_cat_label(cat) for cat in cats],
+        "bottom": 0,
+        "textStyle": {"color": c["text"]},
+        "icon": "circle",
+        "type": "scroll",
+    }
+    option["tooltip"] = {
+        **option["tooltip"],
+        "trigger": "item",
+        "formatter": echarts.js(
+            "function(p){if(p.dataType==='edge'){return '';}var d=p.data;"
+            "if(d.kind==='task'){return '<b>'+d.name+'</b><br/>'+d.origin+' task"
+            " · '+d.prompts+' prompts<br/>$'+Number(d.cost).toFixed(2)+' · '"
+            "+Number(d.ctx).toFixed(0)+'% context';}"
+            "return 'prompt · $'+Number(d.cost).toFixed(2);}"
+        ),
+    }
+    option["series"] = [
+        {
+            "type": "graph",
+            "layout": "force",
+            "roam": True,
+            "draggable": True,
+            "categories": [
+                {"name": _cat_label(cat), "itemStyle": {"color": _task_color(cat)}} for cat in cats
+            ],
+            "force": {
+                "repulsion": 140 if focus is None else 320,
+                "edgeLength": [20, 60],
+                "gravity": 0.12,
+            },
+            "label": {"position": "right", "color": c["text"], "fontSize": 11},
+            "lineStyle": {"color": c["axis"], "opacity": 0.45, "width": 1},
+            "emphasis": {"focus": "adjacency", "lineStyle": {"width": 2}},
+            "data": nodes,
+            "links": links,
+        }
+    ]
+    return option
+
+
+def _render_tasks_section(graph: analytics.TaskGraph) -> None:
+    """The Axe-B2 task graph: KPI row, a focus picker, then the force-layout graph."""
+    shown = graph.tasks
+    top_task = shown[0] if shown else None
+
+    cols = st.columns(4)
+    cols[0].metric("Tasks", f"{graph.total_tasks:,}")
+    cols[1].metric(
+        "From the TodoWrite spine",
+        f"{graph.todo_tasks:,}",
+        delta=f"{graph.total_tasks - graph.todo_tasks:,} inferred",
+        delta_color="off",
+    )
+    cols[2].metric(
+        "Most expensive task",
+        f"${top_task.cost:,.2f}" if top_task else "—",
+        delta=(top_task.name[:22] if top_task else None),
+        delta_color="off",
+    )
+    cols[3].metric(
+        f"Task cost ({graph.provider})",
+        f"${graph.grand_total:,.2f}",
+        delta=(
+            f"{round(100 * graph.context_total / graph.grand_total):.0f}% context"
+            if graph.grand_total
+            else None
+        ),
+        delta_color="off",
+    )
+
+    # Drill by task: the headline shows the top centres, the picker zooms one in.
+    labels = {f"{t.name[:48]}  ·  ${t.cost:,.2f}": t.task_id for t in shown}
+    choice = st.selectbox(
+        "Focus on a task",
+        ["All tasks (top centres)", *labels.keys()],
+        key="comp_task_focus",
+        label_visibility="collapsed",
+    )
+    focus = labels.get(choice)
+
+    option = _task_graph_option(graph, focus)
+    if option is not None:
+        echarts.render(option, key="comp_task_graph", height="560px")
+
+    if focus is None:
+        st.caption(
+            f"Each **task** is a centre of gravity (its size is its cost, its colour the "
+            f"dominant category); the **prompts** that served it orbit around it. Top "
+            f"{min(len(shown), _TASK_TOP)} of {graph.total_tasks:,} tasks shown — pick one above "
+            f"to zoom into its prompts. Drag nodes, scroll to zoom, toggle a category in the "
+            f"legend. 👉 On the command line: `prompt-analytics by-task`."
+        )
+    else:
+        focused = next(t for t in shown if t.task_id == focus)
+        st.caption(
+            f"**{focused.name}** — {focused.origin} task, {focused.prompts:,} prompts, "
+            f"**${focused.cost:,.2f}** ({focused.context_pct:.0f}% context), dominant category "
+            f"_{focused.category}_. Each satellite is one prompt, coloured by its own intent."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Page.
 # ---------------------------------------------------------------------------
 
@@ -614,6 +825,20 @@ def main() -> None:
         "context cost (loading + rent) — the file's whole cost of ownership.",
     )
     _render_files_section(ds, primary)
+
+    theme.section(
+        "Tasks — the cost graph",
+        "The unit of work, not the prompt: tasks as centres of gravity (size = cost, "
+        "colour = dominant category), the prompts that served each one orbiting around it.",
+    )
+    graph = analytics.task_graph(ds, primary, top=_TASK_TOP)
+    if graph.has_data:
+        _render_tasks_section(graph)
+    else:
+        st.info(
+            "No task data yet. Task attribution (the TodoWrite spine + inference) ships with "
+            "the latest extractor — re-run `prompt-analytics extract`, then revisit this page."
+        )
 
 
 # Render only under a real Streamlit server: streamlit-echarts cannot register

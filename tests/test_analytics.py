@@ -1117,3 +1117,60 @@ def test_by_task_empty_dataset_hints_to_extract():
     result = analytics.by_task(empty, "anthropic")
     assert result.rows == []
     assert any("No task data" in n for n in result.notes)
+
+
+# ---------------------------------------------------------------------------
+# task_graph: the Axe-B2 force-graph data (task centres + prompt satellites).
+# ---------------------------------------------------------------------------
+
+
+def test_task_graph_centres_satellites_and_totals():
+    graph = analytics.task_graph(_task_ds(), "anthropic")
+
+    # Two task centres, sorted by cost (the $11.50 todo task first).
+    assert [t.name for t in graph.tasks] == ["Add the export pipeline", "fix the failing test"]
+    centre = graph.tasks[0]
+    assert centre.category == "implementation"
+    assert centre.origin == "todo"
+    assert centre.prompts == 2
+    assert centre.cost == pytest.approx(11.50, abs=1e-6)
+    assert centre.context_pct == round(100 * 1.50 / 11.50, 1)
+
+    # Satellites = the prompts of the shown tasks (3 across both), each linked.
+    assert {s.prompt_id for s in graph.satellites} == {"p1", "p2", "p3"}
+    assert {s.task_id for s in graph.satellites} == {"s1:t01", "s1:i01"}
+    p1 = next(s for s in graph.satellites if s.prompt_id == "p1")
+    assert p1.category == "implementation"
+    assert p1.cost == pytest.approx(11.00, abs=1e-6)  # input $5 + output $5 + cache_read $1
+
+    # Population + reconciled totals (overhead excluded, like by_task).
+    assert graph.total_tasks == 2
+    assert graph.todo_tasks == 1
+    assert graph.grand_total == pytest.approx(19.75, abs=1e-6)
+    assert graph.context_total == pytest.approx(7.75, abs=1e-6)
+    assert graph.has_data
+
+
+def test_task_graph_top_limits_centres_and_their_satellites():
+    graph = analytics.task_graph(_task_ds(), "anthropic", top=1)
+    assert [t.task_id for t in graph.tasks] == ["s1:t01"]
+    # Only the kept task's prompts orbit; the dropped task's prompt is gone.
+    assert {s.prompt_id for s in graph.satellites} == {"p1", "p2"}
+    # The population count still reflects every task, not just the shown slice.
+    assert graph.total_tasks == 2
+
+
+def test_task_graph_uncategorized_without_categories():
+    ds = _task_ds()
+    ds.categories.clear()
+    graph = analytics.task_graph(ds, "anthropic")
+    assert all(t.category == "(uncategorized)" for t in graph.tasks)
+    assert all(s.category == "(uncategorized)" for s in graph.satellites)
+
+
+def test_task_graph_empty_dataset_has_no_data():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test data")
+    graph = analytics.task_graph(empty, "anthropic")
+    assert graph.tasks == []
+    assert graph.satellites == []
+    assert not graph.has_data
