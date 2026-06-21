@@ -41,7 +41,7 @@ from streamlit import runtime
 
 from prompt_analytics import analytics
 from prompt_analytics.context import NO_LANGUAGE
-from prompt_analytics.dashboard import data, echarts, filters, impact, theme
+from prompt_analytics.dashboard import data, echarts, filters, theme
 
 # How many languages to show before folding the long tail into an "Other" slice.
 _MIX_TOP = 12
@@ -263,7 +263,10 @@ def _render_input_section(ds: analytics.Dataset, provider: str, prompts: pd.Data
     with right:
         dist = _char_distribution_option(prompts)
         if dist is not None:
-            clicked = echarts.render(dist, key="comp_char_dist", height="360px", click=True)
+            # Taller than the category bar on the left so the two plot areas bottom out
+            # at the same line: this chart reserves more space for its rotated x-axis
+            # labels + axis name, which would otherwise float its baseline higher.
+            clicked = echarts.render(dist, key="comp_char_dist", height="420px", click=True)
             _apply_char_click(clicked)
         else:
             st.info("No prompt-length data in range.")
@@ -835,25 +838,8 @@ def _render_files_section(graph: analytics.FileGraph, project: str | None) -> No
             st.switch_page("pages/12_file_explorer.py")
 
 
-def _render_file_side(graph: analytics.FileGraph, *, side: str, pivot: str, key: str) -> None:
-    """One side (before / after) of the file graph in compare mode: KPI + force graph."""
-    when = f"before {pivot}" if side == "Before" else f"from {pivot}"
-    st.markdown(f"**{side}** · _{when}_")
-    if not graph.has_data:
-        st.info("No file data on this side of the pivot.")
-        return
-    cols = st.columns(2)
-    cols[0].metric("Files touched", f"{graph.total_files:,}")
-    cols[1].metric(f"Context cost ({graph.provider})", f"${graph.context_total:,.2f}")
-    option = _file_graph_option(graph)
-    if option is not None:
-        echarts.render(option, key=key, height="460px")
-
-
-def _render_files(
-    ds: analytics.Dataset, provider: str, prompts: pd.DataFrame, pivot: str | None
-) -> None:
-    """Files section: scope to a single project, then draw the graph (or compare).
+def _render_files(ds: analytics.Dataset, provider: str, prompts: pd.DataFrame) -> None:
+    """Files section: scope to a single project, then draw the cost-graph.
 
     The **project filter** sits above the per-file focus: a constellation mixing
     several project trees is noise, so one project at a time keeps it legible. The
@@ -873,36 +859,11 @@ def _render_files(
         )
         scoped = analytics.filter_project(ds, project)
 
-    if pivot is not None:
-        _render_files_comparison(scoped, provider, pivot)
-        return
     graph = analytics.file_graph(scoped, provider, top=_FILE_TOP)
     if graph.has_data:
         _render_files_section(graph, project)
     else:
         st.info("No file data for this project in the current range.")
-
-
-def _render_files_comparison(ds: analytics.Dataset, provider: str, pivot: str) -> None:
-    """Before/after of the file cost-graph (DASH2): the constellation on each side.
-
-    The context-cost headline above each graph is the lens; the two force layouts
-    show how the files the work touched shifted across the switch date.
-    """
-    before_ds, after_ds = analytics.split_on_pivot(ds, pivot)
-    before = analytics.file_graph(before_ds, provider, top=_FILE_TOP)
-    after = analytics.file_graph(after_ds, provider, top=_FILE_TOP)
-
-    left, right = st.columns(2)
-    with left:
-        _render_file_side(before, side="Before", pivot=pivot, key="comp_file_graph_before")
-    with right:
-        _render_file_side(after, side="After", pivot=pivot, key="comp_file_graph_after")
-    st.caption(
-        "Each **file** is a centre sized by its context cost and coloured by language, the "
-        "**prompts that edited it** orbiting as satellites — shown before vs after your switch "
-        "date."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -950,17 +911,6 @@ def main() -> None:
         )
         st.stop()
 
-    # Compare mode (Axe E / DASH2): lead with the before/after panel — its Output
-    # cost share and Context rent share deltas are exactly the composition story.
-    pivot = impact.current_pivot()
-    if pivot is not None:
-        theme.section(
-            f"Impact of {pivot} — before vs after",
-            "The before/after of your switch date across the whole spine, in workload-normalized "
-            "ratios (output cost share and context rent share are the composition deltas).",
-        )
-        impact.render_impact_panel(ds, primary, pivot)
-
     theme.section(
         "Input — what you asked for",
         "The spend split of your prompts, by category and by length.",
@@ -997,7 +947,7 @@ def main() -> None:
             "page."
         )
     else:
-        _render_files(ds, primary, prompts, pivot)
+        _render_files(ds, primary, prompts)
 
 
 # Render only under a real Streamlit server: streamlit-echarts cannot register

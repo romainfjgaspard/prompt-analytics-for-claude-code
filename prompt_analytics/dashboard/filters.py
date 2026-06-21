@@ -478,9 +478,7 @@ def render_sidebar(frames: dict[str, pd.DataFrame]) -> None:
     # state is otherwise garbage-collected by Streamlit when its page is left
     # (st.navigation), so the filters would reset on every tab change. Re-assigning
     # each key to itself marks it as user-owned and exempts it from that cleanup.
-    from prompt_analytics.dashboard import impact
-
-    for wkey in (KEY_MODELS, KEY_PROJECTS, KEY_CATEGORIES, *impact.PIVOT_KEYS):
+    for wkey in (KEY_MODELS, KEY_PROJECTS, KEY_CATEGORIES):
         if wkey in st.session_state:
             st.session_state[wkey] = st.session_state[wkey]
     render_refresh_button()
@@ -522,10 +520,6 @@ def render_sidebar(frames: dict[str, pd.DataFrame]) -> None:
     _multiselect_filter("Model", KEY_MODELS, opts["models"], format_func=theme.model_label)
     _multiselect_filter("Project", KEY_PROJECTS, opts["projects"])
     _multiselect_filter("Category", KEY_CATEGORIES, opts["categories"])  # (5.4)
-
-    # Global before/after date-pivot mode (Axe E / DASH2): a toggle + switch date
-    # that reframes the wired pages (Usage, Composition) as before vs after.
-    impact.render_pivot_controls(frames)
 
     # Demo banner at the very bottom of the sidebar (generic chrome that would
     # otherwise steal vertical space from the first chart in the main column).

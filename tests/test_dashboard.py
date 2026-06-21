@@ -868,3 +868,94 @@ def test_bar_table_shades_counts_and_costs() -> None:
     assert "rgba(217, 119, 87" in html  # cost column shaded coral
     # An empty frame is returned formatted but unshaded (no numeric range to scale).
     assert tables.bar_table(df.iloc[0:0], count_cols=("Edits",)) is not None
+
+
+# ---------------------------------------------------------------------------
+# Compare page (Axe E / DASH2): the pure before/after averaging helpers.
+# These never touch Streamlit, so they are asserted directly here.
+# ---------------------------------------------------------------------------
+
+_OPUS = "claude-opus-4-8"  # default-priced: input 5, output 25, cache_read 0.5 / 1M
+
+
+def _compare_side() -> analytics.Dataset:
+    """A tiny side: two implementation prompts, one debug, with OPUS-priced tokens.
+
+    Each prompt: input 1M ($5) + output 100k ($2.50) + cache_read 1M ($0.50).
+    """
+
+    def _tok(pid: str, token_type: str, count: int) -> dict[str, object]:
+        return {
+            "session_id": "s",
+            "prompt_id": pid,
+            "model": _OPUS,
+            "token_type": token_type,
+            "token_count": count,
+        }
+
+    tokens: list[dict[str, object]] = []
+    for pid in ("p1", "p2", "p3"):
+        tokens += [
+            _tok(pid, "input", 1_000_000),
+            _tok(pid, "output", 100_000),
+            _tok(pid, "cache_read", 1_000_000),
+        ]
+    return analytics.Dataset(
+        sessions=[{"session_id": "s"}],
+        prompts=[
+            {"session_id": "s", "prompt_id": "p1"},
+            {"session_id": "s", "prompt_id": "p2"},
+            {"session_id": "s", "prompt_id": "p3"},
+        ],
+        tokens=tokens,
+        categories={
+            "p1": {"category": "implementation"},
+            "p2": {"category": "implementation"},
+            "p3": {"category": "debug"},
+        },
+        source="test data",
+    )
+
+
+def test_token_cost_per_prompt_is_an_average_by_type() -> None:
+    from prompt_analytics.dashboard import impact
+
+    per_prompt = impact.token_cost_per_prompt(_compare_side(), "anthropic")
+
+    # Three prompts, each $5 input / $2.50 output / $0.50 cache_read -> the average
+    # per prompt is exactly the per-prompt amount (cost / 3, not a sum).
+    assert per_prompt["input"] == pytest.approx(5.0)
+    assert per_prompt["output"] == pytest.approx(2.5)
+    assert per_prompt["cache_read"] == pytest.approx(0.5)
+    # Token types with no cost are absent.
+    assert "cache_write_1h" not in per_prompt
+
+
+def test_token_cost_per_prompt_empty_side_is_empty() -> None:
+    from prompt_analytics.dashboard import impact
+
+    empty = analytics.Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="empty")
+    assert impact.token_cost_per_prompt(empty, "anthropic") == {}
+
+
+def test_category_share_is_a_mix_summing_to_100() -> None:
+    from prompt_analytics.dashboard import impact
+
+    share = impact.category_share(_compare_side())
+
+    assert share["implementation"] == pytest.approx(200 / 3)  # 2 of 3 prompts
+    assert share["debug"] == pytest.approx(100 / 3)  # 1 of 3 prompts
+    assert sum(share.values()) == pytest.approx(100.0)
+
+
+def test_category_share_uncategorized_when_no_label() -> None:
+    from prompt_analytics.dashboard import impact
+
+    ds = analytics.Dataset(
+        sessions=[{"session_id": "s"}],
+        prompts=[{"session_id": "s", "prompt_id": "p1"}],
+        tokens=[],
+        categories={},
+        source="test data",
+    )
+    assert impact.category_share(ds) == {"(uncategorized)": pytest.approx(100.0)}

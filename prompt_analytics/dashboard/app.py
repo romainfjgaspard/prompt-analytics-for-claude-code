@@ -370,6 +370,9 @@ def _run() -> None:
         st.Page("pages/11_explorer.py", title="Prompt Explorer", icon="🔎"),
         st.Page("pages/12_file_explorer.py", title="File Explorer", icon="📄"),
         st.Page("pages/6_optimize.py", title="Optimize", icon="✨"),
+        # Compare reads the full history (request grain) on its own date pivot, so
+        # it sits in the no-filter block right after Optimize.
+        st.Page("pages/9_compare.py", title="Compare", icon="⚖️"),
         st.Page("pages/7_quotas.py", title="Quotas", icon="📏"),
         st.Page("pages/10_how_it_works.py", title="How it works", icon="❓"),
     ]

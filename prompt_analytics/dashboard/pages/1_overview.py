@@ -25,8 +25,7 @@ import pandas as pd
 import streamlit as st
 from streamlit import runtime
 
-from prompt_analytics import analytics
-from prompt_analytics.dashboard import data, echarts, filters, impact, theme
+from prompt_analytics.dashboard import data, echarts, filters, theme
 
 # Abbreviate large counts on an axis / tooltip (1_500_000 -> "1.5M", 12_000 -> "12k").
 _ABBREV_JS = (
@@ -413,21 +412,6 @@ def main() -> None:
             f"{rent:.0f}% of API-equivalent cost",
             help="Money spent re-sending context at every turn, not generating answers.",
         )
-
-    # Compare mode (Axe E / DASH2): when a switch date is set in the sidebar, lead
-    # with the before/after panel -- workload-normalized ratios + delta -- then the
-    # usual charts below as the detailed backdrop.
-    pivot = impact.current_pivot()
-    if pivot is not None:
-        prompts = frames.get("prompts", pd.DataFrame())
-        kept_ids = set(prompts["prompt_id"]) if "prompt_id" in prompts.columns else set()
-        ds = analytics.filter_prompt_ids(data.load_dataset(), kept_ids)
-        theme.section(
-            f"Impact of {pivot} — before vs after",
-            "The before/after of your switch date, in workload-normalized ratios so it reads "
-            "through how much you worked.",
-        )
-        impact.render_impact_panel(ds, primary, pivot)
 
     theme.section("Where the money goes")
     left, right = st.columns([3, 2])
