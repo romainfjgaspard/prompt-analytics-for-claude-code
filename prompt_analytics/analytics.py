@@ -61,6 +61,7 @@ __all__ = [
     "by_model",
     "by_token_type",
     "by_category",
+    "input_cost",
     "by_output",
     "output_composition",
     "OutputComposition",
@@ -1013,6 +1014,28 @@ def by_category(ds: Dataset, provider: str) -> TableResult:
     )
 
 
+def input_cost(ds: Dataset, provider: str) -> float:
+    """Cost of *fresh input* tokens only (token type ``input``), priced on ``provider``.
+
+    The Composition "Input cost" KPI must price what you actually *sent fresh*
+    each turn, not the whole prompt. :func:`by_category` sums **every** token type
+    (input + output + all cache), i.e. ~the entire bill -- so reusing its
+    ``cost_usd`` for an "Input cost" headline overstates it by orders of
+    magnitude. This isolates the ``input`` rows, so the figure reconciles to the
+    Overview's fresh-input number (same token type, same :class:`CostEngine`).
+    Metrics only.
+    """
+    engine = CostEngine(provider, ds.pricing_path)
+    return round(
+        sum(
+            engine.cost(row.get("model") or "", "input", row["token_count"])
+            for row in ds.tokens
+            if row["token_type"] == "input"
+        ),
+        4,
+    )
+
+
 def _output_cost_by_prompt(ds: Dataset, engine: CostEngine) -> dict[str, float]:
     """``prompt_id -> USD`` of the generated **output** tokens only (3.x)."""
     costs: dict[str, float] = defaultdict(float)
@@ -1255,16 +1278,34 @@ class ContextElementCost:
     context turn after turn (size x turns of presence); ``load_cost`` the one-off
     ``cache_write`` of caching it. ``language`` is meaningful for ``file_read``
     (``-`` otherwise).
+
+    The raw token counts behind those prices ride alongside (``rent_read_tokens``
+    = the ``cache_read`` tokens; ``load_write_5m_tokens``/``load_write_1h_tokens``
+    = the ``cache_write`` tokens by TTL) so a view can plot the *size* of what
+    lingers in tokens, not only its provider-priced dollars.
     """
 
     source: str
     language: str
     load_cost: float
     rent_cost: float
+    rent_read_tokens: int
+    load_write_5m_tokens: int
+    load_write_1h_tokens: int
 
     @property
     def total_cost(self) -> float:
         return self.load_cost + self.rent_cost
+
+    @property
+    def load_tokens(self) -> int:
+        """One-off cache-write tokens of caching this element (5m + 1h)."""
+        return self.load_write_5m_tokens + self.load_write_1h_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        """Every token this element drove: rent (re-reads) + loading (writes)."""
+        return self.rent_read_tokens + self.load_tokens
 
 
 @dataclass(frozen=True)
@@ -1284,6 +1325,9 @@ class ContextCost:
     load_cost: float
     rent_cost: float
     unattributed_cost: float
+    rent_read_tokens: int
+    load_write_5m_tokens: int
+    load_write_1h_tokens: int
 
     @property
     def total_cost(self) -> float:
@@ -1292,6 +1336,16 @@ class ContextCost:
     @property
     def attributed_cost(self) -> float:
         return self.total_cost - self.unattributed_cost
+
+    @property
+    def load_tokens(self) -> int:
+        """Total one-off cache-write tokens across the attributed elements."""
+        return self.load_write_5m_tokens + self.load_write_1h_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        """Total context tokens (rent re-reads + loading writes), attributed only."""
+        return self.rent_read_tokens + self.load_tokens
 
     @property
     def has_data(self) -> bool:
@@ -1310,13 +1364,24 @@ def context_cost(ds: Dataset, provider: str) -> ContextCost:
     engine = CostEngine(provider, ds.pricing_path)
     load: dict[tuple[str, str], float] = defaultdict(float)
     rent: dict[tuple[str, str], float] = defaultdict(float)
+    # Raw token counts behind the prices, same (source, language) key, so a view
+    # can plot the size of context in tokens (D2 / Prompt 3 token charts).
+    rent_tok: dict[tuple[str, str], int] = defaultdict(int)
+    load5m_tok: dict[tuple[str, str], int] = defaultdict(int)
+    load1h_tok: dict[tuple[str, str], int] = defaultdict(int)
     for row in ds.context_cost:
         model = row.get("model") or ""
         key = (row.get("source") or "", row.get("language") or NO_LANGUAGE)
-        rent[key] += engine.cost(model, "cache_read", int(row.get("rent_read_tokens") or 0))
-        load[key] += engine.cost(
-            model, "cache_write_5m", int(row.get("load_write_5m_tokens") or 0)
-        ) + engine.cost(model, "cache_write_1h", int(row.get("load_write_1h_tokens") or 0))
+        read = int(row.get("rent_read_tokens") or 0)
+        write5m = int(row.get("load_write_5m_tokens") or 0)
+        write1h = int(row.get("load_write_1h_tokens") or 0)
+        rent_tok[key] += read
+        load5m_tok[key] += write5m
+        load1h_tok[key] += write1h
+        rent[key] += engine.cost(model, "cache_read", read)
+        load[key] += engine.cost(model, "cache_write_5m", write5m) + engine.cost(
+            model, "cache_write_1h", write1h
+        )
 
     keys = set(load) | set(rent)
     elements = [
@@ -1325,6 +1390,9 @@ def context_cost(ds: Dataset, provider: str) -> ContextCost:
             language=language,
             load_cost=round(load.get((source, language), 0.0), 6),
             rent_cost=round(rent.get((source, language), 0.0), 6),
+            rent_read_tokens=rent_tok.get((source, language), 0),
+            load_write_5m_tokens=load5m_tok.get((source, language), 0),
+            load_write_1h_tokens=load1h_tok.get((source, language), 0),
         )
         for source, language in keys
         if source != UNATTRIBUTED_SOURCE
@@ -1333,12 +1401,19 @@ def context_cost(ds: Dataset, provider: str) -> ContextCost:
     unattributed = sum(
         load.get(k, 0.0) + rent.get(k, 0.0) for k in keys if k[0] == UNATTRIBUTED_SOURCE
     )
+
+    def _attr_token_sum(per_key: dict[tuple[str, str], int]) -> int:
+        return sum(v for k, v in per_key.items() if k[0] != UNATTRIBUTED_SOURCE)
+
     return ContextCost(
         provider=provider,
         elements=elements,
         load_cost=round(sum(load.values()), 6),
         rent_cost=round(sum(rent.values()), 6),
         unattributed_cost=round(unattributed, 6),
+        rent_read_tokens=_attr_token_sum(rent_tok),
+        load_write_5m_tokens=_attr_token_sum(load5m_tok),
+        load_write_1h_tokens=_attr_token_sum(load1h_tok),
     )
 
 

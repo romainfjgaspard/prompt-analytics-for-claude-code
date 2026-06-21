@@ -159,9 +159,11 @@ def _render_input_section(ds: analytics.Dataset, provider: str) -> None:
         )
         return
 
-    total_cost = sum(float(r["cost_usd"] or 0.0) for r in rows)
     total_prompts = sum(int(r["prompts"] or 0) for r in rows)
     top = max(categorized, key=lambda r: float(r["cost_usd"] or 0.0))
+    # Fresh-input cost only (token type ``input``) -- NOT by_category's cost_usd,
+    # which is the whole prompt (input + output + cache ≈ the entire bill).
+    fresh_input_cost = analytics.input_cost(ds, provider)
 
     cols = st.columns(4)
     cols[0].metric("Prompts", f"{total_prompts:,}")
@@ -169,8 +171,8 @@ def _render_input_section(ds: analytics.Dataset, provider: str) -> None:
     cols[2].metric("Top category", str(top["category"]).title())
     cols[3].metric(
         f"Input cost ({provider})",
-        f"${total_cost:,.2f}",
-        delta=f"{float(top['cost_share_pct'] or 0):.0f}% {top['category']}",
+        f"${fresh_input_cost:,.2f}",
+        delta="fresh input tokens only",
         delta_color="off",
     )
 

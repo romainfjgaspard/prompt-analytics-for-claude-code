@@ -339,16 +339,19 @@ class ContextItem(TypedDict):
 
 
 class TodoEvent(TypedDict):
-    """One ``TodoWrite`` snapshot Claude Code wrote on the main thread (Axe B2).
+    """One "active task" marker Claude Code wrote on the main thread (Axe B2).
 
-    Claude Code rewrites the *whole* todo list on every ``TodoWrite``; we keep
-    only the ``in_progress`` todo's label (the active task at that moment) plus
-    the ``prompt_id`` it happened under and the timestamp, so task assembly can
-    map each prompt to the todo active during its turn. ``label`` is empty when
-    no todo is ``in_progress`` in that snapshot (all pending/completed).
-    ``dedup_id`` is the tool-use id so a replayed (resumed) session is not
-    double-counted. The label is a Claude-authored task name, not user content
-    nor source code -- safe to keep (it is the task's centre of gravity).
+    Two harness mechanisms feed this same shape: a ``TodoWrite`` snapshot (whole
+    list rewritten each call -- we keep the ``in_progress`` todo's label) and the
+    ``Task*`` family (a ``TaskUpdate`` flipping a task ``in_progress``, its label
+    resolved from the matching ``TaskCreate`` subject). Either way we keep only
+    the active-task ``label`` plus the ``prompt_id`` it happened under and the
+    timestamp, so task assembly can map each prompt to the task active during its
+    turn. ``label`` is empty when nothing is ``in_progress`` (all
+    pending/completed). ``dedup_id`` is the tool-use id so a replayed (resumed)
+    session is not double-counted. The label is a Claude-authored task name, not
+    user content nor source code -- safe to keep (it is the task's centre of
+    gravity).
     """
 
     prompt_id: str

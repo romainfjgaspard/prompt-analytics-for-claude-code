@@ -109,8 +109,9 @@ __all__ = ["run_extract", "collect", "parse_file", "ExtractReport", "ExtractResu
 # results + attachments) and the prompt ``text_tokens``; V5 adds the
 # project-relative file ``path`` to edits (Axe C) and context items (Axe D) so
 # the unified per-file view joins a file's edits to its reads (DASH4 / D5-D6);
-# V6 adds the Axe B2 ``TodoWrite`` events (the task spine).
-CACHE_VERSION = 6
+# V6 adds the Axe B2 ``TodoWrite`` events (the task spine); V7 also feeds that
+# spine from the harness's ``Task*`` family (``TaskCreate``/``TaskUpdate``).
+CACHE_VERSION = 7
 
 PREVIEW_CHARS = 100
 
@@ -266,6 +267,24 @@ def _todo_in_progress_label(tool_input: Any) -> str:
     return ""
 
 
+def _task_create_subject(tool_input: Any) -> str:
+    """The ``subject`` (task label) of a ``TaskCreate`` input (Axe B2).
+
+    The harness's ``Task*`` tool family is an alternative task spine to
+    ``TodoWrite``: ``TaskCreate`` opens a task (its ``subject`` is the label) and
+    is assigned the next 1-based id of the session, ``TaskUpdate`` flips a task's
+    ``status``. The task left ``in_progress`` is the active task at that moment --
+    exactly the role ``TodoWrite``'s in-progress todo plays -- so both feed the
+    same spine. The agent-control tools (``TaskStop``/``TaskOutput``/``TaskGet``,
+    keyed by an alphanumeric ``task_id``) drive spawned sub-agents, carry no todo
+    label, and are deliberately ignored. A Claude-authored task name, never user
+    content.
+    """
+    if not isinstance(tool_input, dict):
+        return ""
+    return str(tool_input.get("subject") or "").strip()
+
+
 def _dedup_key(message: dict[str, Any], event: dict[str, Any]) -> str:
     """Global deduplication key for an assistant usage line.
 
@@ -325,6 +344,14 @@ def parse_file(filepath: Path) -> ParsedFile:
     # Axe D: tool-use id -> (source, language), filled from assistant tool calls
     # so the later ``tool_result`` (which only carries the id) can be classified.
     tool_use_meta: dict[str, tuple[str, str, str]] = {}
+    # Axe B2: the harness's ``Task*`` spine. ``TaskCreate`` calls get a 1-based
+    # per-session id (verified against the "Task #N created" result -- 0 mismatch
+    # on real logs); this running map lets a later ``TaskUpdate`` resolve its
+    # task's label. A resumed session replays the creates in the same order, so
+    # the per-file count matches the original id (and the replayed updates dedup
+    # by tool-use id, like ``TodoWrite``).
+    task_subjects: dict[str, str] = {}
+    task_create_seq = 0
     lines_total = 0
     lines_invalid = 0
     event_types: Counter[str] = Counter()
@@ -447,27 +474,48 @@ def parse_file(filepath: Path) -> ParsedFile:
                 content = message.get("content")
                 # Axe D: remember each tool call's (source, language, path) so the
                 # matching tool_result (carrying only the id) is classifiable.
-                # Axe B2: a ``TodoWrite`` records the active task -- capture the
-                # in-progress label so prompts can be attached to it (main thread
-                # only; a subagent's todos belong to its own context).
+                # Axe B2: capture the active task -- either a ``TodoWrite`` snapshot
+                # or the ``Task*`` family (``TaskCreate`` names a task, ``TaskUpdate``
+                # marks one ``in_progress``) -- so prompts can be attached to it
+                # (main thread only; a subagent's todos belong to its own context).
                 if not event.get("isSidechain"):
                     tool_use_meta.update(
                         assistant_tool_metas(content, str(event.get("cwd") or session_cwd))
                     )
+                    ts = str(event.get("timestamp") or "")
                     for block in content if isinstance(content, list) else []:
-                        if (
-                            isinstance(block, dict)
-                            and block.get("type") == "tool_use"
-                            and block.get("name") == "TodoWrite"
-                        ):
+                        if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                            continue
+                        name = block.get("name")
+                        if name == "TodoWrite":
                             todo_events.append(
                                 TodoEvent(
                                     prompt_id=pid,
-                                    timestamp=str(event.get("timestamp") or ""),
+                                    timestamp=ts,
                                     label=_todo_in_progress_label(block.get("input")),
                                     dedup_id=str(block.get("id") or event_uuid),
                                 )
                             )
+                        elif name == "TaskCreate":
+                            task_create_seq += 1
+                            task_subjects[str(task_create_seq)] = _task_create_subject(
+                                block.get("input")
+                            )
+                        elif name == "TaskUpdate":
+                            raw_input = block.get("input")
+                            if (
+                                isinstance(raw_input, dict)
+                                and raw_input.get("status") == "in_progress"
+                            ):
+                                task_id = str(raw_input.get("taskId") or "")
+                                todo_events.append(
+                                    TodoEvent(
+                                        prompt_id=pid,
+                                        timestamp=ts,
+                                        label=task_subjects.get(task_id, ""),
+                                        dedup_id=str(block.get("id") or event_uuid),
+                                    )
+                                )
                 tool_use_ids = [
                     str(block["id"])
                     for block in (content if isinstance(content, list) else [])

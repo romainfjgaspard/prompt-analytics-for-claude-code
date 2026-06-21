@@ -354,6 +354,15 @@ def test_by_category_hand_computed(ds):
     assert any("0.50" in note for note in result.notes)
 
 
+def test_input_cost_is_fresh_input_only(ds):
+    """``input_cost`` prices only the ``input`` token rows: it equals the
+    by_token_type fresh-input figure ($6.50) and stays well below the whole bill
+    (``by_category`` sums every token type, ~the entire bill)."""
+    assert analytics.input_cost(ds, "anthropic") == 6.5
+    full_bill = sum(row["cost_usd"] for row in analytics.by_category(ds, "anthropic").rows)
+    assert analytics.input_cost(ds, "anthropic") < full_bill
+
+
 def test_by_category_without_categorization_suggests_categorize(ds):
     ds.categories = {}
     result = analytics.by_category(ds, "anthropic")
@@ -957,6 +966,27 @@ def test_context_cost_reconciles_to_the_billed_main_chain():
     assert comp.total_cost == pytest.approx(8.85, abs=1e-6)
     assert comp.total_cost == pytest.approx(bill, abs=1e-6)  # subagent read excluded
     assert comp.attributed_cost == pytest.approx(8.75, abs=1e-6)
+
+
+def test_context_cost_exposes_token_counts_for_token_charts():
+    """Each element and the whole ContextCost expose the raw cache tokens behind
+    the prices (rent reads + loading writes), attributed-only, so a view can plot
+    context size in tokens, not just dollars (Prompt 3)."""
+    comp = analytics.context_cost(_context_cost_ds(), "anthropic")
+    by_src = {(e.source, e.language): e for e in comp.elements}
+    python = by_src[("file_read", "Python")]
+    assert python.rent_read_tokens == 2_000_000
+    assert python.load_tokens == 1_000_000  # 5m + 1h
+    assert python.total_tokens == 3_000_000
+    conv = by_src[("conversation", "-")]
+    assert conv.load_write_1h_tokens == 100_000
+    assert conv.total_tokens == 1_100_000
+    # Aggregate totals exclude the (unattributed) 0.2M rent (mirrors elements).
+    assert comp.rent_read_tokens == 3_000_000
+    assert comp.load_write_5m_tokens == 1_000_000
+    assert comp.load_write_1h_tokens == 100_000
+    assert comp.load_tokens == 1_100_000
+    assert comp.total_tokens == 4_100_000
 
 
 def test_by_context_table_sorted_with_total_and_unattributed():

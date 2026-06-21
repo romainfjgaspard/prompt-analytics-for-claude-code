@@ -711,7 +711,7 @@ def test_refresh_data_disabled_on_demo(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_refresh_data_runs_pipeline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """refresh_data runs extract -> snapshot -> heuristic categorize and summarizes."""
+    """refresh_data runs extract -> snapshot -> *semantic* categorize and summarizes."""
     from dataclasses import dataclass
 
     from prompt_analytics import categorize, extract, snapshot
@@ -738,6 +738,7 @@ def test_refresh_data_runs_pipeline(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     def fake_categorize(*, output_dir: str, **kwargs: object) -> int:
         calls["categorize"] = output_dir
         calls["use_llm"] = kwargs.get("use_llm", False)
+        calls["use_semantic"] = kwargs.get("use_semantic", False)
         return 42
 
     monkeypatch.setattr(extract, "run_extract", fake_extract)
@@ -749,6 +750,45 @@ def test_refresh_data_runs_pipeline(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert calls["extract"] == tmp_path
     assert calls["snapshot"] == tmp_path
     assert calls["categorize"] == str(tmp_path)
-    assert calls["use_llm"] is False  # heuristic only -- no API cost from the button
+    assert calls["use_llm"] is False  # never the LLM -- no API cost from the button
+    assert calls["use_semantic"] is True  # semantic is the dashboard default
     assert "42 prompts" in summary
     assert "7 sessions" in summary
+
+
+def test_refresh_data_falls_back_to_heuristic_when_embedder_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When the embedding model can't load (offline / model2vec missing) the
+    semantic run raises RuntimeError; refresh_data must fall back to the heuristic
+    classifier rather than failing the whole refresh."""
+    from dataclasses import dataclass
+
+    from prompt_analytics import categorize, extract, snapshot
+    from prompt_analytics.dashboard import data as data_mod
+
+    monkeypatch.delenv("CCA_DEMO", raising=False)
+    monkeypatch.setattr(data_mod, "data_dir", lambda: tmp_path)
+
+    @dataclass
+    class _Report:
+        prompts: int = 3
+        sessions: int = 1
+
+    modes: list[bool] = []
+
+    def fake_categorize(*, output_dir: str, **kwargs: object) -> int:
+        semantic = bool(kwargs.get("use_semantic", False))
+        modes.append(semantic)
+        if semantic:
+            raise RuntimeError("Could not load the static embedding model")
+        return 3
+
+    monkeypatch.setattr(extract, "run_extract", lambda directory, **_k: _Report())
+    monkeypatch.setattr(snapshot, "run_snapshot", lambda directory: 0)
+    monkeypatch.setattr(categorize, "run_categorize", fake_categorize)
+
+    summary = data_mod.refresh_data()
+
+    assert modes == [True, False]  # tried semantic, then fell back to heuristic
+    assert "3 prompts" in summary

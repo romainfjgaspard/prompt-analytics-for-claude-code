@@ -338,11 +338,14 @@ def refresh_data() -> str:
     Backs the sidebar "Refresh data" button so a user never has to drop to a
     terminal to pull in new prompts: it regenerates the CSVs the dashboard reads
     from the local ``~/.claude`` logs, snapshots the current quota, and applies
-    the **heuristic** categorizer (local, no API key, no cost -- the LLM
-    classifier stays a deliberate terminal action). The caller clears the
-    mtime-keyed cache and reruns afterwards. Returns a one-line summary for a
-    toast. Refuses to run against the bundled demo dataset (no logs to extract,
-    and it must never overwrite the committed ``demo_data``).
+    the **semantic** categorizer (offline embeddings, no API key, no cost -- the
+    dashboard's default classifier), falling back to the **heuristic** one when
+    the embedding model can't load (fully offline / ``model2vec`` missing) so a
+    refresh never fails on that account. The LLM classifier stays a deliberate
+    terminal action. The caller clears the mtime-keyed cache and reruns
+    afterwards. Returns a one-line summary for a toast. Refuses to run against the
+    bundled demo dataset (no logs to extract, and it must never overwrite the
+    committed ``demo_data``).
     """
     if is_demo():
         raise RuntimeError("Refresh is disabled on the demo dataset.")
@@ -351,7 +354,12 @@ def refresh_data() -> str:
     directory = data_dir()
     report = extract.run_extract(directory)
     snapshot.run_snapshot(directory)
-    categorize.run_categorize(output_dir=str(directory))
+    try:
+        categorize.run_categorize(output_dir=str(directory), use_semantic=True)
+    except RuntimeError:
+        # Embedding model unavailable (offline, model2vec not installed): keep the
+        # heuristic as the offline fallback rather than failing the whole refresh.
+        categorize.run_categorize(output_dir=str(directory))
     return f"Extracted {report.prompts:,} prompts across {report.sessions:,} sessions."
 
 

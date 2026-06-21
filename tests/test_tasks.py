@@ -216,6 +216,93 @@ def test_extract_writes_tasks_from_real_todowrite(fake_claude):
     assert all(e["task_id"] == tasks[0]["task_id"] for e in links)
 
 
+def _task_create(tool_id, subject):
+    return {
+        "type": "tool_use",
+        "id": tool_id,
+        "name": "TaskCreate",
+        "input": {"subject": subject, "description": "do it well"},
+    }
+
+
+def _task_update(tool_id, task_id, status):
+    return {
+        "type": "tool_use",
+        "id": tool_id,
+        "name": "TaskUpdate",
+        "input": {"taskId": task_id, "status": status},
+    }
+
+
+def test_extract_writes_tasks_from_the_task_family_spine(fake_claude):
+    """The harness's ``Task*`` family feeds the same todo spine as ``TodoWrite``:
+    ``TaskCreate`` names a task (1-based per-session id), ``TaskUpdate`` marks one
+    ``in_progress``, and each prompt attaches to the task active during its turn.
+    """
+    events = [
+        _user("p1", "2026-06-01T10:00:00.000Z", "start the feature"),
+        _assistant(
+            "r1",
+            "2026-06-01T10:00:01.000Z",
+            "u-p1",
+            [_task_create("tc1", "Build feature X"), _task_create("tc2", "Write the tests")],
+        ),
+        _assistant(
+            "r2", "2026-06-01T10:00:02.000Z", "u-p1", [_task_update("tu1", "1", "in_progress")]
+        ),
+        _user("p2", "2026-06-01T10:10:00.000Z", "now the tests"),
+        _assistant(
+            "r3",
+            "2026-06-01T10:10:01.000Z",
+            "u-p2",
+            [_task_update("tu2", "1", "completed"), _task_update("tu3", "2", "in_progress")],
+        ),
+        _user("p3", "2026-06-01T10:20:00.000Z", "commit it"),
+        _assistant("r4", "2026-06-01T10:20:01.000Z", "u-p3", [{"type": "text", "text": "done"}]),
+    ]
+    fake_claude.write("task_family.jsonl", events)
+    run_extract(fake_claude.out)
+
+    tasks = _read_csv(fake_claude.out / "tasks.csv")
+    links = _read_csv(fake_claude.out / "task_prompts.csv")
+    assert [t["origin"] for t in tasks] == ["todo", "todo"]
+    by_name = {t["name"]: t for t in tasks}
+    assert set(by_name) == {"Build feature X", "Write the tests"}
+    link_by_pid = {e["prompt_id"]: e["task_id"] for e in links}
+    assert link_by_pid["p1"] == by_name["Build feature X"]["task_id"]
+    assert link_by_pid["p2"] == by_name["Write the tests"]["task_id"]
+    assert link_by_pid["p3"] == by_name["Write the tests"]["task_id"]
+
+
+def test_task_family_ignores_sidechain_and_agent_control(fake_claude):
+    """A subagent's ``TaskUpdate`` (``isSidechain``) and the agent-control tools
+    (``TaskStop``, keyed by an alphanumeric ``task_id``) are not a main-thread
+    todo, so a session carrying only those falls to inference, not the spine."""
+    side = _assistant(
+        "r1",
+        "2026-06-01T10:00:01.000Z",
+        "u-p1",
+        [_task_create("tc1", "subagent task"), _task_update("tu1", "1", "in_progress")],
+    )
+    side["isSidechain"] = True
+    events = [
+        _user("p1", "2026-06-01T10:00:00.000Z", "do the thing"),
+        side,
+        _assistant(
+            "r2",
+            "2026-06-01T10:00:02.000Z",
+            "u-p1",
+            [{"type": "tool_use", "id": "ts1", "name": "TaskStop", "input": {"task_id": "b89nz"}}],
+        ),
+    ]
+    fake_claude.write("agent_control.jsonl", events)
+    run_extract(fake_claude.out)
+
+    tasks = _read_csv(fake_claude.out / "tasks.csv")
+    assert tasks
+    assert all(t["origin"] == "inferred" for t in tasks)
+
+
 def test_task_cost_reconciles_with_total_prompt_cost():
     """Every real prompt is in exactly one task, so the task costs sum to the
     real-prompt bill exactly (the B2 reconciliation invariant on demo data)."""
