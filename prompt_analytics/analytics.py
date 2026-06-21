@@ -33,8 +33,16 @@ from pathlib import Path
 from typing import Any
 
 from . import extract, paths
+from .compose import detect_kind
+from .context import NO_LANGUAGE, NO_PATH
 from .pricing import get_model_pricing, get_per_request, is_long_context, load_pricing
-from .schema import REQUESTS_COLS, TOKEN_TYPE_LABELS, TOKEN_TYPES, TOKENS_COLS
+from .schema import (
+    REQUESTS_COLS,
+    TOKEN_TYPE_LABELS,
+    TOKEN_TYPES,
+    TOKENS_COLS,
+    UNATTRIBUTED_SOURCE,
+)
 
 __all__ = [
     "Column",
@@ -45,12 +53,32 @@ __all__ = [
     "dataset_from_csvs",
     "filter_project",
     "filter_dates",
+    "filter_prompt_ids",
+    "split_on_pivot",
     "known_providers",
     "summary",
     "by_project",
     "by_model",
     "by_token_type",
     "by_category",
+    "input_cost",
+    "by_output",
+    "output_composition",
+    "OutputComposition",
+    "LanguageComposition",
+    "by_context",
+    "context_cost",
+    "ContextCost",
+    "ContextElementCost",
+    "file_graph",
+    "FileGraph",
+    "FileNode",
+    "FileSatellite",
+    "by_task",
+    "task_graph",
+    "TaskGraph",
+    "TaskNode",
+    "TaskSatellite",
     "top_prompts",
     "sessions_table",
     "session_depth",
@@ -64,6 +92,14 @@ __all__ = [
     "timeline",
     "break_even",
     "compare_providers",
+    "impact",
+    "impact_report",
+    "ImpactReport",
+    "ImpactMetric",
+    "suggest_pivots",
+    "day_before",
+    "impact_fmt_value",
+    "impact_fmt_change",
     "flat_export",
     "mini_summary",
 ]
@@ -158,6 +194,25 @@ class Dataset:
     source: str  # human-readable provenance for the notes
     pricing_path: Path | None = None
     requests: list[dict[str, Any]] = field(default_factory=list)
+    # Output composition (Axe C). Long per (prompt_id, language, kind); and the
+    # per-prompt prose/code split of the generated output tokens. Empty when
+    # reading a pre-Axe-C extract (the `by-output` view degrades gracefully).
+    output_files: list[dict[str, Any]] = field(default_factory=list)
+    output_tokens: list[dict[str, Any]] = field(default_factory=list)
+    # Context composition (Axe D, static snapshot). Long per
+    # (session_id, source, language): the local-tokenizer size of each context
+    # source. Empty when reading a pre-Axe-D extract.
+    context_sources: list[dict[str, Any]] = field(default_factory=list)
+    # Context cost over time (Axe D, D2). Long per (session, source, language,
+    # model): the real cache tokens attributed by size x turns of presence (rent)
+    # and one-off loading (write). Empty when reading a pre-D2 extract.
+    context_cost: list[dict[str, Any]] = field(default_factory=list)
+    # Task attribution (Axe B2). ``tasks`` is the task dimension (one row per
+    # task); ``task_prompts`` the prompt->task membership edges. A task's cost is
+    # derived at read time by joining ``task_prompts`` -> ``tokens``. Empty when
+    # reading a pre-B2 extract (the `by-task` view degrades gracefully).
+    tasks: list[dict[str, Any]] = field(default_factory=list)
+    task_prompts: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
@@ -280,6 +335,12 @@ def load_dataset(
         source=source,
         pricing_path=pricing_path,
         requests=[dict(row) for row in result.requests],
+        output_files=[dict(row) for row in result.output_files],
+        output_tokens=[dict(row) for row in result.output_tokens],
+        context_sources=[dict(row) for row in result.context_sources],
+        context_cost=[dict(row) for row in result.context_cost],
+        tasks=[dict(row) for row in result.tasks],
+        task_prompts=[dict(row) for row in result.task_prompts],
     )
 
 
@@ -309,9 +370,23 @@ def dataset_from_csvs(
     prompts = _rows("prompts.csv")
     tokens = _rows("tokens.csv")
     requests = _rows("requests.csv")
+    output_files = _rows("output_files.csv")
+    output_tokens = _rows("output_tokens.csv")
+    context_sources = _rows("context_sources.csv")
+    context_cost = _rows("context_cost.csv")
+    tasks = _rows("tasks.csv")
+    task_prompts = _rows("task_prompts.csv")
     _coerce_int(prompts, ("prompt_index", "char_count", "assistant_turns", "tool_calls"))
     _coerce_int(tokens, ("token_count", "is_sidechain"))
     _coerce_int(requests, _REQUEST_INT_COLS)
+    _coerce_int(output_files, ("edits", "lines_added", "lines_deleted"))
+    _coerce_int(output_tokens, ("output_prose_tokens", "output_code_tokens"))
+    _coerce_int(context_sources, ("tokens", "items"))
+    _coerce_int(
+        context_cost,
+        ("rent_read_tokens", "load_write_5m_tokens", "load_write_1h_tokens"),
+    )
+    _coerce_int(tasks, ("prompts",))
     if source is None:
         window = _window_label(data_dir)
         source = f"{data_dir} CSVs ({window})" if window else f"{data_dir} CSVs"
@@ -323,6 +398,12 @@ def dataset_from_csvs(
         source=source,
         pricing_path=pricing_path,
         requests=requests,
+        output_files=output_files,
+        output_tokens=output_tokens,
+        context_sources=context_sources,
+        context_cost=context_cost,
+        tasks=tasks,
+        task_prompts=task_prompts,
     )
 
 
@@ -337,14 +418,22 @@ def filter_project(ds: Dataset, project: str) -> Dataset:
     session_ids = {
         row["session_id"] for row in ds.sessions if (row.get("project") or "") == project
     }
+    kept_prompts = [row for row in ds.prompts if row["session_id"] in session_ids]
+    kept_prompt_ids = {row["prompt_id"] for row in kept_prompts}
     return Dataset(
         sessions=[row for row in ds.sessions if row["session_id"] in session_ids],
-        prompts=[row for row in ds.prompts if row["session_id"] in session_ids],
+        prompts=kept_prompts,
         tokens=[row for row in ds.tokens if row["session_id"] in session_ids],
         categories=ds.categories,
         source=ds.source,
         pricing_path=ds.pricing_path,
         requests=[row for row in ds.requests if row["session_id"] in session_ids],
+        output_files=[row for row in ds.output_files if row["prompt_id"] in kept_prompt_ids],
+        output_tokens=[row for row in ds.output_tokens if row["prompt_id"] in kept_prompt_ids],
+        context_sources=[row for row in ds.context_sources if row["session_id"] in session_ids],
+        context_cost=[row for row in ds.context_cost if row["session_id"] in session_ids],
+        tasks=[row for row in ds.tasks if row["session_id"] in session_ids],
+        task_prompts=[row for row in ds.task_prompts if row["prompt_id"] in kept_prompt_ids],
     )
 
 
@@ -391,6 +480,50 @@ def filter_dates(ds: Dataset, since: str | None, until: str | None) -> Dataset:
         source=ds.source,
         pricing_path=ds.pricing_path,
         requests=[row for row in ds.requests if _keep_usage(row)],
+        # Output rows exist for real prompts only -> follow their prompt_id.
+        output_files=[row for row in ds.output_files if row["prompt_id"] in kept_prompt_ids],
+        output_tokens=[row for row in ds.output_tokens if row["prompt_id"] in kept_prompt_ids],
+        # Context rows are per session -> keep those whose session keeps a prompt.
+        context_sources=[
+            row for row in ds.context_sources if row["session_id"] in kept_session_ids
+        ],
+        context_cost=[row for row in ds.context_cost if row["session_id"] in kept_session_ids],
+        # Tasks follow their session; membership edges follow their kept prompt.
+        tasks=[row for row in ds.tasks if row["session_id"] in kept_session_ids],
+        task_prompts=[row for row in ds.task_prompts if row["prompt_id"] in kept_prompt_ids],
+    )
+
+
+def filter_prompt_ids(ds: Dataset, prompt_ids: set[str] | frozenset[str]) -> Dataset:
+    """A view of ``ds`` restricted to a set of prompt ids (dashboard cross-filter).
+
+    The dashboard applies its sidebar / chart-click selection on the pandas
+    frames, then hands the surviving prompt ids here so the output-composition
+    view honours the very same filter as every other tab. The Axe-C analyses
+    read only prompts / tokens / output rows, so sessions and requests ride
+    along unnarrowed (cheaper, and they are not consulted).
+    """
+    kept = set(prompt_ids)
+    task_prompts = [row for row in ds.task_prompts if row.get("prompt_id") in kept]
+    # The task dimension honours the selection too: keep only tasks that retain at
+    # least one member prompt, so the task count / averages describe the scope (a
+    # task with all its prompts filtered out is no longer "in range").
+    kept_task_ids = {row["task_id"] for row in task_prompts}
+    return Dataset(
+        sessions=ds.sessions,
+        prompts=[row for row in ds.prompts if row.get("prompt_id") in kept],
+        tokens=[row for row in ds.tokens if row.get("prompt_id") in kept],
+        categories=ds.categories,
+        source=ds.source,
+        pricing_path=ds.pricing_path,
+        requests=ds.requests,
+        output_files=[row for row in ds.output_files if row.get("prompt_id") in kept],
+        output_tokens=[row for row in ds.output_tokens if row.get("prompt_id") in kept],
+        # Session-grain context rows ride along unnarrowed, like sessions.
+        context_sources=ds.context_sources,
+        context_cost=ds.context_cost,
+        tasks=[row for row in ds.tasks if row["task_id"] in kept_task_ids],
+        task_prompts=task_prompts,
     )
 
 
@@ -886,6 +1019,1138 @@ def by_category(ds: Dataset, provider: str) -> TableResult:
         ],
         rows,
         notes,
+    )
+
+
+def input_cost(ds: Dataset, provider: str) -> float:
+    """Cost of *fresh input* tokens only (token type ``input``), priced on ``provider``.
+
+    The Composition "Input cost" KPI must price what you actually *sent fresh*
+    each turn, not the whole prompt. :func:`by_category` sums **every** token type
+    (input + output + all cache), i.e. ~the entire bill -- so reusing its
+    ``cost_usd`` for an "Input cost" headline overstates it by orders of
+    magnitude. This isolates the ``input`` rows, so the figure reconciles to the
+    Overview's fresh-input number (same token type, same :class:`CostEngine`).
+    Metrics only.
+    """
+    engine = CostEngine(provider, ds.pricing_path)
+    return round(
+        sum(
+            engine.cost(row.get("model") or "", "input", row["token_count"])
+            for row in ds.tokens
+            if row["token_type"] == "input"
+        ),
+        4,
+    )
+
+
+def _output_cost_by_prompt(ds: Dataset, engine: CostEngine) -> dict[str, float]:
+    """``prompt_id -> USD`` of the generated **output** tokens only (3.x)."""
+    costs: dict[str, float] = defaultdict(float)
+    for row in ds.tokens:
+        if row["token_type"] == "output":
+            costs[row["prompt_id"]] += engine.cost(
+                row.get("model") or "", "output", row["token_count"]
+            )
+    return costs
+
+
+@dataclass(frozen=True)
+class LanguageComposition:
+    """One language's slice of what the assistant produced (Axe C).
+
+    ``test_added`` is the share of ``lines_added`` that landed in tests;
+    ``code_cost`` is the output spend attributed to this language (the code
+    half of the prose/code split, distributed across the languages a prompt
+    edited by line churn).
+    """
+
+    language: str
+    files: int
+    lines_added: int
+    lines_deleted: int
+    test_added: int
+    code_cost: float
+
+
+@dataclass(frozen=True)
+class OutputComposition:
+    """Structured Axe-C output-composition metrics (shared by CLI + dashboard).
+
+    ``languages`` is sorted by lines produced (added), descending. The cost
+    split prorates each prompt's real ``output`` cost by its local-tokenizer
+    prose/code weight (the honest estimate the plan settled on); the code half
+    is then attributed across the languages a prompt edited, by line churn.
+    Code spend with no file edit (Bash / Read / Grep only) lands in
+    ``tooling_cost``, so the per-language costs plus ``tooling_cost`` reconcile
+    to ``code_cost``. Metrics only -- no source code is read here.
+    """
+
+    provider: str
+    languages: list[LanguageComposition]
+    total_files: int
+    total_added: int
+    total_deleted: int
+    total_test: int
+    prose_tokens: int
+    code_tokens: int
+    prose_cost: float
+    code_cost: float
+    tooling_cost: float
+
+    @property
+    def has_data(self) -> bool:
+        """True when there is any line-diff or prose/code-token metric to show."""
+        return bool(self.languages) or bool(self.prose_tokens or self.code_tokens)
+
+
+def output_composition(ds: Dataset, provider: str) -> OutputComposition:
+    """Compute the Axe-C output-composition metrics (see :class:`OutputComposition`).
+
+    Aggregates the per-prompt file-edit rows by language (lines +/-, files,
+    test share) and prorates the generated output cost into a prose half and a
+    code half, the latter attributed back to languages by line churn. The pure
+    numbers feed both :func:`by_output` (the CLI table + notes) and the
+    dashboard's Composition view, so the two never drift.
+    """
+    added: Counter[str] = Counter()
+    deleted: Counter[str] = Counter()
+    paths_by_lang: dict[str, set[str]] = defaultdict(set)
+    test_added: Counter[str] = Counter()
+    # Per-prompt language churn (added + deleted), the weight used to attribute
+    # each prompt's code cost across the languages it touched.
+    prompt_churn: dict[str, Counter[str]] = defaultdict(Counter)
+    for row in ds.output_files:
+        language = row.get("language") or "(unknown)"
+        la = int(row.get("lines_added") or 0)
+        ld = int(row.get("lines_deleted") or 0)
+        added[language] += la
+        deleted[language] += ld
+        # One row per file (path); count distinct files so a file edited across
+        # several prompts is still one file touched.
+        paths_by_lang[language].add(row.get("path") or "")
+        if (row.get("kind") or "") == "test":
+            test_added[language] += la
+        prompt_churn[row["prompt_id"]][language] += la + ld
+    files: Counter[str] = Counter({lang: len(paths) for lang, paths in paths_by_lang.items()})
+
+    engine = CostEngine(provider, ds.pricing_path)
+    out_cost = _output_cost_by_prompt(ds, engine)
+
+    prose_tokens = code_tokens = 0
+    prose_cost = code_cost = tooling_cost = 0.0
+    lang_cost: dict[str, float] = defaultdict(float)
+    for row in ds.output_tokens:
+        prose = int(row.get("output_prose_tokens") or 0)
+        code = int(row.get("output_code_tokens") or 0)
+        prose_tokens += prose
+        code_tokens += code
+        weight = prose + code
+        pid = row["prompt_id"]
+        pid_cost = out_cost.get(pid, 0.0)
+        prose_share = pid_cost * prose / weight if weight else pid_cost
+        code_share = pid_cost - prose_share
+        prose_cost += prose_share
+        code_cost += code_share
+        churn = prompt_churn.get(pid)
+        total_churn = sum(churn.values()) if churn else 0
+        if churn and total_churn:
+            for language, c in churn.items():
+                lang_cost[language] += code_share * c / total_churn
+        else:
+            # Code tokens with no file edit (Bash / Read / Grep only): no
+            # language to attribute to, so they form an honest tooling bucket.
+            tooling_cost += code_share
+
+    languages = [
+        LanguageComposition(
+            language=language,
+            files=files.get(language, 0),
+            lines_added=lines_added,
+            lines_deleted=deleted.get(language, 0),
+            test_added=test_added.get(language, 0),
+            code_cost=round(lang_cost.get(language, 0.0), 6),
+        )
+        for language, lines_added in sorted(added.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    return OutputComposition(
+        provider=provider,
+        languages=languages,
+        total_files=sum(files.values()),
+        total_added=sum(added.values()),
+        total_deleted=sum(deleted.values()),
+        total_test=sum(test_added.values()),
+        prose_tokens=prose_tokens,
+        code_tokens=code_tokens,
+        prose_cost=round(prose_cost, 6),
+        code_cost=round(code_cost, 6),
+        tooling_cost=round(tooling_cost, 6),
+    )
+
+
+def by_output(ds: Dataset, provider: str) -> TableResult:
+    """Output composition (Axe C): what the assistant actually produced.
+
+    The main table is the **language mix** (one row per language, sorted by
+    lines produced) with, per language, the files touched, the exact +/- line
+    diff, and the share of those added lines that landed in **tests** vs code.
+    Two headline notes carry the cross-language story: the overall test ratio of
+    the produced lines, and the **prose vs code** split of the generated output
+    tokens priced on ``provider`` (each prompt's output cost prorated by its
+    local-tokenizer prose/code weight). Metrics only -- no source code is ever
+    read here, just the integer rows ``extract`` derived. The pure computation
+    lives in :func:`output_composition` (shared with the dashboard).
+    """
+    comp = output_composition(ds, provider)
+    total_added = comp.total_added
+    total_test = comp.total_test
+
+    rows: list[dict[str, Any]] = []
+    for lang in comp.languages:
+        rows.append(
+            {
+                "language": lang.language,
+                "files": lang.files,
+                "lines_added": lang.lines_added,
+                "lines_deleted": lang.lines_deleted,
+                "test_pct": round(100 * lang.test_added / lang.lines_added, 1)
+                if lang.lines_added
+                else 0.0,
+                "share_pct": round(100 * lang.lines_added / total_added, 1) if total_added else 0.0,
+            }
+        )
+    if rows:
+        rows.append(
+            {
+                "language": "TOTAL",
+                "files": comp.total_files,
+                "lines_added": total_added,
+                "lines_deleted": comp.total_deleted,
+                "test_pct": round(100 * total_test / total_added, 1) if total_added else 0.0,
+                "share_pct": 100.0 if total_added else 0.0,
+            }
+        )
+
+    notes = [_source_note(ds)]
+    if not ds.output_files and not ds.output_tokens:
+        notes.append(
+            "No output-composition data -- re-run `prompt-analytics extract` "
+            "(these metrics ship with the latest extractor)."
+        )
+
+    engine = CostEngine(provider, ds.pricing_path)
+    if total_added:
+        notes.append(
+            f"Code vs tests: {round(100 * total_test / total_added, 1)}% of the "
+            f"{total_added:,} added lines are tests "
+            f"({total_added - total_test:,} code, {total_test:,} test)."
+        )
+    if comp.prose_tokens or comp.code_tokens:
+        gen_cost = comp.prose_cost + comp.code_cost
+        code_cost_share = round(100 * comp.code_cost / gen_cost, 1) if gen_cost else 0.0
+        notes.append(
+            f"Generated output: {comp.prose_tokens:,} prose tokens (${comp.prose_cost:,.2f}) vs "
+            f"{comp.code_tokens:,} code/tool tokens (${comp.code_cost:,.2f}) -- "
+            f"{code_cost_share}% of generation cost is code."
+        )
+    if (note := engine.note()) is not None:
+        notes.append(note)
+    if (lc_note := engine.long_context_note()) is not None:
+        notes.append(lc_note)
+
+    return TableResult(
+        f"Output composition ({provider})",
+        [
+            Column("language", "Language"),
+            Column("files", "Files", "int"),
+            Column("lines_added", "Lines +", "int"),
+            Column("lines_deleted", "Lines −", "int"),
+            Column("test_pct", "Test %", "pct"),
+            Column("share_pct", "Lines %", "pct"),
+        ],
+        rows,
+        notes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axe D: context cost over time (D2) -- the real cost of a context element.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ContextElementCost:
+    """One context element's cost split into loading vs rent (Axe D).
+
+    ``rent_cost`` is the priced ``cache_read`` the element paid for staying in
+    context turn after turn (size x turns of presence); ``load_cost`` the one-off
+    ``cache_write`` of caching it. ``language`` is meaningful for ``file_read``
+    (``-`` otherwise).
+
+    The raw token counts behind those prices ride alongside (``rent_read_tokens``
+    = the ``cache_read`` tokens; ``load_write_5m_tokens``/``load_write_1h_tokens``
+    = the ``cache_write`` tokens by TTL) so a view can plot the *size* of what
+    lingers in tokens, not only its provider-priced dollars.
+    """
+
+    source: str
+    language: str
+    load_cost: float
+    rent_cost: float
+    rent_read_tokens: int
+    load_write_5m_tokens: int
+    load_write_1h_tokens: int
+
+    @property
+    def total_cost(self) -> float:
+        return self.load_cost + self.rent_cost
+
+    @property
+    def load_tokens(self) -> int:
+        """One-off cache-write tokens of caching this element (5m + 1h)."""
+        return self.load_write_5m_tokens + self.load_write_1h_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        """Every token this element drove: rent (re-reads) + loading (writes)."""
+        return self.rent_read_tokens + self.load_tokens
+
+
+@dataclass(frozen=True)
+class ContextCost:
+    """Structured Axe-D context cost-over-time metrics (shared by CLI + dashboard).
+
+    ``elements`` is sorted by total cost (descending), the real cache spend each
+    context source/language drove. The headline split is loading (one-off cache
+    writes) vs rent (cache reads paid every turn the element stays in context).
+    ``unattributed_cost`` is cache that landed on a turn with no measured element
+    (the post-compaction summary, pre-context turns): it keeps the total honest
+    so ``load + rent`` reconciles to the billed main-chain cache cost exactly.
+    """
+
+    provider: str
+    elements: list[ContextElementCost]
+    load_cost: float
+    rent_cost: float
+    unattributed_cost: float
+    rent_read_tokens: int
+    load_write_5m_tokens: int
+    load_write_1h_tokens: int
+
+    @property
+    def total_cost(self) -> float:
+        return self.load_cost + self.rent_cost
+
+    @property
+    def attributed_cost(self) -> float:
+        return self.total_cost - self.unattributed_cost
+
+    @property
+    def load_tokens(self) -> int:
+        """Total one-off cache-write tokens across the attributed elements."""
+        return self.load_write_5m_tokens + self.load_write_1h_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        """Total context tokens (rent re-reads + loading writes), attributed only."""
+        return self.rent_read_tokens + self.load_tokens
+
+    @property
+    def has_data(self) -> bool:
+        return bool(self.elements)
+
+
+def context_cost(ds: Dataset, provider: str) -> ContextCost:
+    """Compute the Axe-D context cost-over-time metrics (see :class:`ContextCost`).
+
+    Prices the per-element cache tokens ``extract`` attributed (rent = the real
+    ``cache_read`` spread by size x turns of presence; load = the one-off
+    ``cache_write``) on ``provider``, aggregating per ``(source, language)``
+    across models. The pure numbers feed both :func:`by_context` (the CLI table)
+    and the dashboard, so the two never drift. Metrics only -- no content is read.
+    """
+    engine = CostEngine(provider, ds.pricing_path)
+    load: dict[tuple[str, str], float] = defaultdict(float)
+    rent: dict[tuple[str, str], float] = defaultdict(float)
+    # Raw token counts behind the prices, same (source, language) key, so a view
+    # can plot the size of context in tokens (D2 / Prompt 3 token charts).
+    rent_tok: dict[tuple[str, str], int] = defaultdict(int)
+    load5m_tok: dict[tuple[str, str], int] = defaultdict(int)
+    load1h_tok: dict[tuple[str, str], int] = defaultdict(int)
+    for row in ds.context_cost:
+        model = row.get("model") or ""
+        key = (row.get("source") or "", row.get("language") or NO_LANGUAGE)
+        read = int(row.get("rent_read_tokens") or 0)
+        write5m = int(row.get("load_write_5m_tokens") or 0)
+        write1h = int(row.get("load_write_1h_tokens") or 0)
+        rent_tok[key] += read
+        load5m_tok[key] += write5m
+        load1h_tok[key] += write1h
+        rent[key] += engine.cost(model, "cache_read", read)
+        load[key] += engine.cost(model, "cache_write_5m", write5m) + engine.cost(
+            model, "cache_write_1h", write1h
+        )
+
+    keys = set(load) | set(rent)
+    elements = [
+        ContextElementCost(
+            source=source,
+            language=language,
+            load_cost=round(load.get((source, language), 0.0), 6),
+            rent_cost=round(rent.get((source, language), 0.0), 6),
+            rent_read_tokens=rent_tok.get((source, language), 0),
+            load_write_5m_tokens=load5m_tok.get((source, language), 0),
+            load_write_1h_tokens=load1h_tok.get((source, language), 0),
+        )
+        for source, language in keys
+        if source != UNATTRIBUTED_SOURCE
+    ]
+    elements.sort(key=lambda e: (-e.total_cost, e.source, e.language))
+    unattributed = sum(
+        load.get(k, 0.0) + rent.get(k, 0.0) for k in keys if k[0] == UNATTRIBUTED_SOURCE
+    )
+
+    def _attr_token_sum(per_key: dict[tuple[str, str], int]) -> int:
+        return sum(v for k, v in per_key.items() if k[0] != UNATTRIBUTED_SOURCE)
+
+    return ContextCost(
+        provider=provider,
+        elements=elements,
+        load_cost=round(sum(load.values()), 6),
+        rent_cost=round(sum(rent.values()), 6),
+        unattributed_cost=round(unattributed, 6),
+        rent_read_tokens=_attr_token_sum(rent_tok),
+        load_write_5m_tokens=_attr_token_sum(load5m_tok),
+        load_write_1h_tokens=_attr_token_sum(load1h_tok),
+    )
+
+
+# Source -> human label for the context cost table (the four-bucket taxonomy).
+_CONTEXT_SOURCE_LABELS = {
+    "conversation": "Conversation",
+    "file_read": "Files read",
+    "tool_output": "Tool output",
+    "config": "Config / setup",
+    UNATTRIBUTED_SOURCE: "(unattributed)",
+}
+
+
+def _main_chain_cache_cost(ds: Dataset, engine: CostEngine) -> float:
+    """The billed cache cost (read + writes) of every non-sidechain request.
+
+    The ground truth the attributed context cost reconciles to: the bill for the
+    main conversation's context (subagent requests carry their own context and
+    are excluded from the snapshot, hence from here too)."""
+    total = 0.0
+    for row in ds.requests:
+        if row.get("is_sidechain"):
+            continue
+        model = row.get("model") or ""
+        total += engine.cost(model, "cache_read", int(row.get("cache_read_tokens") or 0))
+        total += _request_write_cost(engine, row)
+    return total
+
+
+def by_context(ds: Dataset, provider: str) -> TableResult:
+    """Context cost over time (Axe D): the real cost of what fills the context.
+
+    Each context source/language is one row, split into the one-off **loading**
+    cost (cache writes) and the **rent** it pays every turn it stays in context
+    (cache reads = size x turns of presence) -- the differentiator: "this file
+    cost $X to load and $Y of rent". The attributed totals reconcile to the
+    billed main-chain cache cost to the dollar; cache that cannot be tied to a
+    measured element (chiefly post-compaction summaries -- the ``parentUuid`` ~=
+    API-context caveat) is shown honestly as ``(unattributed)``. Metrics only.
+    The pure computation lives in :func:`context_cost` (shared with the dashboard).
+    """
+    comp = context_cost(ds, provider)
+    engine = CostEngine(provider, ds.pricing_path)
+
+    rows: list[dict[str, Any]] = []
+    total = comp.total_cost
+    for element in comp.elements:
+        rows.append(
+            {
+                "source": _CONTEXT_SOURCE_LABELS.get(element.source, element.source),
+                "language": element.language,
+                "load_usd": round(element.load_cost, 4),
+                "rent_usd": round(element.rent_cost, 4),
+                "total_usd": round(element.total_cost, 4),
+                "share_pct": round(100 * element.total_cost / total, 1) if total else 0.0,
+            }
+        )
+    if comp.unattributed_cost:
+        rows.append(
+            {
+                "source": _CONTEXT_SOURCE_LABELS[UNATTRIBUTED_SOURCE],
+                "language": NO_LANGUAGE,
+                "load_usd": None,
+                "rent_usd": None,
+                "total_usd": round(comp.unattributed_cost, 4),
+                "share_pct": round(100 * comp.unattributed_cost / total, 1) if total else 0.0,
+            }
+        )
+    if rows:
+        rows.append(
+            {
+                "source": "TOTAL",
+                "language": "",
+                "load_usd": round(comp.load_cost, 4),
+                "rent_usd": round(comp.rent_cost, 4),
+                "total_usd": round(total, 4),
+                "share_pct": 100.0 if total else 0.0,
+            }
+        )
+
+    notes = [_source_note(ds)]
+    if not ds.context_cost:
+        notes.append(
+            "No context-cost data -- re-run `prompt-analytics extract` "
+            "(these metrics ship with the latest extractor)."
+        )
+    if comp.has_data and total:
+        rent_share = round(100 * comp.rent_cost / total, 1)
+        notes.append(
+            f"Loading vs rent: ${comp.load_cost:,.2f} to cache the context once, "
+            f"${comp.rent_cost:,.2f} of rent re-reading it every turn it stays "
+            f"({rent_share}% of the cache bill is rent -- the cost of context that "
+            "lingers; that is what /compact and a leaner CLAUDE.md cut)."
+        )
+        top = comp.elements[0]
+        notes.append(
+            f"Top context cost: {_CONTEXT_SOURCE_LABELS.get(top.source, top.source)}"
+            + (f" ({top.language})" if top.language != NO_LANGUAGE else "")
+            + f" at ${top.total_cost:,.2f} "
+            f"(${top.load_cost:,.2f} load + ${top.rent_cost:,.2f} rent)."
+        )
+        bill = _main_chain_cache_cost(ds, engine)
+        unattr_share = round(100 * comp.unattributed_cost / total, 1) if total else 0.0
+        notes.append(
+            f"Reconciliation: attributed ${comp.attributed_cost:,.2f} + "
+            f"${comp.unattributed_cost:,.2f} unattributed = ${total:,.2f}, the billed "
+            f"main-chain cache cost (${bill:,.2f}). The {unattr_share}% unattributed is "
+            "cache on turns with no measured element (post-compaction summaries / "
+            "pre-context turns): the parentUuid chain approximates the API context."
+        )
+    if (note := engine.note()) is not None:
+        notes.append(note)
+    if (lc_note := engine.long_context_note()) is not None:
+        notes.append(lc_note)
+
+    return TableResult(
+        f"Context cost over time ({provider})",
+        [
+            Column("source", "Source"),
+            Column("language", "Language"),
+            Column("load_usd", "Load $", "money"),
+            Column("rent_usd", "Rent $", "money"),
+            Column("total_usd", "Total $", "money"),
+            Column("share_pct", "Share", "pct"),
+        ],
+        rows,
+        notes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unified per-file view (DASH4): a file's whole footprint, Axe C joined to D.
+# ---------------------------------------------------------------------------
+
+
+def file_footprint(ds: Dataset, provider: str, *, by_project: bool = False) -> TableResult:
+    """One row per file crossing Axe C (edits) and Axe D (reads + context cost).
+
+    The Explorer-style scorecard: a file's total cost of ownership in a single
+    line -- how often it was **edited** and its exact +/- line diff (Axe C),
+    how often it was **read** into context and what that context cost (the one-off
+    **load** plus the **rent** it paid every turn it lingered, Axe D), keyed on
+    the project-relative path so a file edited *and* kept in context shows both
+    halves. Rows are sorted by context cost (the actionable "what to cut") then
+    line churn. Metrics only -- relative paths, never a byte of content.
+
+    Paths are *project-relative*, so the same name (``README.md``, ``conftest.py``)
+    recurs across repos. ``by_project=True`` keys each row on ``(project, path)``
+    and adds a ``project`` column, so those homonyms no longer merge into one line
+    (the dashboard File Explorer uses this); the default keys on the path alone.
+    """
+    engine = CostEngine(provider, ds.pricing_path)
+
+    # by_project keys on a (project, path) composite so cross-repo homonyms split;
+    # the default keeps the bare path. ``key_meta`` maps each key back to its parts.
+    sep = "\x00"
+    prompt_project = (
+        {str(r.get("prompt_id")): str(r.get("project") or "") for r in ds.prompts}
+        if by_project
+        else {}
+    )
+    session_project = (
+        {str(r.get("session_id")): str(r.get("project") or "") for r in ds.sessions}
+        if by_project
+        else {}
+    )
+    key_meta: dict[str, tuple[str, str]] = {}
+
+    def _key(project: str, path: str) -> str:
+        k = f"{project}{sep}{path}" if by_project else path
+        key_meta.setdefault(k, (project, path))
+        return k
+
+    edits: Counter[str] = Counter()
+    added: Counter[str] = Counter()
+    deleted: Counter[str] = Counter()
+    language: dict[str, str] = {}
+    kind: dict[str, str] = {}
+
+    def _note_lang(key: str, value: str | None) -> None:
+        if value and value != NO_LANGUAGE and key not in language:
+            language[key] = value
+
+    for row in ds.output_files:
+        path = row.get("path") or ""
+        if not path or path == NO_PATH:
+            continue
+        key = _key(prompt_project.get(str(row.get("prompt_id")), ""), path)
+        edits[key] += int(row.get("edits") or 0)
+        added[key] += int(row.get("lines_added") or 0)
+        deleted[key] += int(row.get("lines_deleted") or 0)
+        _note_lang(key, row.get("language"))
+        if key not in kind:
+            kind[key] = row.get("kind") or detect_kind(path)
+
+    reads: Counter[str] = Counter()
+    for row in ds.context_sources:
+        if (row.get("source") or "") != "file_read":
+            continue
+        path = row.get("path") or ""
+        if not path or path == NO_PATH:
+            continue
+        key = _key(session_project.get(str(row.get("session_id")), ""), path)
+        reads[key] += int(row.get("items") or 0)
+        _note_lang(key, row.get("language"))
+
+    load: dict[str, float] = defaultdict(float)
+    rent: dict[str, float] = defaultdict(float)
+    for row in ds.context_cost:
+        if (row.get("source") or "") != "file_read":
+            continue
+        path = row.get("path") or ""
+        if not path or path == NO_PATH:
+            continue
+        key = _key(session_project.get(str(row.get("session_id")), ""), path)
+        model = row.get("model") or ""
+        rent[key] += engine.cost(model, "cache_read", int(row.get("rent_read_tokens") or 0))
+        load[key] += engine.cost(
+            model, "cache_write_5m", int(row.get("load_write_5m_tokens") or 0)
+        ) + engine.cost(model, "cache_write_1h", int(row.get("load_write_1h_tokens") or 0))
+        _note_lang(key, row.get("language"))
+
+    all_keys = set(edits) | set(reads) | set(load) | set(rent)
+    rows: list[dict[str, Any]] = []
+    for key in all_keys:
+        project, path = key_meta[key]
+        context_usd = load.get(key, 0.0) + rent.get(key, 0.0)
+        row_out: dict[str, Any] = {
+            "path": path,
+            "language": language.get(key, NO_LANGUAGE),
+            "kind": kind.get(key) or detect_kind(path),
+            "edits": edits.get(key, 0),
+            "lines_added": added.get(key, 0),
+            "lines_deleted": deleted.get(key, 0),
+            "reads": reads.get(key, 0),
+            "load_usd": round(load.get(key, 0.0), 4),
+            "rent_usd": round(rent.get(key, 0.0), 4),
+            "context_usd": round(context_usd, 4),
+        }
+        if by_project:
+            row_out = {"project": project, **row_out}
+        rows.append(row_out)
+    rows.sort(
+        key=lambda r: (-r["context_usd"], -(r["lines_added"] + r["lines_deleted"]), r["path"])
+    )
+
+    notes = [_source_note(ds)]
+    if not ds.output_files and not ds.context_cost:
+        notes.append(
+            "No per-file data -- re-run `prompt-analytics extract` "
+            "(the file identity ships with the latest extractor)."
+        )
+    elif rows:
+        edited = sum(1 for r in rows if r["edits"])
+        read_only = sum(1 for r in rows if not r["edits"] and r["reads"])
+        notes.append(
+            f"{len(rows):,} files: {edited:,} edited, {read_only:,} read but never edited "
+            "(pure context cost -- the first candidates to keep out of context)."
+        )
+
+    columns = [Column("project", "Project")] if by_project else []
+    columns += [
+        Column("path", "File"),
+        Column("language", "Language"),
+        Column("kind", "Kind"),
+        Column("edits", "Edits", "int"),
+        Column("lines_added", "Lines +", "int"),
+        Column("lines_deleted", "Lines −", "int"),
+        Column("reads", "Reads", "int"),
+        Column("load_usd", "Load $", "money"),
+        Column("rent_usd", "Rent $", "money"),
+        Column("context_usd", "Context $", "money"),
+    ]
+    return TableResult(
+        f"Per-file footprint ({provider})",
+        columns,
+        rows,
+        notes,
+    )
+
+
+@dataclass(frozen=True)
+class FileNode:
+    """One file as a graph centre (Axe C+D): a node sized by its context cost.
+
+    ``cost`` is the file's reconciled context spend (the one-off **load** plus the
+    **rent** it paid every turn it lingered in cache, Axe D); ``language`` drives
+    the node colour. ``edited`` distinguishes a file the work *wrote* to (Axe C)
+    from one only *read* into context -- a read-only file with cost but no edit is
+    pure rent, the first thing to keep out of context. ``path`` is the
+    project-relative path, never a byte of content.
+    """
+
+    path: str
+    language: str
+    kind: str
+    cost: float
+    edits: int
+    lines_added: int
+    lines_deleted: int
+    reads: int
+    edited: bool
+
+
+@dataclass(frozen=True)
+class FileSatellite:
+    """One prompt that *edited* a file (Axe C): a small node linked to the centre.
+
+    Coloured by the file's language (the graph's single legend dimension) but
+    carrying its own ``category`` and ``churn`` (lines added + deleted on *this*
+    file) in the tooltip, so a centre shows who touched it and how much.
+    """
+
+    prompt_id: str
+    path: str
+    category: str
+    churn: int
+
+
+@dataclass(frozen=True)
+class FileGraph:
+    """Structured file cost-graph data (Axe C+D), shared shape for the dashboard.
+
+    ``files`` are the top ``top`` file centres by context cost; ``satellites`` the
+    prompts that edited *those* files (so the graph stays legible). ``total_files``
+    / ``edited_files`` / ``readonly_files`` describe the whole population behind the
+    shown slice; ``context_total`` is the reconciled file context spend. The pure
+    numbers mirror :func:`file_footprint` so the graph and the CLI table never
+    drift.
+    """
+
+    provider: str
+    files: list[FileNode]
+    satellites: list[FileSatellite]
+    total_files: int
+    edited_files: int
+    readonly_files: int
+    context_total: float
+
+    @property
+    def has_data(self) -> bool:
+        """True when there is at least one file centre to draw."""
+        return bool(self.files)
+
+
+def file_graph(ds: Dataset, provider: str, *, top: int = 40) -> FileGraph:
+    """Assemble the file cost-graph: file centres + their edit-prompt satellites.
+
+    Centres are files sized by their reconciled context cost (load + rent, Axe D);
+    satellites are the prompts that *edited* each file (Axe C), so a centre shows
+    who touched it. Reuses :func:`file_footprint` for the per-file metrics, so the
+    graph and the CLI table never drift, then keeps the top ``top`` files by
+    context cost (0 = all) and gathers the edits of *those* files as satellites.
+    A read-only file (cost but no edit) stays a lone centre -- pure context rent.
+    """
+    footprint = file_footprint(ds, provider)
+    rows = footprint.rows  # already sorted by context $ then line churn
+    total_files = len(rows)
+    edited_files = sum(1 for r in rows if r["edits"])
+    readonly_files = sum(1 for r in rows if not r["edits"] and r["reads"])
+    context_total = sum(r["context_usd"] for r in rows)
+
+    shown = rows[:top] if top else rows
+    kept_paths = {r["path"] for r in shown}
+    nodes = [
+        FileNode(
+            path=r["path"],
+            language=r["language"],
+            kind=r["kind"],
+            cost=round(r["context_usd"], 4),
+            edits=r["edits"],
+            lines_added=r["lines_added"],
+            lines_deleted=r["lines_deleted"],
+            reads=r["reads"],
+            edited=bool(r["edits"]),
+        )
+        for r in shown
+    ]
+
+    churn: defaultdict[tuple[str, str], int] = defaultdict(int)
+    for row in ds.output_files:
+        path = row.get("path") or ""
+        if path not in kept_paths:
+            continue
+        churn[(row.get("prompt_id") or "", path)] += int(row.get("lines_added") or 0) + int(
+            row.get("lines_deleted") or 0
+        )
+    satellites = [
+        FileSatellite(
+            prompt_id=pid,
+            path=path,
+            category=(ds.categories.get(pid) or {}).get("category") or "(uncategorized)",
+            churn=c,
+        )
+        for (pid, path), c in churn.items()
+        if pid
+    ]
+
+    return FileGraph(
+        provider=provider,
+        files=nodes,
+        satellites=satellites,
+        total_files=total_files,
+        edited_files=edited_files,
+        readonly_files=readonly_files,
+        context_total=round(context_total, 4),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axe B2: cost by task -- the task, not the prompt, is the unit of work.
+# ---------------------------------------------------------------------------
+
+# Token types that are context (cache) rather than fresh generation: the share
+# of a task's cost spent re-reading / caching context, the B2 "part contexte".
+_CONTEXT_TOKEN_TYPES = frozenset({"cache_read", "cache_write_5m", "cache_write_1h"})
+
+
+def _parse_iso(value: str) -> datetime | None:
+    """An aware-or-naive datetime from an ISO-8601 string, or None (empty-safe)."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_duration(seconds: float) -> str:
+    """A compact human span (e.g. ``2h 15m``); ``<1m`` under a minute."""
+    total = int(seconds)
+    if total <= 0:
+        return "<1m"
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or not parts:
+        parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _dominant_categories(
+    task_of: dict[str, str],
+    categories: dict[str, dict[str, str]],
+    weight: dict[str, float],
+) -> dict[str, str]:
+    """Pick each task's defining category by *cost*, not prompt count.
+
+    A task collects a launching prompt plus cheap trailers ("commit", "ok go");
+    counting prompts lets those trailers outvote the real work, so the task node's
+    colour looked random. Weighting each prompt's category by its cost lets the
+    category where the money actually went win -- the expensive core defines the
+    task. Falls back to a plain count when a task has no priced prompt.
+    """
+    cost_weighted: defaultdict[str, defaultdict[str, float]] = defaultdict(
+        lambda: defaultdict(float)
+    )
+    count_weighted: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    for pid, tid in task_of.items():
+        category = (categories.get(pid) or {}).get("category") or ""
+        if not category:
+            continue
+        count_weighted[tid][category] += 1
+        cost_weighted[tid][category] += weight.get(pid, 0.0)
+    dominant: dict[str, str] = {}
+    for tid, counts in count_weighted.items():
+        priced = cost_weighted[tid]
+        if sum(priced.values()) > 0:
+            # Cost wins; break ties on the category name so it stays deterministic.
+            dominant[tid] = max(priced, key=lambda cat: (priced[cat], cat))
+        else:
+            dominant[tid] = counts.most_common(1)[0][0]
+    return dominant
+
+
+def by_task(ds: Dataset, provider: str, *, top: int = 20) -> TableResult:
+    """Cost by task (Axe B2): the task is the unit of work, not the prompt.
+
+    Every real prompt belongs to exactly one task (``task_prompts``), so a task's
+    cost is just its prompts' token rows priced at read time -- it reconciles to
+    the bill by construction (continuation/compaction overhead, tied to no prompt,
+    is excluded and surfaced in the notes). Each row carries the task's total cost
+    and the **context share** of it (the cache reads/writes its prompts paid -- the
+    B2 "this task cost $X, of which Y% is context rent"), its prompt count, its
+    span (a task lives within one session -- ``task_id`` is session-scoped -- so
+    the span is its first->last prompt duration), its ``origin`` (``todo`` spine vs
+    ``inferred``, so readers can weigh it) and its **dominant category** (the most
+    frequent category among its prompts, when ``categorize`` has run). Sorted by
+    cost, top ``top`` (0 = all). Metrics only -- the task name is a Claude-authored
+    todo label or a blanked-under-``--no-text`` snippet, never source content.
+    """
+    engine = CostEngine(provider, ds.pricing_path)
+    task_of = {row["prompt_id"]: row["task_id"] for row in ds.task_prompts}
+
+    total_cost: defaultdict[str, float] = defaultdict(float)
+    context_cost_by_task: defaultdict[str, float] = defaultdict(float)
+    prompt_cost: defaultdict[str, float] = defaultdict(float)
+    overhead = 0.0
+    for row in ds.tokens:
+        c = engine.cost(row.get("model") or "", row["token_type"], row["token_count"])
+        prompt_cost[row["prompt_id"]] += c
+        tid = task_of.get(row["prompt_id"])
+        if tid is None:
+            overhead += c
+            continue
+        total_cost[tid] += c
+        if row["token_type"] in _CONTEXT_TOKEN_TYPES:
+            context_cost_by_task[tid] += c
+
+    dominant = _dominant_categories(task_of, ds.categories, prompt_cost)
+
+    grand_total = sum(total_cost.values())
+    context_total = sum(context_cost_by_task.values())
+    rows: list[dict[str, Any]] = []
+    for task in ds.tasks:
+        tid = task["task_id"]
+        cost = total_cost.get(tid, 0.0)
+        ctx = context_cost_by_task.get(tid, 0.0)
+        first = _parse_iso(task.get("first_timestamp", ""))
+        last = _parse_iso(task.get("last_timestamp", ""))
+        span = _format_duration((last - first).total_seconds()) if first and last else ""
+        rows.append(
+            {
+                "task": (task.get("name") or tid)[:60],
+                "origin": task.get("origin", ""),
+                "prompts": int(task.get("prompts") or 0),
+                "duration": span,
+                "category": dominant.get(tid, "(uncategorized)"),
+                "context_pct": round(100 * ctx / cost, 1) if cost else 0.0,
+                "cost_usd": round(cost, 4),
+                "cost_share_pct": round(100 * cost / grand_total, 1) if grand_total else 0.0,
+            }
+        )
+    rows.sort(key=lambda r: (-r["cost_usd"], r["task"]))
+    if top:
+        rows = rows[:top]
+
+    notes = [_source_note(ds)]
+    if not ds.tasks:
+        notes.append(
+            "No task data -- re-run `prompt-analytics extract` "
+            "(task attribution ships with the latest extractor)."
+        )
+    else:
+        todo_n = sum(1 for t in ds.tasks if t.get("origin") == "todo")
+        sessions_n = len({t.get("session_id") for t in ds.tasks})
+        notes.append(
+            f"{len(ds.tasks):,} tasks across {sessions_n:,} sessions: {todo_n:,} from the "
+            f"TodoWrite spine, {len(ds.tasks) - todo_n:,} inferred (time gap + semantics)."
+        )
+        if grand_total:
+            notes.append(
+                f"Context is {round(100 * context_total / grand_total, 1)}% of task cost "
+                f"(${context_total:,.2f} of ${grand_total:,.2f}) -- the cache reads/writes the "
+                "tasks' prompts paid; per-task share is the Context % column."
+            )
+        if not ds.categories:
+            notes.append(
+                "No categorization found -- run `prompt-analytics categorize` to fill the "
+                "Top category column."
+            )
+    if overhead:
+        notes.append(
+            f"Session overhead (continuations, compactions): ${overhead:,.2f} "
+            "not attributable to a task, excluded above."
+        )
+    if (note := engine.note()) is not None:
+        notes.append(note)
+    if (lc_note := engine.long_context_note()) is not None:
+        notes.append(lc_note)
+
+    return TableResult(
+        f"Cost by task ({provider})",
+        [
+            Column("task", "Task"),
+            Column("origin", "Origin"),
+            Column("prompts", "Prompts", "int"),
+            Column("duration", "Span"),
+            Column("category", "Top category"),
+            Column("context_pct", "Context %", "pct"),
+            Column("cost_usd", f"Cost ({provider})", "money"),
+            Column("cost_share_pct", "Cost %", "pct"),
+        ],
+        rows,
+        notes,
+    )
+
+
+@dataclass(frozen=True)
+class TaskNode:
+    """One task as a graph centre (Axe B2): a node sized by cost, hued by category.
+
+    ``cost`` is the task's full spend (input + output + context, reconciled to the
+    bill like :func:`by_task`); ``context_pct`` the share of it that is cache
+    rent/loading; ``category`` the dominant category among its prompts (the node
+    colour). ``name`` is a Claude-authored todo label or a blanked snippet, never
+    source content.
+    """
+
+    task_id: str
+    name: str
+    origin: str
+    category: str
+    prompts: int
+    cost: float
+    context_pct: float
+
+
+@dataclass(frozen=True)
+class TaskSatellite:
+    """One prompt orbiting its task (Axe B2): a small node linked to its centre.
+
+    Coloured by its own category, sized faintly by its own cost, so a task's
+    centre shows the category mix of the prompts that served it.
+    """
+
+    prompt_id: str
+    task_id: str
+    category: str
+    cost: float
+
+
+@dataclass(frozen=True)
+class TaskGraph:
+    """Structured task-graph data (Axe B2), shared shape for the dashboard view.
+
+    ``tasks`` are the top ``top`` task centres by cost; ``satellites`` the prompts
+    of exactly those tasks (so the graph stays legible). ``total_tasks`` /
+    ``todo_tasks`` describe the whole population behind the shown slice;
+    ``grand_total`` / ``context_total`` are the reconciled task spend and its
+    context share. The pure numbers mirror :func:`by_task` so the graph and the
+    CLI table never drift.
+    """
+
+    provider: str
+    tasks: list[TaskNode]
+    satellites: list[TaskSatellite]
+    total_tasks: int
+    todo_tasks: int
+    grand_total: float
+    context_total: float
+
+    @property
+    def has_data(self) -> bool:
+        """True when there is at least one task centre to draw."""
+        return bool(self.tasks)
+
+
+def task_graph(ds: Dataset, provider: str, *, top: int = 40) -> TaskGraph:
+    """Assemble the Axe-B2 task graph: task centres + their prompt satellites.
+
+    Prices every prompt once (reconciling to the bill by construction, like
+    :func:`by_task`), aggregates to tasks, keeps the top ``top`` by cost (0 =
+    all), then gathers the prompts of *those* tasks as satellites so the force
+    layout stays readable on a large corpus. The dashboard turns this into the
+    ECharts ``graph``; the data assembly lives here so it stays unit-testable.
+    """
+    engine = CostEngine(provider, ds.pricing_path)
+    task_of = {row["prompt_id"]: row["task_id"] for row in ds.task_prompts}
+
+    prompt_cost: defaultdict[str, float] = defaultdict(float)
+    prompt_ctx: defaultdict[str, float] = defaultdict(float)
+    for row in ds.tokens:
+        c = engine.cost(row.get("model") or "", row["token_type"], row["token_count"])
+        pid = row["prompt_id"]
+        prompt_cost[pid] += c
+        if row["token_type"] in _CONTEXT_TOKEN_TYPES:
+            prompt_ctx[pid] += c
+
+    task_cost: defaultdict[str, float] = defaultdict(float)
+    task_ctx: defaultdict[str, float] = defaultdict(float)
+    for pid, c in prompt_cost.items():
+        tid = task_of.get(pid)
+        if tid is None:  # continuation/compaction overhead, tied to no task
+            continue
+        task_cost[tid] += c
+        task_ctx[tid] += prompt_ctx.get(pid, 0.0)
+
+    dominant = _dominant_categories(task_of, ds.categories, prompt_cost)
+
+    grand_total = sum(task_cost.values())
+    context_total = sum(task_ctx.values())
+
+    nodes: list[TaskNode] = []
+    for task in ds.tasks:
+        tid = task["task_id"]
+        cost = task_cost.get(tid, 0.0)
+        ctx = task_ctx.get(tid, 0.0)
+        nodes.append(
+            TaskNode(
+                task_id=tid,
+                name=task.get("name") or tid,
+                origin=task.get("origin", ""),
+                category=dominant.get(tid, "(uncategorized)"),
+                prompts=int(task.get("prompts") or 0),
+                cost=round(cost, 4),
+                context_pct=round(100 * ctx / cost, 1) if cost else 0.0,
+            )
+        )
+    nodes.sort(key=lambda n: (-n.cost, n.name))
+    if top:
+        nodes = nodes[:top]
+
+    kept = {n.task_id for n in nodes}
+    satellites = [
+        TaskSatellite(
+            prompt_id=row["prompt_id"],
+            task_id=row["task_id"],
+            category=(ds.categories.get(row["prompt_id"]) or {}).get("category")
+            or "(uncategorized)",
+            cost=round(prompt_cost.get(row["prompt_id"], 0.0), 4),
+        )
+        for row in ds.task_prompts
+        if row["task_id"] in kept
+    ]
+
+    return TaskGraph(
+        provider=provider,
+        tasks=nodes,
+        satellites=satellites,
+        total_tasks=len(ds.tasks),
+        todo_tasks=sum(1 for t in ds.tasks if t.get("origin") == "todo"),
+        grand_total=round(grand_total, 4),
+        context_total=round(context_total, 4),
     )
 
 
@@ -2157,6 +3422,370 @@ def compare_providers(ds: Dataset, providers: list[str]) -> TableResult:
         Column(f"cost_{provider}_usd", f"Cost ({provider})", "money") for provider in providers
     ]
     return TableResult("Provider cost comparison", columns, rows, notes)
+
+
+# ---------------------------------------------------------------------------
+# Axe E: before/after impact of an optimization (capstone, transverse).
+#
+# A date pivot splits the history; the SAME workload-normalized ratios are
+# computed on both sides so a config change (a CLAUDE.md edit, /compact earlier,
+# a model switch) reads as a delta instead of a raw-total swing that the workload
+# alone would confound. The confounders (volume, depth, task mix) are surfaced
+# right next to the ratios so the change is never over-sold as causal: this is an
+# observational split, not a controlled experiment.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ImpactMetric:
+    """One before/after metric of the Axe-E split (shared shape, CLI + dashboard).
+
+    ``before``/``after`` are raw values (a float ratio, a money amount, a count,
+    or a label) or ``None`` when a side has no data; ``fmt`` drives how
+    :func:`impact` renders them and their delta. ``confounder`` flags the workload
+    descriptors (volume, depth, task mix) shown to keep the ratio deltas honest --
+    they describe how the workload moved, they are not the optimization.
+    """
+
+    label: str
+    before: float | str | None
+    after: float | str | None
+    fmt: str
+    confounder: bool = False
+
+
+@dataclass(frozen=True)
+class ImpactReport:
+    """Structured Axe-E before/after report (shared by the CLI + the dashboard).
+
+    ``pivot`` is the inclusive split day: ``before`` covers prompts up to the day
+    before it, ``after`` covers the pivot day onward. ``metrics`` lists the
+    workload-normalized ratios first, then the confounders. The pure numbers feed
+    both :func:`impact` (the CLI table) and the dashboard, so the two never drift.
+    """
+
+    provider: str
+    pivot: str
+    before_prompts: int
+    after_prompts: int
+    before_days: int
+    after_days: int
+    metrics: list[ImpactMetric]
+
+    @property
+    def has_both_sides(self) -> bool:
+        """True when both sides carry at least one prompt (a meaningful split)."""
+        return self.before_prompts > 0 and self.after_prompts > 0
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float | None:
+    """``numerator / denominator``, or ``None`` when the denominator is 0."""
+    return numerator / denominator if denominator else None
+
+
+def _impact_side_stats(side: Dataset, provider: str) -> dict[str, Any]:
+    """Workload-normalized ratios + confounders for one side of the split.
+
+    Every ratio is normalized (per prompt, per turn, or as a cost share) so it
+    isolates the config from the workload; the raw confounders (prompts, cost,
+    days, depth, tasks, dominant category) ride alongside so the deltas stay
+    honest. A turn is one API request (``requests.csv`` grain).
+    """
+    engine = CostEngine(provider, side.pricing_path)
+    prompts = len(side.prompts)
+    sessions = len(side.sessions)
+
+    total_cost = output_cost = input_cost = context_cost_total = 0.0
+    cache_read_tokens = output_tokens = 0
+    for row in side.tokens:
+        token_type = row["token_type"]
+        c = engine.cost(row.get("model") or "", token_type, row["token_count"])
+        total_cost += c
+        if token_type == "output":
+            output_cost += c
+            output_tokens += row["token_count"]
+        elif token_type == "input":
+            input_cost += c
+        elif token_type in _CONTEXT_TOKEN_TYPES:
+            context_cost_total += c
+            if token_type == "cache_read":
+                cache_read_tokens += row["token_count"]
+
+    turns = len(side.requests)
+    categories: Counter[str] = Counter()
+    for row in side.prompts:
+        category = (side.categories.get(row["prompt_id"]) or {}).get("category") or ""
+        if category:
+            categories[category] += 1
+
+    return {
+        "prompts": prompts,
+        "total_cost": round(total_cost, 4),
+        "cost_per_prompt": _safe_ratio(total_cost, prompts),
+        "output_share": (100 * output_cost / total_cost) if total_cost else None,
+        "context_share": (100 * context_cost_total / total_cost) if total_cost else None,
+        "cache_read_per_turn": _safe_ratio(cache_read_tokens, turns),
+        "output_per_prompt": _safe_ratio(output_tokens, prompts),
+        "days": _span_days(side) if prompts else 0,
+        "prompts_per_session": _safe_ratio(prompts, sessions),
+        "tasks": len(side.tasks),
+        "top_category": categories.most_common(1)[0][0] if categories else "(uncategorized)",
+    }
+
+
+def day_before(day: str) -> str:
+    """The calendar day before an ISO ``YYYY-MM-DD`` (lexical, no timezone)."""
+    return (datetime.fromisoformat(day) - timedelta(days=1)).date().isoformat()
+
+
+def split_on_pivot(ds: Dataset, pivot: str) -> tuple[Dataset, Dataset]:
+    """Split ``ds`` on a pivot day into ``(before, after)`` views (Axe E / DASH2).
+
+    ``before`` covers prompts up to the day before ``pivot``; ``after`` covers the
+    pivot day onward -- the same inclusive convention :func:`impact_report` is
+    built on (it calls this). Shared with the dashboard's global date-pivot mode so
+    the CLI table and the before/after views split the history identically.
+    """
+    return filter_dates(ds, None, day_before(pivot)), filter_dates(ds, pivot, None)
+
+
+def impact_report(ds: Dataset, *, provider: str, pivot: str) -> ImpactReport:
+    """Assemble the Axe-E before/after report around ``pivot`` (see :class:`ImpactReport`).
+
+    Splits the dataset on the pivot day (``before`` = up to the day before it,
+    ``after`` = the pivot day onward, via :func:`split_on_pivot`), then computes
+    the same workload-normalized ratios and workload confounders on each side.
+    Pure: the filesystem pivot suggestions live in :func:`suggest_pivots`, kept out
+    of here so this stays deterministic and unit-testable.
+    """
+    before, after = split_on_pivot(ds, pivot)
+    b = _impact_side_stats(before, provider)
+    a = _impact_side_stats(after, provider)
+
+    metrics: list[ImpactMetric] = [
+        ImpactMetric("Cost per prompt", b["cost_per_prompt"], a["cost_per_prompt"], "money"),
+        ImpactMetric("Output cost share", b["output_share"], a["output_share"], "pct"),
+        ImpactMetric("Context rent share", b["context_share"], a["context_share"], "pct"),
+        ImpactMetric(
+            "Cache read / turn", b["cache_read_per_turn"], a["cache_read_per_turn"], "ratio"
+        ),
+        ImpactMetric(
+            "Output tokens / prompt", b["output_per_prompt"], a["output_per_prompt"], "ratio"
+        ),
+        ImpactMetric("Prompts", b["prompts"], a["prompts"], "int", confounder=True),
+        ImpactMetric(
+            "Total cost", b["total_cost"], a["total_cost"], "money_total", confounder=True
+        ),
+        ImpactMetric("Active days", b["days"], a["days"], "int", confounder=True),
+        ImpactMetric(
+            "Prompts / session",
+            b["prompts_per_session"],
+            a["prompts_per_session"],
+            "ratio",
+            confounder=True,
+        ),
+    ]
+    if ds.tasks:
+        metrics.append(ImpactMetric("Tasks", b["tasks"], a["tasks"], "int", confounder=True))
+    if ds.categories:
+        metrics.append(
+            ImpactMetric(
+                "Top category", b["top_category"], a["top_category"], "str", confounder=True
+            )
+        )
+
+    return ImpactReport(
+        provider=provider,
+        pivot=pivot,
+        before_prompts=b["prompts"],
+        after_prompts=a["prompts"],
+        before_days=b["days"],
+        after_days=a["days"],
+        metrics=metrics,
+    )
+
+
+def impact_fmt_value(value: float | str | None, fmt: str) -> str:
+    """Render a before/after cell (a side may be empty -> ``-``)."""
+    if value is None or value == "":
+        return "-"
+    if fmt == "money":
+        return f"${float(value):,.4f}"
+    if fmt == "money_total":
+        return f"${float(value):,.2f}"
+    if fmt == "pct":
+        return f"{float(value):.1f}%"
+    if fmt == "ratio":
+        return f"{float(value):,.1f}"
+    if fmt == "int":
+        return f"{int(value):,}"
+    return str(value)
+
+
+def impact_fmt_change(before: float | str | None, after: float | str | None, fmt: str) -> str:
+    """Render the delta cell: percentage points for shares, signed delta (+ % change)
+    for amounts and ratios, a same/changed flag for a label."""
+    if fmt == "str":
+        if before is None and after is None:
+            return "-"
+        return "same" if before == after else "changed"
+    if before is None or after is None:
+        return "-"  # one side empty -> no meaningful delta
+    bf, af = float(before), float(after)
+    delta = af - bf
+    if fmt == "pct":
+        # Shares move in percentage POINTS, not a relative percentage.
+        return f"{delta:+.1f} pp"
+    if fmt == "money":
+        body = f"{'+' if delta >= 0 else '-'}${abs(delta):,.4f}"
+    elif fmt == "money_total":
+        body = f"{'+' if delta >= 0 else '-'}${abs(delta):,.2f}"
+    elif fmt == "int":
+        body = f"{delta:+,.0f}"
+    else:  # ratio
+        body = f"{delta:+,.1f}"
+    if bf:
+        body += f" ({100 * delta / bf:+.0f}%)"
+    return body
+
+
+def impact(
+    ds: Dataset,
+    provider: str,
+    *,
+    pivot: str,
+    suggestions: list[tuple[str, str]] | None = None,
+) -> TableResult:
+    """Before/after impact of an optimization around a date ``pivot`` (Axe E).
+
+    Splits the history on ``pivot`` and shows, per metric, the BEFORE value, the
+    AFTER value and the change. The headline rows are workload-normalized ratios
+    (cost per prompt, output cost share, context rent share, cache read per turn,
+    output tokens per prompt) so a config change reads through the workload; the
+    rows under the divider are the workload confounders (volume, depth, task mix)
+    that keep the deltas honest. The notes spell out that this is an observational
+    split, not a controlled experiment. The pure numbers live in
+    :func:`impact_report` (shared with the dashboard); ``suggestions`` (from
+    :func:`suggest_pivots`) are folded into the notes as a pivot-picking aid.
+    """
+    report = impact_report(ds, provider=provider, pivot=pivot)
+
+    def _row(metric: ImpactMetric) -> dict[str, Any]:
+        return {
+            "metric": metric.label,
+            "before": impact_fmt_value(metric.before, metric.fmt),
+            "after": impact_fmt_value(metric.after, metric.fmt),
+            "change": impact_fmt_change(metric.before, metric.after, metric.fmt),
+        }
+
+    rows: list[dict[str, Any]] = [_row(m) for m in report.metrics if not m.confounder]
+    confounders = [m for m in report.metrics if m.confounder]
+    if confounders:
+        rows.append(
+            {
+                "metric": "— workload confounders (not the optimization) —",
+                "before": "",
+                "after": "",
+                "change": "",
+            }
+        )
+        rows.extend(_row(m) for m in confounders)
+
+    pivot_before = day_before(pivot)
+    notes = [_source_note(ds)]
+    notes.append(
+        f"Pivot {pivot}: BEFORE = {report.before_prompts:,} prompts up to {pivot_before} "
+        f"({report.before_days} active days); AFTER = {report.after_prompts:,} prompts from "
+        f"{pivot} ({report.after_days} active days)."
+    )
+    if not report.has_both_sides:
+        empty = "before" if report.before_prompts == 0 else "after"
+        notes.append(
+            f"WARNING: no prompts {empty} the pivot -- pick a date inside the data range "
+            "for a meaningful comparison."
+        )
+    notes.append(
+        "The ratios above the divider are workload-normalized (per prompt, per turn, or as a "
+        "cost share); the confounders below describe how the workload itself moved. This is an "
+        "observational split, not a controlled experiment -- if volume, depth or task mix "
+        "shifted a lot, read the ratio deltas with caution (correlation, not proven causation)."
+    )
+    notes.append("Cache read / turn = average context re-sent per API request (a 'turn').")
+    if suggestions:
+        listed = ", ".join(f"{day} ({label})" for day, label in suggestions)
+        notes.append(f"Detected config changes you could use as a pivot: {listed}.")
+    # Loud about unpriced / long-context models, like every other cost view.
+    engine = CostEngine(provider, ds.pricing_path)
+    for row in ds.tokens:
+        engine.cost(row.get("model") or "", row["token_type"], row["token_count"])
+    if (note := engine.note()) is not None:
+        notes.append(note)
+    if (lc_note := engine.long_context_note()) is not None:
+        notes.append(lc_note)
+
+    return TableResult(
+        f"Impact before/after {pivot} ({provider})",
+        [
+            Column("metric", "Metric"),
+            Column("before", "Before", "str"),
+            Column("after", "After", "str"),
+            Column("change", "Change", "str"),
+        ],
+        rows,
+        notes,
+    )
+
+
+def suggest_pivots(ds: Dataset) -> list[tuple[str, str]]:
+    """Candidate pivot dates from the mtime of config files (Axe E pivot aid).
+
+    Probes the Claude config dir (``CLAUDE.md`` / ``settings.json`` /
+    ``settings.local.json``) and every project ``cwd`` seen in the data for a
+    ``CLAUDE.md`` or ``.claude/settings*.json``; a file's last-modified day is a
+    plausible "I changed my setup here" pivot. This is only a typing aid -- it
+    never drives the analysis -- and is filtered to dates strictly inside the data
+    range so the suggested split is non-degenerate. Returns ``(YYYY-MM-DD, label)``
+    pairs sorted by day, deduplicated.
+    """
+    days = sorted(_parse_day(p.get("timestamp", "")) for p in ds.prompts if p.get("timestamp"))
+    if not days:
+        return []
+    first, last = days[0], days[-1]
+
+    candidates: list[tuple[Path, str]] = []
+    config_dir = paths.claude_config_dir()
+    for name in ("CLAUDE.md", "settings.json", "settings.local.json"):
+        candidates.append((config_dir / name, f"~/.claude/{name}"))
+    cwds = {row.get("cwd") or "" for row in ds.sessions} | {
+        row.get("cwd") or "" for row in ds.prompts
+    }
+    for cwd in sorted(c for c in cwds if c):
+        base = Path(cwd)
+        label_base = base.name or cwd
+        candidates.append((base / "CLAUDE.md", f"{label_base}/CLAUDE.md"))
+        candidates.append(
+            (base / ".claude" / "settings.json", f"{label_base}/.claude/settings.json")
+        )
+        candidates.append(
+            (base / ".claude" / "settings.local.json", f"{label_base}/.claude/settings.local.json")
+        )
+
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for path, label in candidates:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        day = datetime.fromtimestamp(mtime).date().isoformat()
+        if not (first < day <= last):
+            continue
+        key = (day, label)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    out.sort()
+    return out
 
 
 # ---------------------------------------------------------------------------

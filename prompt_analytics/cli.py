@@ -36,6 +36,10 @@ examples:
   prompt-analytics timeline --by month           cost per month
   prompt-analytics summary --since 2026-06-01    analyze one period (any analysis command)
   prompt-analytics by-token-type                 context rent vs generation in the bill
+  prompt-analytics by-output                     what Claude produced: language mix, code vs tests
+  prompt-analytics by-context                    what fills the cache: loading vs rent per source
+  prompt-analytics by-file                       per-file footprint: edits + reads + context cost
+  prompt-analytics by-task                       cost per task: total (with context share), category
   prompt-analytics sessions --depth              marginal prompt cost vs session depth
   prompt-analytics context                       accumulated context per turn (when to /compact)
   prompt-analytics ttl                           what pauses cost in cache re-writes
@@ -45,6 +49,7 @@ examples:
   prompt-analytics recommend                     what compacting long sessions earlier would save
   prompt-analytics burn-rate                     $/day and week-over-week trend
   prompt-analytics break-even                    your API-equivalent value vs a Max subscription
+  prompt-analytics impact --pivot 2026-06-01     before/after a setup change: normalized deltas
   prompt-analytics prompts --top 10              your 10 most expensive prompts
   prompt-analytics compare --providers anthropic,copilot
   prompt-analytics summary --format json         machine-readable output (also: csv)
@@ -174,6 +179,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _provider_arg(p_by_category)
     p_by_category.set_defaults(func=_handle_by_category)
+
+    p_by_output = subparsers.add_parser(
+        "by-output",
+        parents=[analytics_parent],
+        help="Output composition: language mix, code vs tests, prose vs code cost, lines produced.",
+    )
+    _provider_arg(p_by_output)
+    p_by_output.set_defaults(func=_handle_by_output)
+
+    p_by_context = subparsers.add_parser(
+        "by-context",
+        parents=[analytics_parent],
+        help="Context cost over time: what fills the cache, loading vs rent per source.",
+    )
+    _provider_arg(p_by_context)
+    p_by_context.set_defaults(func=_handle_by_context)
+
+    p_by_file = subparsers.add_parser(
+        "by-file",
+        parents=[analytics_parent],
+        help="Per-file footprint: edits + line diff (output) crossed with reads + context cost.",
+    )
+    _provider_arg(p_by_file)
+    p_by_file.set_defaults(func=_handle_by_file)
+
+    p_by_task = subparsers.add_parser(
+        "by-task",
+        parents=[analytics_parent],
+        help="Cost by task: total cost (with context share), prompts, span, dominant category.",
+    )
+    _provider_arg(p_by_task)
+    p_by_task.add_argument(
+        "--top",
+        type=int,
+        default=20,
+        metavar="N",
+        help="How many tasks to show, by cost (0 = all; default: %(default)s).",
+    )
+    p_by_task.set_defaults(func=_handle_by_task)
 
     p_prompts = subparsers.add_parser(
         "prompts",
@@ -323,6 +367,20 @@ def build_parser() -> argparse.ArgumentParser:
     _provider_arg(p_break_even)
     p_break_even.set_defaults(func=_handle_break_even)
 
+    p_impact = subparsers.add_parser(
+        "impact",
+        parents=[analytics_parent],
+        help="Before/after a date pivot: workload-normalized deltas + confounders (Axe E).",
+    )
+    _provider_arg(p_impact)
+    p_impact.add_argument(
+        "--pivot",
+        metavar="YYYY-MM-DD",
+        help="Split day: BEFORE is up to the day before it, AFTER is this day onward. "
+        "Omit to list detected config-change dates as suggestions.",
+    )
+    p_impact.set_defaults(func=_handle_impact)
+
     p_compare = subparsers.add_parser(
         "compare",
         parents=[analytics_parent],
@@ -405,10 +463,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Categorize prompts (heuristic by default, --llm for LLM).",
     )
     _add_output_dir(p_categorize)
-    p_categorize.add_argument(
+    categorize_mode = p_categorize.add_mutually_exclusive_group()
+    categorize_mode.add_argument(
         "--llm",
         action="store_true",
         help="Use an LLM API instead of the heuristic classifier.",
+    )
+    categorize_mode.add_argument(
+        "--semantic",
+        action="store_true",
+        help="Use the offline semantic classifier (embeddings, no API key).",
+    )
+    categorize_mode.add_argument(
+        "--audit-categories",
+        action="store_true",
+        help="Diagnostic only: cluster the whole corpus (HDBSCAN) and compare the "
+        "natural clusters to the 13 categories. Writes a report + CSV; never "
+        "changes categories.csv.",
+    )
+    p_categorize.add_argument(
+        "--min-cluster-size",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Smallest natural cluster for --audit-categories (0 = the default).",
     )
     p_categorize.add_argument(
         "--batch",
@@ -418,13 +496,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_categorize.add_argument(
         "--provider",
         default="auto",
-        choices=["auto", "anthropic", "openrouter", "ollama"],
+        choices=["auto", "anthropic", "openrouter", "ollama", "azure"],
         help="LLM provider (--llm only, default: auto).",
     )
     p_categorize.add_argument(
         "--model",
         default="",
         help="Override the default model for the chosen provider.",
+    )
+    p_categorize.add_argument(
+        "--tau",
+        type=float,
+        default=None,
+        metavar="T",
+        help="Semantic only: override the 'other' threshold (default: calibrated).",
+    )
+    p_categorize.add_argument(
+        "--prime-weight",
+        type=float,
+        default=None,
+        metavar="W",
+        help="Semantic only: override the lexical prime weight (default: calibrated).",
+    )
+    p_categorize.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Semantic only: prototypes averaged per category (1 = max; default: calibrated).",
     )
     p_categorize.add_argument(
         "--batch-size",
@@ -542,8 +641,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_config_init.set_defaults(func=_handle_config_init)
 
     # dashboard
-    p_dashboard = subparsers.add_parser("dashboard", help="Launch the Streamlit dashboard.")
+    p_dashboard = subparsers.add_parser(
+        "dashboard",
+        help="Refresh the data, then launch the Streamlit dashboard.",
+    )
     _add_output_dir(p_dashboard)
+    p_dashboard.add_argument(
+        "--no-refresh",
+        action="store_true",
+        help="Skip the pre-launch extract/snapshot/categorize; open on the existing CSVs.",
+    )
     p_dashboard.set_defaults(func=_handle_dashboard)
 
     return parser
@@ -712,6 +819,58 @@ def _handle_by_category(args: argparse.Namespace) -> int:
     if ds is None:
         return code
     render(analytics.by_category(ds, args.provider), args.format)
+    return 0
+
+
+def _handle_by_output(args: argparse.Namespace) -> int:
+    from . import analytics
+    from .render import render
+
+    if code := _check_providers([args.provider], _pricing_path(args)):
+        return code
+    ds, code = _dataset_or_fail(args)
+    if ds is None:
+        return code
+    render(analytics.by_output(ds, args.provider), args.format)
+    return 0
+
+
+def _handle_by_context(args: argparse.Namespace) -> int:
+    from . import analytics
+    from .render import render
+
+    if code := _check_providers([args.provider], _pricing_path(args)):
+        return code
+    ds, code = _dataset_or_fail(args)
+    if ds is None:
+        return code
+    render(analytics.by_context(ds, args.provider), args.format)
+    return 0
+
+
+def _handle_by_file(args: argparse.Namespace) -> int:
+    from . import analytics
+    from .render import render
+
+    if code := _check_providers([args.provider], _pricing_path(args)):
+        return code
+    ds, code = _dataset_or_fail(args)
+    if ds is None:
+        return code
+    render(analytics.file_footprint(ds, args.provider), args.format)
+    return 0
+
+
+def _handle_by_task(args: argparse.Namespace) -> int:
+    from . import analytics
+    from .render import render
+
+    if code := _check_providers([args.provider], _pricing_path(args)):
+        return code
+    ds, code = _dataset_or_fail(args)
+    if ds is None:
+        return code
+    render(analytics.by_task(ds, args.provider, top=args.top), args.format)
     return 0
 
 
@@ -904,6 +1063,42 @@ def _handle_break_even(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_impact(args: argparse.Namespace) -> int:
+    import sys
+
+    from . import analytics
+    from .extract import _parse_bound
+    from .render import render
+
+    if code := _check_providers([args.provider], _pricing_path(args)):
+        return code
+    ds, code = _dataset_or_fail(args)
+    if ds is None:
+        return code
+    suggestions = analytics.suggest_pivots(ds)
+    # No pivot: this is a date-pivot tool, so list the detected config-change
+    # dates as a typing aid and ask for one (exit 2, a usage gate -- not an error).
+    if not args.pivot:
+        print("Provide a pivot date with --pivot YYYY-MM-DD to split before/after.")
+        if suggestions:
+            print("Detected config-change dates you could use as a pivot:")
+            for day, label in suggestions:
+                print(f"  {day}  {label}")
+        else:
+            print("(No CLAUDE.md / settings.json changes detected inside the data range.)")
+        return 2
+    try:
+        _parse_bound(args.pivot, "pivot")
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    render(
+        analytics.impact(ds, args.provider, pivot=args.pivot, suggestions=suggestions),
+        args.format,
+    )
+    return 0
+
+
 def _handle_compare(args: argparse.Namespace) -> int:
     import sys
 
@@ -1021,15 +1216,27 @@ def _handle_categorize(args: argparse.Namespace) -> int:
     """Dispatch the ``categorize`` subcommand."""
     from . import categorize
 
+    # Diagnostic branch: cluster the corpus and report, never write categories.
+    if getattr(args, "audit_categories", False):
+        from . import taxonomy_audit
+
+        mcs = args.min_cluster_size or taxonomy_audit.DEFAULT_MIN_CLUSTER_SIZE
+        code = taxonomy_audit.run_audit(output_dir=args.output_dir, min_cluster_size=mcs)
+        return 0 if code >= 0 else 1
+
     count = categorize.run_categorize(
         output_dir=args.output_dir,
         use_llm=args.llm,
+        use_semantic=args.semantic,
         use_batch=args.batch,
         provider=args.provider,
         model=args.model,
         batch_size=args.batch_size,
         delay=args.delay,
         limit=args.limit,
+        tau=args.tau,
+        prime_weight=args.prime_weight,
+        top_k=args.top_k,
     )
     return 0 if count >= 0 else 1
 
@@ -1127,10 +1334,36 @@ def _handle_config_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refresh_for_dashboard(output_dir: Path) -> None:
+    """Refresh the CSVs the dashboard reads, just before launching it.
+
+    Runs extract -> snapshot -> heuristic categorize so the dashboard opens on
+    the current ``~/.claude`` history without the user having to click the
+    sidebar "Refresh data" button (or run ``run --categorize`` in a terminal
+    first). This is what collapses the self-host recipe to two commands. The
+    heuristic categorizer is local (no API key, no cost); the LLM classifier
+    stays a deliberate terminal action. Never fatal: on any failure print a hint
+    and let Streamlit launch on whatever CSVs already exist.
+    """
+    import sys
+
+    from . import categorize, extract, snapshot
+
+    print("Refreshing data from ~/.claude before launch...")
+    try:
+        report = extract.run_extract(output_dir)
+        snapshot.run_snapshot(output_dir)
+        categorize.run_categorize(output_dir=str(output_dir))
+        print(f"  Extracted {report.prompts:,} prompts across {report.sessions:,} sessions.")
+    except (ValueError, OSError) as exc:
+        print(f"  (refresh skipped: {exc}; launching on the existing data)", file=sys.stderr)
+
+
 def _handle_dashboard(args: argparse.Namespace) -> int:
     """Dispatch the ``dashboard`` subcommand.
 
-    Resolves the output directory, exposes it to the dashboard process via the
+    Refreshes the data (unless ``--no-refresh`` or the demo dataset), resolves
+    the output directory, exposes it to the dashboard process via the
     ``PROMPT_ANALYTICS_OUTPUT_DIR`` environment variable, and launches the
     Streamlit app located in the installed package.
     """
@@ -1141,6 +1374,12 @@ def _handle_dashboard(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     output_dir = Path(args.output_dir).resolve()
+
+    # Pull in the latest history before opening the board, so a fresh launch
+    # never shows stale numbers. Skipped on the demo dataset (no logs to extract,
+    # and it must never overwrite the committed demo_data) and behind --no-refresh.
+    if not getattr(args, "no_refresh", False) and os.environ.get("CCA_DEMO") != "1":
+        _refresh_for_dashboard(output_dir)
 
     # Locate app.py via importlib.resources so it works from an installed wheel.
     pkg_files = importlib.resources.files("prompt_analytics.dashboard")

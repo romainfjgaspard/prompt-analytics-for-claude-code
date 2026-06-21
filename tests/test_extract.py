@@ -7,7 +7,9 @@ import os
 
 import pytest
 
+from prompt_analytics.compose import analyze_assistant_content
 from prompt_analytics.extract import run_extract
+from prompt_analytics.tokenizer import count_tokens
 
 
 def _read_csv(path):
@@ -90,6 +92,10 @@ def test_full_extract_produces_all_csvs(fake_claude):
         "requests.csv",
         "token_types.csv",
         "prompts_text.csv",
+        "context_sources.csv",
+        "context_cost.csv",
+        "tasks.csv",
+        "task_prompts.csv",
         "extract_meta.json",
     ):
         assert (out / name).exists(), f"missing {name}"
@@ -690,3 +696,442 @@ def test_extract_never_touches_categories_csv(fake_claude):
     # And prompts.csv no longer carries category columns at all.
     prompts = _read_csv(fake_claude.out / "prompts.csv")
     assert "category" not in prompts[0]
+
+
+# ---------------------------------------------------------------------------
+# Axe C: output composition metrics (output_files.csv + output_tokens.csv).
+# ---------------------------------------------------------------------------
+
+
+def _output_files_by_prompt(out):
+    """{prompt_id: {path: row}} from output_files.csv."""
+    result: dict[str, dict[str, dict[str, str]]] = {}
+    for row in _read_csv(out / "output_files.csv"):
+        result.setdefault(row["prompt_id"], {})[row["path"]] = row
+    return result
+
+
+def test_output_files_language_kind_and_lines(fake_claude):
+    fake_claude.add("session_output.jsonl", project="out")
+    run_extract(fake_claude.out)
+
+    files = _output_files_by_prompt(fake_claude.out)
+    # pO1 writes then edits src/parser.py (one file, two edit calls).
+    po1 = files["pO1"]["src/parser.py"]
+    assert (po1["language"], po1["kind"]) == ("Python", "code")
+    assert po1["edits"] == "2"  # Write + Edit
+    assert po1["lines_added"] == "7"  # Write 5 + Edit +2
+    assert po1["lines_deleted"] == "1"  # Edit -1
+    # pO2 writes tests/test_parser.py -> Python test.
+    po2 = files["pO2"]["tests/test_parser.py"]
+    assert (po2["language"], po2["kind"]) == ("Python", "test")
+    assert po2["edits"] == "1"
+    assert po2["lines_added"] == "3"
+    assert po2["lines_deleted"] == "0"
+    assert "src/parser.py" not in files["pO2"]
+
+
+def test_output_tokens_split_reconciles_with_total_output(fake_claude):
+    """prose + code per prompt equals that prompt's total output tokens."""
+    fake_claude.add("session_output.jsonl", project="out")
+    run_extract(fake_claude.out)
+
+    tokens = _tokens_by_prompt(fake_claude.out)
+    split = {
+        r["prompt_id"]: (int(r["output_prose_tokens"]), int(r["output_code_tokens"]))
+        for r in _read_csv(fake_claude.out / "output_tokens.csv")
+    }
+    for pid, (prose, code) in split.items():
+        assert prose + code == tokens[pid]["output"], pid
+        # Both blocks present in every assistant turn -> both sides non-zero.
+        assert prose > 0 and code > 0, pid
+    # pO1 = 50 + 40, pO2 = 60.
+    assert sum(split["pO1"]) == 90
+    assert sum(split["pO2"]) == 60
+
+
+def test_output_split_all_prose_when_no_tool_blocks(fake_claude):
+    """A pure-text answer (no tool_use) attributes all output to prose."""
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    run_extract(fake_claude.out)
+
+    split = {
+        r["prompt_id"]: (int(r["output_prose_tokens"]), int(r["output_code_tokens"]))
+        for r in _read_csv(fake_claude.out / "output_tokens.csv")
+    }
+    tokens = _tokens_by_prompt(fake_claude.out)
+    # session_alpha assistant lines carry no content blocks -> all prose.
+    assert split["pA1"] == (tokens["pA1"]["output"], 0)
+    assert split["pA2"] == (tokens["pA2"]["output"], 0)
+
+
+def test_output_csvs_carry_metrics_only_no_source_code(fake_claude):
+    """Relative paths are kept (the file identity); content / absolute paths are not."""
+    fake_claude.add("session_output.jsonl", project="out")
+    run_extract(fake_claude.out)
+
+    files_text = (fake_claude.out / "output_files.csv").read_text(encoding="utf-8")
+    tokens_text = (fake_claude.out / "output_tokens.csv").read_text(encoding="utf-8")
+    blob = files_text + tokens_text
+    # Source fragments from the fixture must be absent.
+    for secret in ("def parse", "return int", "import mod", "assert parse"):
+        assert secret not in blob
+    header = files_text.splitlines()[0]
+    assert header == "prompt_id,path,language,kind,edits,lines_added,lines_deleted"
+    # The project-relative path IS the file identity (DASH4 / D5-D6); only the
+    # absolute machine path must never leak.
+    assert "src/parser.py" in files_text
+    assert "/home/fake" not in blob
+
+
+def test_output_files_dedup_across_resumed_replay(fake_claude):
+    """A replayed tool call is not double-counted (dedup by tool_use id)."""
+    fake_claude.add("session_output.jsonl", project="out")
+    # A second copy of the same session: resumed sessions replay identical
+    # lines; the edits must still count once.
+    fake_claude.add("session_output.jsonl", project="out2")
+    run_extract(fake_claude.out)
+
+    files = _output_files_by_prompt(fake_claude.out)
+    po1 = files["pO1"]["src/parser.py"]
+    assert po1["lines_added"] == "7"  # not 14
+    assert po1["edits"] == "2"  # Write + Edit, counted once
+
+
+def test_output_csvs_respect_date_window(fake_claude):
+    fake_claude.add("session_output.jsonl", project="out")
+    run_extract(fake_claude.out, since="2026-06-05", timezone_name="UTC")
+    # Both prompts predate the window -> empty (header-only) output CSVs.
+    assert _read_csv(fake_claude.out / "output_files.csv") == []
+    assert _read_csv(fake_claude.out / "output_tokens.csv") == []
+
+
+# ---------------------------------------------------------------------------
+# Axe D: context composition snapshot (context_sources.csv).
+# ---------------------------------------------------------------------------
+
+_CTX_CWD = "/home/fake/projects/ctx-proj"
+_PY = "def parse(x):\n    return int(x)\n# a measured comment\n# another line\n"
+_BASH_OUT = "tests/test_parser.py ... ok\n3 passed in 0.12s\n"
+_GREP_OUT = "src/parser.py:1:def parse(x):\nsrc/util.py:4:def helper():\n"
+_SKILL = "- verify: run the app and observe.\n- code-review: review the diff.\n"
+_TS = "export function add(a: number, b: number): number {\n  return a + b\n}\n"
+
+# The assistant turns, kept as variables so the test can recompute the exact
+# conversation token weight (prose + code) the extractor will derive.
+_A_READ = [
+    {"type": "text", "text": "Reading the parser."},
+    {
+        "type": "tool_use",
+        "id": "tR1",
+        "name": "Read",
+        "input": {"file_path": f"{_CTX_CWD}/src/parser.py"},
+    },
+]
+_A_BASH = [
+    {"type": "text", "text": "Running the suite."},
+    {"type": "tool_use", "id": "tB1", "name": "Bash", "input": {"command": "pytest -q"}},
+]
+_A_GREP = [
+    {"type": "text", "text": "Searching for definitions."},
+    {"type": "tool_use", "id": "tG1", "name": "Grep", "input": {"pattern": "def "}},
+]
+_A_DONE = [{"type": "text", "text": "All done, the parser is fixed."}]
+_PROMPT_TEXT = "Analyze the parser, run the tests, and search for definitions."
+
+
+def _ctx_events(sid="sess-ctx"):
+    """A session exercising every context source (read / output / config / chat)."""
+
+    def u(uuid, parent, content, **extra):
+        return {
+            "type": "user",
+            "uuid": uuid,
+            "parentUuid": parent,
+            "timestamp": "2026-06-08T10:00:00.000Z",
+            "sessionId": sid,
+            "cwd": _CTX_CWD,
+            "gitBranch": "main",
+            "message": {"role": "user", "content": content},
+            **extra,
+        }
+
+    def a(uuid, parent, req, content):
+        return {
+            "type": "assistant",
+            "uuid": uuid,
+            "parentUuid": parent,
+            "requestId": req,
+            "timestamp": "2026-06-08T10:00:01.000Z",
+            "sessionId": sid,
+            "cwd": _CTX_CWD,
+            "message": {
+                "id": f"m-{req}",
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "stop_reason": "end_turn",
+                "content": content,
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+            },
+        }
+
+    def result(tool_id, content):
+        return [{"type": "tool_result", "tool_use_id": tool_id, "content": content}]
+
+    def att(uuid, parent, attachment):
+        return {
+            "type": "attachment",
+            "uuid": uuid,
+            "parentUuid": parent,
+            "timestamp": "2026-06-08T10:00:02.000Z",
+            "sessionId": sid,
+            "cwd": _CTX_CWD,
+            "attachment": attachment,
+        }
+
+    return [
+        u("uc1", None, _PROMPT_TEXT, promptId="pC1"),
+        a("uc2", "uc1", "rc1", _A_READ),
+        u("uc3", "uc2", result("tR1", _PY)),
+        a("uc4", "uc3", "rc2", _A_BASH),
+        u("uc5", "uc4", result("tB1", _BASH_OUT)),
+        a("uc6", "uc5", "rc3", _A_GREP),
+        # tool_result body as a list of text blocks (the other valid shape).
+        u("uc7", "uc6", result("tG1", [{"type": "text", "text": _GREP_OUT}])),
+        att("uc8", "uc7", {"type": "skill_listing", "content": _SKILL}),
+        att("uc9", "uc8", {"type": "file", "filename": f"{_CTX_CWD}/web/app.ts", "content": _TS}),
+        a("uc10", "uc9", "rc4", _A_DONE),
+    ]
+
+
+def _context_by_source(out):
+    """{(source, language): {'tokens': int, 'items': int}} from context_sources.csv."""
+    result: dict[tuple[str, str], dict[str, int]] = {}
+    for row in _read_csv(out / "context_sources.csv"):
+        bucket = result.setdefault((row["source"], row["language"]), {"tokens": 0, "items": 0})
+        bucket["tokens"] += int(row["tokens"])
+        bucket["items"] += int(row["items"])
+    return result
+
+
+def test_context_sources_sizes_each_source(fake_claude):
+    """Each source is sized by the local tokenizer; file reads keep a language."""
+    fake_claude.write("session_context.jsonl", _ctx_events(), project="ctx")
+    run_extract(fake_claude.out)
+
+    by_source = _context_by_source(fake_claude.out)
+
+    # Files read: the Read result (Python) and the file attachment (TypeScript).
+    assert by_source[("file_read", "Python")] == {"tokens": count_tokens(_PY), "items": 1}
+    assert by_source[("file_read", "TypeScript")] == {"tokens": count_tokens(_TS), "items": 1}
+    # Tool output: Bash + Grep results, both language-less.
+    assert by_source[("tool_output", "-")] == {
+        "tokens": count_tokens(_BASH_OUT) + count_tokens(_GREP_OUT),
+        "items": 2,
+    }
+    # Config: the injected skill listing (no filename -> config bucket).
+    assert by_source[("config", "-")] == {"tokens": count_tokens(_SKILL), "items": 1}
+    # Conversation: the prompt + every main-thread assistant turn (prose + code).
+    expected_conv = count_tokens(_PROMPT_TEXT)
+    for content in (_A_READ, _A_BASH, _A_GREP, _A_DONE):
+        prose, code, _ = analyze_assistant_content(content, _CTX_CWD)
+        expected_conv += prose + code
+    assert by_source[("conversation", "-")] == {"tokens": expected_conv, "items": 5}
+
+
+def test_context_source_shares_sum_to_one(fake_claude):
+    """The per-source token shares are a partition of the total context size."""
+    fake_claude.write("session_context.jsonl", _ctx_events(), project="ctx")
+    run_extract(fake_claude.out)
+
+    rows = _read_csv(fake_claude.out / "context_sources.csv")
+    total = sum(int(r["tokens"]) for r in rows)
+    assert total > 0
+    assert {r["source"] for r in rows} == {"conversation", "file_read", "tool_output", "config"}
+
+
+def test_context_sources_metrics_only_no_content(fake_claude):
+    """No file content / tool output reaches context_sources.csv; relative paths do."""
+    fake_claude.write("session_context.jsonl", _ctx_events(), project="ctx")
+    run_extract(fake_claude.out)
+
+    blob = (fake_claude.out / "context_sources.csv").read_text(encoding="utf-8")
+    header = blob.splitlines()[0]
+    assert header == "session_id,source,language,path,tokens,items"
+    # Content fragments (file bodies, tool output, skill listing) must be absent.
+    for secret in ("def parse", "return int", "3 passed", "def helper", "verify"):
+        assert secret not in blob
+    # The file-read path is kept as a project-relative identity; only the
+    # absolute machine path must never leak.
+    assert "src/parser.py" in blob and "web/app.ts" in blob
+    assert "/home/fake" not in blob
+
+
+def test_context_sources_dedup_across_resumed_replay(fake_claude):
+    """A replayed session does not double-count reads / output / config."""
+    fake_claude.write("session_context.jsonl", _ctx_events(), project="ctx")
+    run_extract(fake_claude.out)
+    once = _context_by_source(fake_claude.out)
+
+    # A resumed copy replays identical uuids / tool_use ids: totals must hold.
+    fake_claude.write("session_context_resumed.jsonl", _ctx_events(), project="ctx2")
+    run_extract(fake_claude.out)
+    twice = _context_by_source(fake_claude.out)
+    assert twice == once
+
+
+def test_context_sources_respect_date_window(fake_claude):
+    """Out-of-window sessions drop from the context snapshot entirely."""
+    fake_claude.write("session_context.jsonl", _ctx_events(), project="ctx")
+    run_extract(fake_claude.out, since="2026-07-01", timezone_name="UTC")
+    assert _read_csv(fake_claude.out / "context_sources.csv") == []
+
+
+# ---------------------------------------------------------------------------
+# Axe D (D2): context cost over time (context_cost.csv) -- the rigour signature
+# is that the attributed cache tokens reconcile to the billed main chain.
+# ---------------------------------------------------------------------------
+
+
+def _cost_events(sid="sess-cost"):
+    """A multi-turn session carrying real cache usage across its requests."""
+
+    def a(uuid, parent, req, content, usage):
+        return {
+            "type": "assistant",
+            "uuid": uuid,
+            "parentUuid": parent,
+            "requestId": req,
+            "timestamp": f"2026-06-08T10:0{req[-1]}:01.000Z",
+            "sessionId": sid,
+            "cwd": _CTX_CWD,
+            "message": {
+                "id": f"m-{req}",
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "stop_reason": "end_turn",
+                "content": content,
+                "usage": usage,
+            },
+        }
+
+    def u(uuid, parent, content, **extra):
+        return {
+            "type": "user",
+            "uuid": uuid,
+            "parentUuid": parent,
+            "timestamp": "2026-06-08T10:00:00.000Z",
+            "sessionId": sid,
+            "cwd": _CTX_CWD,
+            "message": {"role": "user", "content": content},
+            **extra,
+        }
+
+    def result(tool_id, content):
+        return [{"type": "tool_result", "tool_use_id": tool_id, "content": content}]
+
+    return [
+        u("u1", None, _PROMPT_TEXT, promptId="pc1"),
+        # Turn 1: fresh input + big cache writes (loading the context).
+        a(
+            "a1",
+            "u1",
+            "req1",
+            _A_READ,
+            {
+                "input_tokens": 50,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 8000,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 6000,
+                    "ephemeral_1h_input_tokens": 2000,
+                },
+            },
+        ),
+        u("u2", "a1", result("tR1", _PY)),
+        # Turn 2: the context is hot, re-read as cache_read (rent).
+        a(
+            "a2",
+            "u2",
+            "req2",
+            _A_BASH,
+            {
+                "input_tokens": 5,
+                "output_tokens": 15,
+                "cache_read_input_tokens": 9000,
+                "cache_creation_input_tokens": 500,
+                "cache_creation": {"ephemeral_5m_input_tokens": 500},
+            },
+        ),
+        u("u3", "a2", result("tB1", _BASH_OUT)),
+        a(
+            "a3",
+            "u3",
+            "req3",
+            _A_DONE,
+            {"input_tokens": 5, "output_tokens": 30, "cache_read_input_tokens": 12000},
+        ),
+    ]
+
+
+def _context_cost_rows(out):
+    return _read_csv(out / "context_cost.csv")
+
+
+def test_context_cost_reconciles_with_the_billed_main_chain(fake_claude):
+    """Attributed rent/load equal the billed main-chain cache tokens, to the token."""
+    fake_claude.write("session_cost.jsonl", _cost_events(), project="cost")
+    run_extract(fake_claude.out)
+
+    cost = _context_cost_rows(fake_claude.out)
+    requests = _read_csv(fake_claude.out / "requests.csv")
+    main = [r for r in requests if r["is_sidechain"] == "0"]
+
+    assert sum(int(r["rent_read_tokens"]) for r in cost) == sum(
+        int(r["cache_read_tokens"]) for r in main
+    )
+    assert sum(int(r["load_write_5m_tokens"]) for r in cost) == sum(
+        int(r["cache_write_5m_tokens"]) for r in main
+    )
+    assert sum(int(r["load_write_1h_tokens"]) for r in cost) == sum(
+        int(r["cache_write_1h_tokens"]) for r in main
+    )
+    # The session loaded the context once (writes) then paid rent re-reading it.
+    assert sum(int(r["rent_read_tokens"]) for r in cost) == 21000
+    assert sum(int(r["load_write_5m_tokens"]) for r in cost) == 6500
+
+
+def test_context_cost_metrics_only_no_content(fake_claude):
+    """context_cost.csv carries raw token counts + relative paths -- no content."""
+    fake_claude.write("session_cost.jsonl", _cost_events(), project="cost")
+    run_extract(fake_claude.out)
+
+    blob = (fake_claude.out / "context_cost.csv").read_text(encoding="utf-8")
+    assert blob.splitlines()[0] == (
+        "session_id,source,language,path,model,rent_read_tokens,"
+        "load_write_5m_tokens,load_write_1h_tokens"
+    )
+    # Content fragments must be absent; the relative file path is kept as identity.
+    for secret in ("def parse", "return int", "3 passed"):
+        assert secret not in blob
+    assert "src/parser.py" in blob
+    assert "/home/fake" not in blob
+
+
+def test_context_cost_dedup_across_resumed_replay(fake_claude):
+    """A replayed session does not double-count the attributed cache cost."""
+    fake_claude.write("session_cost.jsonl", _cost_events(), project="cost")
+    run_extract(fake_claude.out)
+    once = sum(int(r["rent_read_tokens"]) for r in _context_cost_rows(fake_claude.out))
+
+    fake_claude.write("session_cost_resumed.jsonl", _cost_events(), project="cost2")
+    run_extract(fake_claude.out)
+    twice = sum(int(r["rent_read_tokens"]) for r in _context_cost_rows(fake_claude.out))
+    assert twice == once
+
+
+def test_context_cost_respects_date_window(fake_claude):
+    """Out-of-window sessions drop from the context cost entirely."""
+    fake_claude.write("session_cost.jsonl", _cost_events(), project="cost")
+    run_extract(fake_claude.out, since="2026-07-01", timezone_name="UTC")
+    assert _context_cost_rows(fake_claude.out) == []

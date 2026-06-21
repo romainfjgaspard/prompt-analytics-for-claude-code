@@ -27,8 +27,8 @@ any chart on any page says which axis you are reading, with no legend relearning
 
 Mappings are constant across every page and identical in both themes (only the
 UI chrome flips light/dark). Prompt categories (:data:`CATEGORY_COLORS`) are a
-secondary axis confined to the Prompts page, grouped by intent (critical ops /
-reflection / support).
+secondary axis on the Composition page (Input + Tasks), grouped by intent
+(critical ops / reflection / support).
 * **Projects** get a stable hue (:func:`project_color_map`) so a project keeps
   the same color across the pareto, treemap and scatter, and even when a filter
   changes which other projects are present -- provided the caller builds the map
@@ -46,9 +46,13 @@ import streamlit as st
 
 __all__ = [
     "PALETTE",
+    "BAR_COUNT_COLOR",
+    "BAR_COST_COLOR",
     "TOKEN_TYPE_COLORS",
     "SEMANTIC_COLORS",
     "CATEGORY_COLORS",
+    "LANGUAGE_COLORS",
+    "language_color_map",
     "MIX_COLORS",
     "model_color_map",
     "model_label",
@@ -82,6 +86,13 @@ PALETTE = [
     "#6B7280",  # gray
 ]
 
+# In-cell data-bar colors for the Explorer tables (shared so the Prompt Explorer
+# and the File Explorer read identically): plain **counts** in cool blue, **costs**
+# in the brand coral that means "spend" everywhere else on the board.
+BAR_COUNT_COLOR = "#3B82F6"
+BAR_COST_COLOR = "#D97757"
+
+
 # Keyed by display label (token_type_label) AND machine key, so both work.
 # The Token palette: a cool "flow" set (no warm hue, so nothing competes with the
 # Claude coral the models own). Keyed by display label AND machine key.
@@ -108,18 +119,23 @@ SEMANTIC_COLORS = {
     "subagents": "#14B8A6",
 }
 
-# Input-side mix components (Session depth page). Cache writes stay split by
-# TTL (1.3): 1h writes are billed 2x and can dominate the 5m bucket 10:1.
+# Token-mix components (Session depth page). The four input-side components --
+# cache writes stay split by TTL (1.3): 1h writes are billed 2x and can dominate
+# the 5m bucket 10:1 -- plus **Output**, shown as a fifth panel beside them so the
+# page reads what a prompt produces, not only what it consumes. Output keeps its
+# token-palette cyan (matches ``TOKEN_TYPE_COLORS["Output"]``).
 MIX_COLORS = {
     "Fresh input": "#3B82F6",
     "Cache read": "#10B981",
     "Cache write (5m)": "#A78BFA",
     "Cache write (1h)": "#8B5CF6",
+    "Output": "#06B6D4",
 }
 
-# Prompt categories (Prompts page only): grouped by intent so the legend keeps a
-# mental logic instead of reading as a rainbow -- critical ops, reflection work,
-# support. Confined to one page, so echoing a model/token hue here is harmless.
+# Prompt categories (Composition page: Input + Tasks): grouped by intent so the
+# legend keeps a mental logic instead of reading as a rainbow -- critical ops,
+# reflection work, support. Confined there, so echoing a model/token hue here is
+# harmless.
 CATEGORY_COLORS = {
     # Critical ops
     "debug": "#DC2626",
@@ -283,6 +299,82 @@ def project_color_map(projects: Iterable[str]) -> dict[str, str]:
     reals = [p for p in sorted({str(x) for x in projects}) if p not in _PROJECT_SPECIAL]
     for index, project in enumerate(reals):
         mapping[project] = _PROJECT_PALETTE[index % len(_PROJECT_PALETTE)]
+    return mapping
+
+
+# Languages (Composition page only): a confined secondary axis, like categories
+# and projects. Recognizable linguist-ish hues for the common languages so a
+# reader spots Python / TypeScript at a glance; the synthetic buckets read as
+# neutral grey, and any other language gets a stable palette hue by sorted
+# position (see :func:`language_color_map`). Confined to one page, so echoing a
+# token / model hue here is harmless.
+LANGUAGE_COLORS = {
+    "Python": "#4B8BBE",
+    "TypeScript": "#3178C6",
+    "JavaScript": "#E8B339",
+    "Jupyter Notebook": "#DA5B0B",
+    "Markdown": "#8B949E",
+    "Go": "#00ADD8",
+    "Rust": "#CE7B53",
+    "Java": "#B07219",
+    "Kotlin": "#A97BFF",
+    "Ruby": "#CC342D",
+    "PHP": "#777BB4",
+    "C": "#6E7781",
+    "C++": "#F34B7D",
+    "C#": "#178600",
+    "Swift": "#F05138",
+    "Scala": "#C22D40",
+    "Shell": "#89E051",
+    "PowerShell": "#5391FE",
+    "SQL": "#3A7CA5",
+    "HTML": "#E34C26",
+    "CSS": "#663399",
+    "Vue": "#41B883",
+    "Svelte": "#FF3E00",
+    "Dart": "#00B4AB",
+    "Elixir": "#6E4A7E",
+    "Lua": "#000080",
+    "R": "#198CE7",
+    "Terraform": "#7B42BC",
+    "Dockerfile": "#2496ED",
+    "Makefile": "#427819",
+    "YAML": "#9CA3AF",
+    "JSON": "#9CA3AF",
+    "TOML": "#9CA3AF",
+    "XML": "#9CA3AF",
+    "INI": "#9CA3AF",
+    "Text": "#94A3B8",
+    "CSV": "#94A3B8",
+    "reStructuredText": "#8B949E",
+}
+# Synthetic non-language buckets always read as neutral grey, never a hue.
+_LANGUAGE_SPECIAL = {
+    "(other tooling)": "#64748B",
+    "(unknown)": "#D1D5DB",
+    "other": "#94A3B8",
+}
+
+
+def language_color_map(languages: Iterable[str]) -> dict[str, str]:
+    """Stable color per language label (Composition page, analogous to projects).
+
+    Known languages keep their curated linguist-ish hue (:data:`LANGUAGE_COLORS`);
+    the synthetic ``(other tooling)`` / ``(unknown)`` buckets are always neutral
+    grey; anything else is assigned the brand palette in sorted order so two
+    unmapped languages do not collide while colors remain. As with
+    :func:`project_color_map`, pass the full language universe so a language
+    keeps one hue across the page's charts.
+    """
+    mapping: dict[str, str] = dict(_LANGUAGE_SPECIAL)
+    rest: list[str] = []
+    for lang in sorted({str(x) for x in languages}):
+        if lang in LANGUAGE_COLORS:
+            mapping[lang] = LANGUAGE_COLORS[lang]
+        elif lang not in mapping:
+            rest.append(lang)
+    for index, lang in enumerate(rest):
+        mapping[lang] = _PROJECT_PALETTE[index % len(_PROJECT_PALETTE)]
     return mapping
 
 

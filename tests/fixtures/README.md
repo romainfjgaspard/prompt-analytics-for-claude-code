@@ -6,6 +6,10 @@ Hand-written JSONL exercising specific parsing edge cases (dedup across resumed
 sessions, sidechains/subagents, BOM, interleaved attribution…). They are loaded
 explicitly by name in `test_extract.py`.
 
+`session_output.jsonl` carries `tool_use` blocks (Write/Edit on `src/parser.py`
+and `tests/test_parser.py`) to exercise the Axe C output-composition metrics
+(`output_files.csv` + the prose/code split in `output_tokens.csv`).
+
 ## Versioned format fixtures (`claude-code-<version>/`)
 
 One directory per Claude Code JSONL **format version** we have captured, e.g.

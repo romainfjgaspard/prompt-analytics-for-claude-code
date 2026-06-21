@@ -54,13 +54,40 @@ XF_DATE_RANGE = "xf_date_range"
 XF_MODELS = "xf_models"
 XF_PROJECTS = "xf_projects"
 XF_CATEGORIES = "xf_categories"
+# Prompts-per-session drill: clicking a bar on the Sessions page narrows the whole
+# dashboard to sessions of exactly that prompt count. Unlike the others it has no
+# sidebar twin (it is an *aggregate* of prompts, not a prompt column), so it is a
+# drill-only dimension applied by :func:`apply_filters` after the row masks.
+XF_PROMPT_COUNT = "xf_prompt_count"
+# Prompt-length drill: clicking a bar on the Composition / Input char-count
+# histogram narrows the dashboard to prompts whose ``char_count`` falls in that
+# bucket. Like ``XF_PROMPT_COUNT`` it has no sidebar twin, but it is a *row*
+# dimension (a column of ``prompts``), so it is applied as a plain mask. Stored
+# as a ``[lo, hi]`` pair (``hi`` may be ``None`` for the open-ended top bucket).
+XF_CHAR_BUCKET = "xf_char_bucket"
 
-_XF_KEYS = (XF_DATE_RANGE, XF_MODELS, XF_PROJECTS, XF_CATEGORIES)
+_XF_KEYS = (XF_DATE_RANGE, XF_MODELS, XF_PROJECTS, XF_CATEGORIES, XF_PROMPT_COUNT, XF_CHAR_BUCKET)
 
-# The Explorer's local day / session focus, also cleared by Reset (a treemap /
-# top-10 tile click sets ``drill_session``; ``_xf_treemap_applied`` is the
-# treemap's sticky-value guard, cleared so a re-click after Reset fires again).
-_DRILL_KEYS = ("drill_date", "drill_session", "_xf_treemap_applied")
+# The Explorer pages' local focus, also cleared by Reset. A treemap / top-10 tile
+# click sets ``drill_session``; a prompt-detail / Composition link sets
+# ``drill_file`` (+ ``drill_file_project``); ``_xf_treemap_applied`` is the
+# treemap's sticky-value guard, cleared so a re-click after Reset fires again.
+#
+# The three ``st.dataframe`` *widget keys* are listed here too: their row-selection
+# is sticky (Streamlit keeps it keyed by ``key`` across reruns), so clearing only
+# the drill would leave a stale selection that re-applies the same drill on the
+# very next rerun -- the "Reset / ← All doesn't return to the list" bug. Popping
+# the widget key resets the selection so the page truly lands back on the overview.
+_DRILL_KEYS = (
+    "drill_date",
+    "drill_session",
+    "drill_file",
+    "drill_file_project",
+    "_xf_treemap_applied",
+    "explorer_sessions",
+    "explorer_prompts",
+    "fe_files",
+)
 
 # Map a sidebar widget key (what the chart-click callers still reference) to its
 # cross-filter twin. A click writes the twin, never the sidebar key.
@@ -189,6 +216,8 @@ def get_filter_state() -> dict[str, Any]:
         "xf_models": st.session_state.get(XF_MODELS),
         "xf_projects": st.session_state.get(XF_PROJECTS),
         "xf_categories": st.session_state.get(XF_CATEGORIES),
+        "xf_prompt_count": st.session_state.get(XF_PROMPT_COUNT),
+        "xf_char_bucket": st.session_state.get(XF_CHAR_BUCKET),
     }
 
 
@@ -308,7 +337,28 @@ def apply_filters(
             mask &= prompts["category"].isin(xf_categories)
         mask &= _date_mask(prompts, state.get("xf_date_range"))
 
+        # Prompt-length drill (a row dimension): keep prompts whose char_count
+        # falls in the clicked histogram bucket ``[lo, hi)`` (``hi`` None = open).
+        xf_char = state.get("xf_char_bucket")
+        if xf_char and "char_count" in prompts.columns:
+            lo, hi = xf_char[0], xf_char[1]
+            cc = pd.to_numeric(prompts["char_count"], errors="coerce")
+            mask &= cc >= lo
+            if hi is not None:
+                mask &= cc < hi
+
         prompts = prompts[mask]
+
+        # Prompts-per-session drill, applied last because it is an *aggregate*:
+        # keep only sessions whose surviving prompt count is in the selected set.
+        # Counting on the already-masked prompts matches exactly what the Sessions
+        # bar shows (it bins the filtered prompts), so a click re-narrows to that
+        # single bar and the cascade below restricts tokens / sessions in step.
+        xf_prompt_count = state.get("xf_prompt_count")
+        if xf_prompt_count and "session_id" in prompts.columns:
+            counts = prompts.groupby("session_id").size()
+            keep_sessions = set(counts[counts.isin(xf_prompt_count)].index)
+            prompts = prompts[prompts["session_id"].isin(keep_sessions)]
 
     # Cascade: keep only tokens / sessions referenced by surviving prompts.
     surviving_prompt_ids = set(prompts["prompt_id"]) if "prompt_id" in prompts.columns else set()
@@ -556,6 +606,13 @@ def _xf_parts() -> list[str]:
         parts.append(str(p))
     for c in state.get("xf_categories") or []:
         parts.append(str(c))
+    for n in state.get("xf_prompt_count") or []:
+        parts.append(f"{n} prompt/session" if n == 1 else f"{n} prompts/session")
+
+    char = state.get("xf_char_bucket")
+    if char:
+        lo, hi = char[0], char[1]
+        parts.append(f"≥{lo:,} chars" if hi is None else f"{lo:,}–{hi:,} chars")
 
     xf_date = state.get("xf_date_range")
     if xf_date:
@@ -579,6 +636,27 @@ def set_cross_filter(filter_key: str, value: list[Any]) -> bool:
         return False
     st.session_state[xf_key] = value
     return True
+
+
+def apply_prompt_count_click(value: Any) -> None:
+    """Clicked prompts-per-session bar -> filter every page to that prompt count.
+
+    A new global cross-filter dimension (Sessions page): the bar's category is the
+    integer prompt count (``"1"``, ``"2"``, …), so a click narrows the dashboard to
+    the sessions of that size. Lands on the drill key :data:`XF_PROMPT_COUNT` (badge
+    + Reset, never the sidebar), and reruns only on a real change so the
+    component's sticky value cannot re-apply every rerun.
+    """
+    if not isinstance(value, str):
+        return
+    try:
+        n = int(value)
+    except ValueError:
+        return
+    if st.session_state.get(XF_PROMPT_COUNT) == [n]:
+        return
+    st.session_state[XF_PROMPT_COUNT] = [n]
+    st.rerun()
 
 
 def reset_filters() -> None:
@@ -618,24 +696,34 @@ def render_active_filter_badge(
     it were the whole dataset (the audit's "phantom filters" risk). Because it
     appears exactly when the user has narrowed the dashboard (by clicking charts),
     it is also where the **drill-through** lives: an *Explore →* button jumps to
-    the Explorer page, which inspects the same selection as day → session → prompt
-    detail. ``explore_link=False`` on the Explorer page itself (no self-link).
+    the Prompt Explorer page, which inspects the same selection as day → session →
+    prompt detail. ``explore_link=False`` on the Prompt Explorer itself (no self-link).
 
-    Only the chart-click drill raises the badge; the persistent sidebar filters
-    never do (they are changed only in the sidebar). ``frames`` is kept for the
-    call-site signature but no longer read.
+    The badge appears **only when a chart-click drill is active** (the persistent
+    sidebar filters never raise it). When it does, it carries the **drill-through**:
+    two *Explore* buttons that dive into either detail view -- the **Prompt
+    Explorer** or the **File Explorer** -- on the current selection. ``frames`` is
+    kept for the call-site signature but no longer read.
     """
     parts = _xf_parts()
     if not parts:
         return
     if explore_link:
-        summary, explore, button = st.columns([4, 1, 1])
-        if explore.button(
-            "Explore →",
-            help="Open the matching day / session / prompt detail in Explorer",
+        summary, explore_p, explore_f, button = st.columns([3, 1.3, 1.3, 1])
+        if explore_p.button(
+            "Explore prompts →",
+            help="Open the Prompt Explorer on the current selection",
             width="stretch",
+            key="badge_explore_prompts",
         ):
             st.switch_page("pages/11_explorer.py")
+        if explore_f.button(
+            "Explore files →",
+            help="Open the File Explorer on the current selection",
+            width="stretch",
+            key="badge_explore_files",
+        ):
+            st.switch_page("pages/12_file_explorer.py")
     else:
         summary, button = st.columns([5, 1])
     summary.info("🔎 Filtered: " + " · ".join(parts))

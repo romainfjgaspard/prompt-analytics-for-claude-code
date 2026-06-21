@@ -9,7 +9,11 @@ non-regression. The Streamlit pages are run headless through
 from __future__ import annotations
 
 import datetime
+import importlib.util
+import sys
+import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -329,6 +333,37 @@ def test_project_color_map_specials_always_present_and_grey() -> None:
     assert mapping["alpha"] not in {"#9CA3AF", "#D1D5DB"}
 
 
+# ---------------------------------------------------------------------------
+# theme.language_color_map: curated hues for known languages, stable cycle else.
+# ---------------------------------------------------------------------------
+
+
+def test_language_color_map_uses_curated_hues() -> None:
+    from prompt_analytics.dashboard import theme
+
+    mapping = theme.language_color_map(["Python", "TypeScript"])
+    assert mapping["Python"] == theme.LANGUAGE_COLORS["Python"]
+    assert mapping["TypeScript"] == theme.LANGUAGE_COLORS["TypeScript"]
+
+
+def test_language_color_map_tooling_bucket_is_grey_and_distinct() -> None:
+    from prompt_analytics.dashboard import theme
+
+    mapping = theme.language_color_map(["Python", "(other tooling)"])
+    assert mapping["(other tooling)"] == "#64748B"
+    assert mapping["Python"] != mapping["(other tooling)"]
+
+
+def test_language_color_map_unknown_languages_get_distinct_stable_hues() -> None:
+    from prompt_analytics.dashboard import theme
+
+    langs = ["zig", "nim", "crystal"]  # none curated
+    mapping = theme.language_color_map(langs)
+    hues = [mapping[lang] for lang in langs]
+    assert len(set(hues)) == len(hues)  # distinct for small N
+    assert theme.language_color_map(langs) == theme.language_color_map(reversed(langs))  # stable
+
+
 def test_box_stats_uses_p5_p95_whiskers() -> None:
     """Robust whiskers: the 5-number summary uses p5/p95, not min/max."""
     from prompt_analytics.dashboard import data as data_mod
@@ -452,8 +487,9 @@ def test_available_date_bounds_mixed_tz_does_not_crash() -> None:
 @pytest.mark.parametrize(
     "script",
     [
-        # app.py and pages 1_overview / 2_models / 3_prompts / 4_session_depth /
-        # 5_sessions / 6_optimize / 7_quotas / 11_explorer are intentionally
+        # app.py and pages 1_overview / 2_models / 4_session_depth / 5_sessions /
+        # 6_optimize / 7_quotas / 8_composition / 11_explorer (Prompt Explorer) /
+        # 12_file_explorer (File Explorer) are intentionally
         # absent: they now render ECharts in main() after the data guards, and
         # streamlit-echarts cannot register under AppTest (empty component
         # registry) -- only under a real `streamlit run`. Their calculations are
@@ -571,6 +607,18 @@ def test_build_frames_date_columns_are_utc_aware(demo_env: Path) -> None:
             )
 
 
+def test_impact_to_iso_handles_date_datetime_str_none() -> None:
+    """impact._to_iso normalizes the pivot value the date widget / a suggestion stores."""
+    from prompt_analytics.dashboard import impact
+
+    assert impact._to_iso(datetime.date(2026, 6, 5)) == "2026-06-05"
+    assert impact._to_iso(datetime.datetime(2026, 6, 5, 14, 30)) == "2026-06-05"
+    assert impact._to_iso("2026-06-05") == "2026-06-05"
+    assert impact._to_iso("not a date") is None
+    assert impact._to_iso(None) is None
+    assert impact._to_iso("") is None
+
+
 def test_available_date_bounds_correct_dates(no_session_state: None) -> None:
     """available_date_bounds returns the min and max date across both frames."""
     from prompt_analytics.dashboard import filters
@@ -653,6 +701,64 @@ def test_apply_filters_ands_drill_on_top_of_sidebar(monkeypatch: pytest.MonkeyPa
     assert set(out["prompts"]["prompt_id"]) == {"p3"}
 
 
+def test_apply_filters_by_prompt_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prompts-per-session drill keeps only sessions of that prompt count.
+
+    In ``_frames`` s1 has two prompts (p1, p2) and s2 has one (p3), so a drill to
+    ``1`` keeps s2 (and its session-overhead tail), and ``2`` keeps s1.
+    """
+    from prompt_analytics.dashboard import filters
+
+    _patch_state(monkeypatch, xf_prompt_count=[1])
+    one = filters.apply_filters(_frames())
+    assert set(one["prompts"]["prompt_id"]) == {"p3"}
+    assert set(one["tokens"]["prompt_id"]) == {"p3", "s2:_continuation"}
+
+    _patch_state(monkeypatch, xf_prompt_count=[2])
+    two = filters.apply_filters(_frames())
+    assert set(two["prompts"]["prompt_id"]) == {"p1", "p2"}
+
+
+def test_xf_parts_reports_prompt_count_drill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prompts-per-session drill shows in the badge (singular for 1)."""
+    from prompt_analytics.dashboard import filters
+
+    _patch_state(monkeypatch, xf_prompt_count=[1])
+    assert "1 prompt/session" in filters._xf_parts()
+    _patch_state(monkeypatch, xf_prompt_count=[3])
+    assert "3 prompts/session" in filters._xf_parts()
+
+
+def test_apply_filters_by_char_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prompt-length drill keeps only prompts whose char_count is in the bucket.
+
+    ``[lo, hi)`` is half-open; ``hi=None`` is the open-ended top bucket. Here p1/p2/p3
+    carry 50 / 300 / 1500 chars, so ``[100, 500)`` keeps p2 and ``[1000, None]`` keeps p3.
+    """
+    from prompt_analytics.dashboard import filters
+
+    frames = _frames()
+    frames["prompts"] = frames["prompts"].assign(char_count=[50, 300, 1500])
+
+    _patch_state(monkeypatch, xf_char_bucket=[100, 500])
+    keep = filters.apply_filters(frames)
+    assert set(keep["prompts"]["prompt_id"]) == {"p2"}
+
+    _patch_state(monkeypatch, xf_char_bucket=[1000, None])
+    top = filters.apply_filters(frames)
+    assert set(top["prompts"]["prompt_id"]) == {"p3"}
+
+
+def test_xf_parts_reports_char_bucket_drill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prompt-length drill shows in the badge (≥ form for the open top bucket)."""
+    from prompt_analytics.dashboard import filters
+
+    _patch_state(monkeypatch, xf_char_bucket=[100, 500])
+    assert "100–500 chars" in filters._xf_parts()
+    _patch_state(monkeypatch, xf_char_bucket=[5000, None])
+    assert "≥5,000 chars" in filters._xf_parts()
+
+
 # ---------------------------------------------------------------------------
 # Refresh-data button pipeline (sidebar "Refresh data").
 # ---------------------------------------------------------------------------
@@ -668,7 +774,7 @@ def test_refresh_data_disabled_on_demo(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_refresh_data_runs_pipeline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """refresh_data runs extract -> snapshot -> heuristic categorize and summarizes."""
+    """refresh_data runs extract -> snapshot -> *semantic* categorize and summarizes."""
     from dataclasses import dataclass
 
     from prompt_analytics import categorize, extract, snapshot
@@ -695,6 +801,7 @@ def test_refresh_data_runs_pipeline(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     def fake_categorize(*, output_dir: str, **kwargs: object) -> int:
         calls["categorize"] = output_dir
         calls["use_llm"] = kwargs.get("use_llm", False)
+        calls["use_semantic"] = kwargs.get("use_semantic", False)
         return 42
 
     monkeypatch.setattr(extract, "run_extract", fake_extract)
@@ -706,6 +813,357 @@ def test_refresh_data_runs_pipeline(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert calls["extract"] == tmp_path
     assert calls["snapshot"] == tmp_path
     assert calls["categorize"] == str(tmp_path)
-    assert calls["use_llm"] is False  # heuristic only -- no API cost from the button
+    assert calls["use_llm"] is False  # never the LLM -- no API cost from the button
+    assert calls["use_semantic"] is True  # semantic is the dashboard default
     assert "42 prompts" in summary
     assert "7 sessions" in summary
+
+
+def test_refresh_data_falls_back_to_heuristic_when_embedder_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When the embedding model can't load (offline / model2vec missing) the
+    semantic run raises RuntimeError; refresh_data must fall back to the heuristic
+    classifier rather than failing the whole refresh."""
+    from dataclasses import dataclass
+
+    from prompt_analytics import categorize, extract, snapshot
+    from prompt_analytics.dashboard import data as data_mod
+
+    monkeypatch.delenv("CCA_DEMO", raising=False)
+    monkeypatch.setattr(data_mod, "data_dir", lambda: tmp_path)
+
+    @dataclass
+    class _Report:
+        prompts: int = 3
+        sessions: int = 1
+
+    modes: list[bool] = []
+
+    def fake_categorize(*, output_dir: str, **kwargs: object) -> int:
+        semantic = bool(kwargs.get("use_semantic", False))
+        modes.append(semantic)
+        if semantic:
+            raise RuntimeError("Could not load the static embedding model")
+        return 3
+
+    monkeypatch.setattr(extract, "run_extract", lambda directory, **_k: _Report())
+    monkeypatch.setattr(snapshot, "run_snapshot", lambda directory: 0)
+    monkeypatch.setattr(categorize, "run_categorize", fake_categorize)
+
+    summary = data_mod.refresh_data()
+
+    assert modes == [True, False]  # tried semantic, then fell back to heuristic
+    assert "3 prompts" in summary
+
+
+def test_bar_table_shades_counts_and_costs() -> None:
+    """The shared Explorer styler formats money + ints and shades cells per column.
+
+    ``st.dataframe`` renders a Styler's solid ``background-color`` (not bar
+    gradients), so the heat shade is emitted as ``rgba`` of the count/cost colours.
+    """
+    from prompt_analytics.dashboard import tables
+
+    df = pd.DataFrame({"File": ["a", "b"], "Edits": [1, 4], "Cost (USD)": [1.5, 3.0]})
+    html = tables.bar_table(df, count_cols=("Edits",), cost_cols=("Cost (USD)",)).to_html()
+    assert "$3.00" in html  # money format on the cost column
+    assert "rgba(59, 130, 246" in html  # count column shaded blue
+    assert "rgba(217, 119, 87" in html  # cost column shaded coral
+    # An empty frame is returned formatted but unshaded (no numeric range to scale).
+    assert tables.bar_table(df.iloc[0:0], count_cols=("Edits",)) is not None
+
+
+# ---------------------------------------------------------------------------
+# Compare page (Axe E / DASH2): the pure before/after averaging helpers.
+# These never touch Streamlit, so they are asserted directly here.
+# ---------------------------------------------------------------------------
+
+_OPUS = "claude-opus-4-8"  # default-priced: input 5, output 25, cache_read 0.5 / 1M
+
+
+def _compare_side() -> analytics.Dataset:
+    """A tiny side: two implementation prompts, one debug, with OPUS-priced tokens.
+
+    Each prompt: input 1M ($5) + output 100k ($2.50) + cache_read 1M ($0.50).
+    """
+
+    def _tok(pid: str, token_type: str, count: int) -> dict[str, object]:
+        return {
+            "session_id": "s",
+            "prompt_id": pid,
+            "model": _OPUS,
+            "token_type": token_type,
+            "token_count": count,
+        }
+
+    tokens: list[dict[str, object]] = []
+    for pid in ("p1", "p2", "p3"):
+        tokens += [
+            _tok(pid, "input", 1_000_000),
+            _tok(pid, "output", 100_000),
+            _tok(pid, "cache_read", 1_000_000),
+        ]
+    return analytics.Dataset(
+        sessions=[{"session_id": "s"}],
+        prompts=[
+            {"session_id": "s", "prompt_id": "p1"},
+            {"session_id": "s", "prompt_id": "p2"},
+            {"session_id": "s", "prompt_id": "p3"},
+        ],
+        tokens=tokens,
+        categories={
+            "p1": {"category": "implementation"},
+            "p2": {"category": "implementation"},
+            "p3": {"category": "debug"},
+        },
+        source="test data",
+    )
+
+
+def test_token_cost_per_prompt_is_an_average_by_type() -> None:
+    from prompt_analytics.dashboard import impact
+
+    per_prompt = impact.token_cost_per_prompt(_compare_side(), "anthropic")
+
+    # Three prompts, each $5 input / $2.50 output / $0.50 cache_read -> the average
+    # per prompt is exactly the per-prompt amount (cost / 3, not a sum).
+    assert per_prompt["input"] == pytest.approx(5.0)
+    assert per_prompt["output"] == pytest.approx(2.5)
+    assert per_prompt["cache_read"] == pytest.approx(0.5)
+    # Token types with no cost are absent.
+    assert "cache_write_1h" not in per_prompt
+
+
+def test_token_cost_per_prompt_empty_side_is_empty() -> None:
+    from prompt_analytics.dashboard import impact
+
+    empty = analytics.Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="empty")
+    assert impact.token_cost_per_prompt(empty, "anthropic") == {}
+
+
+def test_category_share_is_a_mix_summing_to_100() -> None:
+    from prompt_analytics.dashboard import impact
+
+    share = impact.category_share(_compare_side())
+
+    assert share["implementation"] == pytest.approx(200 / 3)  # 2 of 3 prompts
+    assert share["debug"] == pytest.approx(100 / 3)  # 1 of 3 prompts
+    assert sum(share.values()) == pytest.approx(100.0)
+
+
+def test_category_share_uncategorized_when_no_label() -> None:
+    from prompt_analytics.dashboard import impact
+
+    ds = analytics.Dataset(
+        sessions=[{"session_id": "s"}],
+        prompts=[{"session_id": "s", "prompt_id": "p1"}],
+        tokens=[],
+        categories={},
+        source="test data",
+    )
+    assert impact.category_share(ds) == {"(uncategorized)": pytest.approx(100.0)}
+
+
+# ---------------------------------------------------------------------------
+# Reset clears the Explorer drill *and* its sticky table selections (phase 10).
+# A row-selection that outlived a cleared drill would re-apply it on the next
+# rerun ("Reset / ← back doesn't return to the list") -- the keys must go too.
+# ---------------------------------------------------------------------------
+
+
+def test_reset_filters_clears_explorer_drill_and_table_selections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import streamlit as st
+
+    from prompt_analytics.dashboard import filters
+
+    state: dict[str, object] = {
+        # chart-click drill + Explorer focus + sticky st.dataframe selections
+        "xf_projects": ["beta"],
+        "drill_session": "s1",
+        "drill_file": "README.md",
+        "drill_file_project": "alpha",
+        "explorer_sessions": {"selection": {"rows": [0]}},
+        "explorer_prompts": {"selection": {"rows": [2]}},
+        "fe_files": {"selection": {"rows": [5]}},
+        # persistent sidebar selection -- must SURVIVE a Reset
+        "flt_projects": ["alpha"],
+    }
+    # ``filters`` does ``import streamlit as st``, so patching the streamlit module
+    # object swaps the session_state it reads (no real runtime in a unit test).
+    monkeypatch.setattr(st, "session_state", state)
+
+    filters.reset_filters()
+
+    for cleared in (
+        "xf_projects",
+        "drill_session",
+        "drill_file",
+        "drill_file_project",
+        "explorer_sessions",
+        "explorer_prompts",
+        "fe_files",
+    ):
+        assert cleared not in state, f"{cleared} should be cleared by Reset"
+    # The sidebar filter is deliberately left untouched.
+    assert state["flt_projects"] == ["alpha"]
+
+
+# ---------------------------------------------------------------------------
+# Explorer / File Explorer page helpers (phase 10 dedicated pass). The page
+# modules render ECharts, which can't register outside a real server, so we load
+# them with a stubbed ``streamlit_echarts`` and exercise the pure helpers only
+# (``main()`` never runs here -- it is gated on ``runtime.exists()``).
+# ---------------------------------------------------------------------------
+
+
+def _stub_streamlit_echarts() -> None:
+    """Register a no-op ``streamlit_echarts`` so the chart pages import offline."""
+    if "streamlit_echarts" not in sys.modules:
+        stub = types.ModuleType("streamlit_echarts")
+        stub.st_echarts = lambda *a, **k: None  # type: ignore[attr-defined]
+        stub.JsCode = lambda x: x  # type: ignore[attr-defined]
+        sys.modules["streamlit_echarts"] = stub
+
+
+_PAGE_CACHE: dict[str, Any] = {}
+
+
+def _load_page(filename: str) -> Any:
+    """Import a numbered dashboard page module by path (helpers only, no render)."""
+    if filename not in _PAGE_CACHE:
+        _stub_streamlit_echarts()
+        spec = importlib.util.spec_from_file_location(
+            f"_page_{Path(filename).stem}", PAGES_DIR / filename
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _PAGE_CACHE[filename] = module
+    return _PAGE_CACHE[filename]
+
+
+def test_files_edited_by_dedups_and_skips_no_path() -> None:
+    """The deep-link helper returns each edited path once, order-preserved, no '-'."""
+    ex = _load_page("11_explorer.py")
+    ds = analytics.Dataset(
+        sessions=[],
+        prompts=[],
+        tokens=[],
+        categories={},
+        source="test data",
+        output_files=[
+            {"prompt_id": "p1", "path": "src/a.py"},
+            {"prompt_id": "p1", "path": "src/b.py"},
+            {"prompt_id": "p1", "path": "src/a.py"},  # duplicate -> collapsed
+            {"prompt_id": "p1", "path": "-"},  # NO_PATH sentinel -> skipped
+            {"prompt_id": "p2", "path": "src/c.py"},
+        ],
+    )
+    assert ex._files_edited_by("p1", ds) == ["src/a.py", "src/b.py"]
+    assert ex._files_edited_by("p2", ds) == ["src/c.py"]
+    assert ex._files_edited_by("", ds) == []
+
+
+def test_by_session_rolls_up_and_sorts_by_cost() -> None:
+    """``_by_session`` is one row per session: project, day, prompts, cost desc."""
+    ex = _load_page("11_explorer.py")
+    prompts = pd.DataFrame(
+        {
+            "prompt_id": ["p1", "p2", "p3"],
+            "session_id": ["s1", "s1", "s2"],
+            "date": pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"], utc=True),
+            "model": ["claude-opus-4-8", "claude-opus-4-8", "claude-haiku-4-5"],
+        }
+    )
+    cost = "cost_anthropic_usd"
+    tokens = pd.DataFrame({"session_id": ["s1", "s2"], cost: [10.0, 5.0]})
+    sessions = pd.DataFrame({"session_id": ["s1", "s2"], "project": ["alpha", "beta"]})
+
+    out = ex._by_session(prompts, tokens, sessions, cost)
+
+    assert list(out["session_id"]) == ["s1", "s2"]  # sorted by cost desc
+    s1 = out[out["session_id"] == "s1"].iloc[0]
+    assert int(s1["prompts"]) == 2
+    assert float(s1[cost]) == 10.0
+    assert s1["project"] == "alpha"
+    assert s1["day"] == "2026-01-01"  # earliest prompt date in the session
+
+
+def test_file_explorer_edited_by_aggregates_per_prompt_with_task() -> None:
+    """``_edited_by`` sums a prompt's edits on a file and tags it with its task."""
+    fe = _load_page("12_file_explorer.py")
+    ds = analytics.Dataset(
+        sessions=[{"session_id": "s1", "project": "alpha"}],
+        prompts=[],
+        tokens=[],
+        categories={},
+        source="test data",
+        output_files=[
+            {"prompt_id": "p1", "path": "a.py", "edits": 2, "lines_added": 10, "lines_deleted": 3},
+            {"prompt_id": "p1", "path": "a.py", "edits": 1, "lines_added": 5, "lines_deleted": 0},
+            {"prompt_id": "p2", "path": "a.py", "edits": 1, "lines_added": 1, "lines_deleted": 1},
+            {"prompt_id": "p3", "path": "b.py", "edits": 9, "lines_added": 9, "lines_deleted": 9},
+        ],
+        tasks=[{"task_id": "t1", "name": "Build feature"}],
+        task_prompts=[{"prompt_id": "p1", "task_id": "t1"}],
+    )
+    prompts = pd.DataFrame(
+        {
+            "prompt_id": ["p1", "p2"],
+            "session_id": ["s1", "s1"],
+            "prompt_index": [1, 2],
+            "category": ["implementation", "debug"],
+        }
+    )
+
+    out = fe._edited_by(ds, "a.py", prompts)
+
+    assert set(out["prompt_id"]) == {"p1", "p2"}  # b.py's p3 excluded
+    p1 = out[out["prompt_id"] == "p1"].iloc[0]
+    assert int(p1["edits"]) == 3  # 2 + 1 aggregated
+    assert int(p1["lines_added"]) == 15
+    assert p1["task"] == "Build feature"
+    p2 = out[out["prompt_id"] == "p2"].iloc[0]
+    assert p2["task"] == ""  # no task edge -> blank, not a crash
+
+
+def test_file_explorer_read_in_costs_context_per_session() -> None:
+    """``_read_in`` summarizes reads + reconciled context cost per session."""
+    fe = _load_page("12_file_explorer.py")
+    ds = analytics.Dataset(
+        sessions=[{"session_id": "s1", "project": "alpha"}],
+        prompts=[],
+        tokens=[],
+        categories={},
+        source="test data",
+        context_sources=[
+            {"source": "file_read", "path": "a.py", "session_id": "s1", "items": 3, "tokens": 1000},
+            # a different file -> must not leak into a.py's read summary
+            {"source": "file_read", "path": "z.py", "session_id": "s1", "items": 9, "tokens": 99},
+        ],
+        context_cost=[
+            {
+                "source": "file_read",
+                "path": "a.py",
+                "session_id": "s1",
+                "model": _OPUS,
+                "rent_read_tokens": 1_000_000,
+                "load_write_5m_tokens": 0,
+                "load_write_1h_tokens": 0,
+            }
+        ],
+    )
+    sessions = pd.DataFrame({"session_id": ["s1"], "project": ["alpha"]})
+
+    out = fe._read_in(ds, "anthropic", "a.py", sessions)
+
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert int(row["reads"]) == 3
+    assert int(row["tokens"]) == 1000
+    assert row["project"] == "alpha"
+    # 1M Opus cache_read tokens priced at $0.50/M -> $0.50 of context rent.
+    assert float(row["context_usd"]) == pytest.approx(0.5)

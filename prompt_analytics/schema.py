@@ -34,6 +34,16 @@ __all__ = [
     "PROMPT_TEXT_COLS",
     "CATEGORIES_COLS",
     "QUOTA_LOG_COLS",
+    "OUTPUT_FILES_COLS",
+    "OUTPUT_TOKENS_COLS",
+    "CONTEXT_SOURCES_COLS",
+    "CONTEXT_COST_COLS",
+    "TASKS_COLS",
+    "TASK_PROMPTS_COLS",
+    "UNATTRIBUTED_SOURCE",
+    "ToolEdit",
+    "ContextItem",
+    "TodoEvent",
     "ParsedPrompt",
     "UsageRecord",
     "ParsedFile",
@@ -41,6 +51,12 @@ __all__ = [
     "PromptRow",
     "TokenRow",
     "RequestRow",
+    "OutputFileRow",
+    "OutputTokenRow",
+    "ContextSourceRow",
+    "ContextCostRow",
+    "TaskRow",
+    "TaskPromptRow",
     "continuation_prompt_id",
 ]
 
@@ -152,6 +168,101 @@ CATEGORIES_COLS = [
 
 QUOTA_LOG_COLS = ["snapshot_at", "field", "utilization_pct", "resets_at"]
 
+# Output composition (Axe C). ``output_files.csv`` is long: one row per
+# ``(prompt_id, path)`` -- the project-relative file path is the identity that
+# crosses Axe C (edits) and Axe D (reads) in the unified per-file view (DASH4 /
+# D5-D6: relative path, never absolute, so no machine path leaks). ``edits``
+# counts the edit tool calls to that file in the prompt; the line counts are
+# exact LCS diffs; ``language``/``kind`` are derived from the path. Metrics only
+# -- no source code ever reaches this CSV, just the relative path and integers.
+OUTPUT_FILES_COLS = [
+    "prompt_id",
+    "path",
+    "language",
+    "kind",
+    "edits",
+    "lines_added",
+    "lines_deleted",
+]
+
+# Per-prompt prose/code split of the generated output tokens (Axe C). The real
+# ``output_tokens`` are prorated by the local-tokenizer weight of the message's
+# text vs tool_use blocks; per prompt the two columns sum to the prompt's total
+# output tokens in ``tokens.csv`` (estimate on the split, exact on the total).
+OUTPUT_TOKENS_COLS = ["prompt_id", "output_prose_tokens", "output_code_tokens"]
+
+# Context composition (Axe D, static snapshot). Long: one row per
+# ``(session_id, source, language, path)``. ``source`` is one of the four context
+# buckets (``conversation`` / ``file_read`` / ``tool_output`` / ``config``);
+# ``language`` is the file language for ``file_read`` rows (``-`` otherwise);
+# ``path`` is the project-relative file path for ``file_read`` rows (``-``
+# otherwise), the identity that joins to Axe C in the unified per-file view.
+# ``tokens`` is the local-tokenizer size of every distinct piece of that content
+# the session ever put in context, and ``items`` counts those pieces (distinct
+# tool results, attachments, prompts + assistant turns) -- for a file that is the
+# number of times it was read. A single local tokenizer measures every source,
+# so the per-source *share* is an honest ratio (the API never reports a
+# per-element token count). Metrics only -- no content ever reaches this CSV.
+CONTEXT_SOURCES_COLS = ["session_id", "source", "language", "path", "tokens", "items"]
+
+# Context cost-over-time (Axe D, the "real cost of a context element"). Long: one
+# row per ``(session_id, source, language, path, model)``. The real per-request
+# cache tokens of the main chain are attributed across the context elements
+# present that turn -- ``rent_read_tokens`` is the cumulative ``cache_read`` (the
+# rent an element pays every turn it stays in context: size x turns of presence),
+# ``load_write_5m_tokens``/``load_write_1h_tokens`` the one-off ``cache_write``
+# of loading it. ``path`` is the project-relative file path for ``file_read``
+# rows (``-`` otherwise) -- the per-file cost that joins to Axe C edits in the
+# unified view. ``model`` is carried (like ``tokens.csv``) because pricing is per
+# model. Cache that lands on a turn with no measured element (chiefly the
+# synthetic post-compaction summary) is kept under the ``(unattributed)`` source
+# so the per-source split still reconciles to the billed total exactly. Metrics
+# only -- raw token counts, no content, relative paths only, priced at read time.
+CONTEXT_COST_COLS = [
+    "session_id",
+    "source",
+    "language",
+    "path",
+    "model",
+    "rent_read_tokens",
+    "load_write_5m_tokens",
+    "load_write_1h_tokens",
+]
+
+# Source label for cache tokens that cannot be tied to a measured context
+# element (turns before any element entered, or the post-compaction summary we
+# never persist as content). It absorbs the residual so the reconciliation is
+# exact; its size is the honest measure of the ``parentUuid`` ~= API-context gap.
+UNATTRIBUTED_SOURCE = "(unattributed)"
+
+# Task attribution (Axe B2): the prompt is not the unit of work -- the *task* is
+# ("implement feature X", "debug Y"). ``tasks.csv`` is the dimension table (one
+# row per task), ``task_prompts.csv`` the membership edges (one row per prompt:
+# its task). A task is assembled from the ``TodoWrite`` todos Claude Code really
+# wrote (the spine) or, when a session has none, inferred from time gaps +
+# prompt semantics (the fallback). The cost of a task is NOT stored here: it is
+# derived at read time by joining ``task_prompts`` -> ``tokens`` per model (the
+# whole codebase prices raw counts at read time), so a task's input+output+cache
+# cost reconciles to the bill exactly -- every real prompt belongs to one task.
+#
+# ``origin`` is ``todo`` (a real ``TodoWrite`` label, kept -- a Claude-authored
+# label, not user content) or ``inferred`` (a time/semantics segment; ``name`` is
+# a best-effort snippet of the segment's first anchoring prompt, blanked under
+# ``--no-text`` like the prompt preview). ``prompts`` is the member count.
+TASKS_COLS = [
+    "task_id",
+    "session_id",
+    "name",
+    "origin",
+    "prompts",
+    "first_timestamp",
+    "last_timestamp",
+]
+
+# Membership edges: one row per real prompt -> the task it belongs to (the
+# satellite link the B2 graph draws). A prompt belongs to exactly one task.
+TASK_PROMPTS_COLS = ["task_id", "prompt_id"]
+
 
 def continuation_prompt_id(session_id: str) -> str:
     """Pseudo prompt_id gathering a session's unattributable usage.
@@ -183,6 +294,70 @@ class ParsedPrompt(TypedDict):
     entrypoint: str
     version: str
     text: str
+    # Local-tokenizer size of ``text`` (Axe D): the prompt's contribution to the
+    # ``conversation`` context source, counted at parse time so it is cached.
+    text_tokens: int
+
+
+class ToolEdit(TypedDict):
+    """Metrics derived from one file-editing ``tool_use`` block (Axe C).
+
+    Carries no source code: only the derived language/kind, the exact line
+    diff, and a project-relative path -- the file identity persisted to
+    ``output_files.csv`` so a file's edits (Axe C) join its reads (Axe D).
+    """
+
+    tool_id: str
+    path: str
+    language: str
+    kind: str
+    lines_added: int
+    lines_deleted: int
+
+
+class ContextItem(TypedDict):
+    """One piece of content that entered the context, sized in tokens (Axe D).
+
+    Emitted for tool results (file reads, command/search output) and injected
+    attachments (skill/tool listings, file references). The dialogue itself
+    (prompts + assistant turns) is *not* an item -- it is summed from the
+    prompts and the deduplicated usage records, which already carry their token
+    weights. Carries no content: only the source bucket, the (file) language and
+    project-relative ``path`` (both ``-`` outside ``file_read``), the
+    local-tokenizer ``tokens`` size, the prompt + ``post_compact`` membership
+    reconstructed from the ``parentUuid`` chain, and a ``dedup_id`` (the tool-use
+    id or attachment uuid) so a replayed session is not double-counted.
+    """
+
+    prompt_id: str
+    post_compact: bool
+    source: str
+    language: str
+    path: str
+    tokens: int
+    dedup_id: str
+
+
+class TodoEvent(TypedDict):
+    """One "active task" marker Claude Code wrote on the main thread (Axe B2).
+
+    Two harness mechanisms feed this same shape: a ``TodoWrite`` snapshot (whole
+    list rewritten each call -- we keep the ``in_progress`` todo's label) and the
+    ``Task*`` family (a ``TaskUpdate`` flipping a task ``in_progress``, its label
+    resolved from the matching ``TaskCreate`` subject). Either way we keep only
+    the active-task ``label`` plus the ``prompt_id`` it happened under and the
+    timestamp, so task assembly can map each prompt to the task active during its
+    turn. ``label`` is empty when nothing is ``in_progress`` (all
+    pending/completed). ``dedup_id`` is the tool-use id so a replayed (resumed)
+    session is not double-counted. The label is a Claude-authored task name, not
+    user content nor source code -- safe to keep (it is the task's centre of
+    gravity).
+    """
+
+    prompt_id: str
+    timestamp: str
+    label: str
+    dedup_id: str
 
 
 class UsageRecord(TypedDict):
@@ -200,6 +375,12 @@ class UsageRecord(TypedDict):
     ``post_compact`` is True when the record descends (via the
     ``uuid``/``parentUuid`` chain) from a synthetic post-compaction
     continuation message, until the next real human prompt breaks the chain.
+
+    ``prose_tokens``/``code_tokens`` are local-tokenizer weights of this
+    message's ``text`` vs ``tool_use`` blocks (Axe C); the aggregation prorates
+    the real ``output_tokens`` by them. ``file_edits`` holds the per-edit
+    metrics for any file-editing tool calls on this line (deduplicated by
+    ``tool_id`` at aggregation time, like ``tool_use_ids``).
     """
 
     prompt_id: str
@@ -211,6 +392,9 @@ class UsageRecord(TypedDict):
     post_compact: bool
     tokens: dict[str, int]
     tool_use_ids: list[str]
+    prose_tokens: int
+    code_tokens: int
+    file_edits: list[ToolEdit]
 
 
 class ParsedFile(TypedDict):
@@ -222,6 +406,8 @@ class ParsedFile(TypedDict):
     first_timestamp: str
     prompts: list[ParsedPrompt]
     usage: list[UsageRecord]
+    context_items: list[ContextItem]
+    todo_events: list[TodoEvent]
     lines_total: int
     lines_invalid: int
     event_types: dict[str, int]
@@ -293,3 +479,89 @@ class RequestRow(TypedDict):
     cache_write_5m_tokens: int
     cache_write_1h_tokens: int
     server_tool_use_requests: int
+
+
+class OutputFileRow(TypedDict):
+    """One row of ``output_files.csv`` (Axe C, long by file path).
+
+    ``path`` is the project-relative file identity (it joins to Axe D's reads in
+    the unified per-file view); ``edits`` counts the edit tool calls to it in the
+    prompt. ``language``/``kind`` are derived from the path. Metrics only.
+    """
+
+    prompt_id: str
+    path: str
+    language: str
+    kind: str
+    edits: int
+    lines_added: int
+    lines_deleted: int
+
+
+class OutputTokenRow(TypedDict):
+    """One row of ``output_tokens.csv`` (Axe C, prose/code split per prompt)."""
+
+    prompt_id: str
+    output_prose_tokens: int
+    output_code_tokens: int
+
+
+class ContextSourceRow(TypedDict):
+    """One row of ``context_sources.csv`` (Axe D, long by source/language/path).
+
+    ``path`` is the project-relative file for ``file_read`` rows (``-``
+    otherwise); ``items`` is how many distinct pieces entered context -- for a
+    file, the number of times it was read. Metrics only.
+    """
+
+    session_id: str
+    source: str
+    language: str
+    path: str
+    tokens: int
+    items: int
+
+
+class ContextCostRow(TypedDict):
+    """One row of ``context_cost.csv`` (Axe D, cost-over-time by source/path/model).
+
+    ``rent_read_tokens`` is the real ``cache_read`` of the session's main chain
+    attributed to this ``(source, language, path)`` across every turn it stayed in
+    context (size x turns of presence); the two ``load_write_*`` columns are the
+    one-off ``cache_write`` of caching it. ``path`` is the project-relative file
+    for ``file_read`` rows (``-`` otherwise). Raw counts, priced at read time.
+    """
+
+    session_id: str
+    source: str
+    language: str
+    path: str
+    model: str
+    rent_read_tokens: int
+    load_write_5m_tokens: int
+    load_write_1h_tokens: int
+
+
+class TaskRow(TypedDict):
+    """One row of ``tasks.csv`` (Axe B2, the task dimension table).
+
+    ``origin`` is ``todo`` (a real ``TodoWrite`` label) or ``inferred`` (a
+    time/semantics segment). ``name`` is the task's centre-of-gravity label (a
+    Claude-authored todo label, or a snippet of the segment's anchoring prompt;
+    blanked under ``--no-text``). Carries no cost: it is derived at read time.
+    """
+
+    task_id: str
+    session_id: str
+    name: str
+    origin: str
+    prompts: int
+    first_timestamp: str
+    last_timestamp: str
+
+
+class TaskPromptRow(TypedDict):
+    """One row of ``task_prompts.csv`` (Axe B2): a prompt -> its task edge."""
+
+    task_id: str
+    prompt_id: str

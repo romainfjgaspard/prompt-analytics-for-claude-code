@@ -85,6 +85,112 @@ def test_demo_requests_sums_match_tokens_per_prompt():
             assert request_sums[pid][token_type] == count, (pid, token_type)
 
 
+def test_committed_output_composition_matches_generator(generated):
+    """output_files.csv / output_tokens.csv stay in sync with the generator."""
+    assert len(_read_csv("output_files.csv")) == len(generated["output_files"])
+    assert len(_read_csv("output_tokens.csv")) == len(generated["output_tokens"])
+
+
+def test_demo_output_split_reconciles_with_output_tokens():
+    """Axe C invariant on the committed demo: prose + code == prompt output."""
+    output_by_prompt: dict[str, int] = defaultdict(int)
+    for row in _read_csv("tokens.csv"):
+        if row["token_type"] == "output" and row["is_sidechain"] == "0":
+            output_by_prompt[row["prompt_id"]] += int(row["token_count"])
+
+    split = _read_csv("output_tokens.csv")
+    assert split, "the demo must ship an output_tokens.csv"
+    for row in split:
+        prose = int(row["output_prose_tokens"])
+        code = int(row["output_code_tokens"])
+        assert prose + code == output_by_prompt[row["prompt_id"]], row["prompt_id"]
+
+
+def test_demo_output_files_are_metrics_only():
+    """output_files.csv carries relative paths + metrics only (no source code)."""
+    prompt_ids = {r["prompt_id"] for r in _read_csv("prompts.csv")}
+    rows = _read_csv("output_files.csv")
+    assert rows
+    for row in rows:
+        # File rows exist for real prompts only, and carry positive metrics.
+        assert row["prompt_id"] in prompt_ids
+        assert row["kind"] in ("code", "test")
+        assert int(row["lines_added"]) >= 0 and int(row["edits"]) >= 1
+        # The path is a project-relative identity (never absolute).
+        assert row["path"] and not row["path"].startswith("/")
+
+
+def test_committed_context_composition_matches_generator(generated):
+    """context_sources.csv / context_cost.csv stay in sync with the generator."""
+    assert len(_read_csv("context_sources.csv")) == len(generated["context_sources"])
+    assert len(_read_csv("context_cost.csv")) == len(generated["context_cost"])
+
+
+def test_demo_context_cost_reconciles_with_billed_cache():
+    """Axe D invariant: attributed rent/load == billed main-chain cache, to the token."""
+    main = [r for r in _read_csv("requests.csv") if r["is_sidechain"] == "0"]
+    cost = _read_csv("context_cost.csv")
+    assert cost, "the demo must ship a context_cost.csv"
+    assert sum(int(r["rent_read_tokens"]) for r in cost) == sum(
+        int(r["cache_read_tokens"]) for r in main
+    )
+    assert sum(int(r["load_write_5m_tokens"]) for r in cost) == sum(
+        int(r["cache_write_5m_tokens"]) for r in main
+    )
+    assert sum(int(r["load_write_1h_tokens"]) for r in cost) == sum(
+        int(r["cache_write_1h_tokens"]) for r in main
+    )
+
+
+def test_demo_context_is_metrics_only():
+    """No content / file paths leak into the Axe D CSVs (privacy guard)."""
+    for name in ("context_sources.csv", "context_cost.csv"):
+        rows = _read_csv(name)
+        assert rows
+        for row in rows:
+            assert "/" not in row.get("session_id", "")
+    # File languages are labels, never paths or content.
+    langs = {r["language"] for r in _read_csv("context_sources.csv")}
+    assert "Python" in langs or "Markdown" in langs
+    assert not any("." in lang and "/" in lang for lang in langs)
+
+
+def test_committed_tasks_match_the_generator(generated):
+    """tasks.csv / task_prompts.csv stay in sync with the generator."""
+    assert len(_read_csv("tasks.csv")) == len(generated["tasks"])
+    assert len(_read_csv("task_prompts.csv")) == len(generated["task_prompts"])
+
+
+def test_demo_tasks_cover_every_prompt_once():
+    """Axe B2 invariant on the committed demo: every real prompt is in exactly
+    one task (so task costs reconcile to the prompt bill), both origins present."""
+    prompt_ids = sorted(r["prompt_id"] for r in _read_csv("prompts.csv"))
+    links = _read_csv("task_prompts.csv")
+    covered = [row["prompt_id"] for row in links]
+    assert sorted(covered) == prompt_ids  # one edge per real prompt, no extras
+    assert len(covered) == len(set(covered))
+
+    tasks = _read_csv("tasks.csv")
+    origins = {t["origin"] for t in tasks}
+    assert origins == {"todo", "inferred"}  # both assembly paths are exercised
+    # The per-task prompt count matches its membership edges.
+    counts: dict[str, int] = defaultdict(int)
+    for row in links:
+        counts[row["task_id"]] += 1
+    for task in tasks:
+        assert int(task["prompts"]) == counts[task["task_id"]]
+
+
+def test_demo_tasks_are_metrics_only():
+    """tasks.csv carries no cost columns (cost is derived at read time)."""
+    rows = _read_csv("tasks.csv")
+    assert rows
+    cols = set(rows[0])
+    assert not (cols & {"cost", "cost_usd", "rent_read_tokens", "input_tokens"})
+    for row in rows:
+        assert "/" not in row.get("session_id", "")
+
+
 def test_demo_represents_the_new_dimensions():
     tokens = _read_csv("tokens.csv")
     requests = _read_csv("requests.csv")

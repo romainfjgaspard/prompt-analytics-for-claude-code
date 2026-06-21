@@ -354,6 +354,15 @@ def test_by_category_hand_computed(ds):
     assert any("0.50" in note for note in result.notes)
 
 
+def test_input_cost_is_fresh_input_only(ds):
+    """``input_cost`` prices only the ``input`` token rows: it equals the
+    by_token_type fresh-input figure ($6.50) and stays well below the whole bill
+    (``by_category`` sums every token type, ~the entire bill)."""
+    assert analytics.input_cost(ds, "anthropic") == 6.5
+    full_bill = sum(row["cost_usd"] for row in analytics.by_category(ds, "anthropic").rows)
+    assert analytics.input_cost(ds, "anthropic") < full_bill
+
+
 def test_by_category_without_categorization_suggests_categorize(ds):
     ds.categories = {}
     result = analytics.by_category(ds, "anthropic")
@@ -576,3 +585,1016 @@ def test_live_dataset_costs_match_csv_dataset(fake_claude):
     live_rows = analytics.by_project(live, "anthropic").rows
     cached_rows = analytics.by_project(cached, "anthropic").rows
     assert live_rows == cached_rows
+
+
+# ---------------------------------------------------------------------------
+# by_output: output composition (Axe C, C2).
+# ---------------------------------------------------------------------------
+
+
+def _output_ds() -> Dataset:
+    """Two prompts with file edits + a prose/code output split.
+
+    Hand-computed (anthropic): opus output $25/1M, haiku output $5/1M.
+
+    * p1 (opus): 100k output ($2.50), split prose 60k / code 40k
+      -> prose $1.50, code $1.00. Files: Python code (+100/-10, 2 files),
+      Python test (+50, 1 file).
+    * p3 (haiku): 100k output ($0.50), split prose 20k / code 80k
+      -> prose $0.10, code $0.40. Files: SQL code (+20, 1 file).
+
+    Lines added: Python 150 (test 50), SQL 20; total 170 (test 50 = 29.4%).
+    """
+    sessions = [{"session_id": "s1", "project": "alpha"}]
+    prompts = [
+        {"session_id": "s1", "prompt_id": "p1", "project": "alpha", "model": OPUS},
+        {"session_id": "s1", "prompt_id": "p3", "project": "alpha", "model": HAIKU},
+    ]
+    tokens = [
+        _token("s1", "p1", OPUS, "output", 100_000),
+        _token("s1", "p3", HAIKU, "output", 100_000),
+    ]
+    output_files = [
+        # p1 edits two Python code files (100/+10 total) and one Python test file.
+        {
+            "prompt_id": "p1",
+            "path": "src/a.py",
+            "language": "Python",
+            "kind": "code",
+            "edits": 1,
+            "lines_added": 50,
+            "lines_deleted": 5,
+        },
+        {
+            "prompt_id": "p1",
+            "path": "src/b.py",
+            "language": "Python",
+            "kind": "code",
+            "edits": 1,
+            "lines_added": 50,
+            "lines_deleted": 5,
+        },
+        {
+            "prompt_id": "p1",
+            "path": "tests/t.py",
+            "language": "Python",
+            "kind": "test",
+            "edits": 1,
+            "lines_added": 50,
+            "lines_deleted": 0,
+        },
+        {
+            "prompt_id": "p3",
+            "path": "q.sql",
+            "language": "SQL",
+            "kind": "code",
+            "edits": 1,
+            "lines_added": 20,
+            "lines_deleted": 0,
+        },
+    ]
+    output_tokens = [
+        {"prompt_id": "p1", "output_prose_tokens": 60_000, "output_code_tokens": 40_000},
+        {"prompt_id": "p3", "output_prose_tokens": 20_000, "output_code_tokens": 80_000},
+    ]
+    return Dataset(
+        sessions=sessions,
+        prompts=prompts,
+        tokens=tokens,
+        categories={},
+        source="test data",
+        output_files=output_files,
+        output_tokens=output_tokens,
+    )
+
+
+def test_by_output_language_mix_and_kind_split():
+    result = analytics.by_output(_output_ds(), "anthropic")
+    by_lang = {r["language"]: r for r in result.rows}
+
+    python = by_lang["Python"]
+    assert python["files"] == 3
+    assert python["lines_added"] == 150
+    assert python["lines_deleted"] == 10
+    assert python["test_pct"] == round(100 * 50 / 150, 1)  # 33.3
+    assert python["share_pct"] == round(100 * 150 / 170, 1)  # 88.2
+
+    sql = by_lang["SQL"]
+    assert sql["lines_added"] == 20 and sql["test_pct"] == 0.0
+
+    total = by_lang["TOTAL"]
+    assert total["files"] == 4
+    assert total["lines_added"] == 170
+    assert total["lines_deleted"] == 10
+    assert total["test_pct"] == round(100 * 50 / 170, 1)  # 29.4
+    assert total["share_pct"] == 100.0
+
+
+def test_by_output_sorted_by_lines_with_total_last():
+    rows = analytics.by_output(_output_ds(), "anthropic").rows
+    assert [r["language"] for r in rows] == ["Python", "SQL", "TOTAL"]
+
+
+def test_by_output_prose_vs_code_cost_note():
+    notes = analytics.by_output(_output_ds(), "anthropic").notes
+    # prose $1.50+$0.10=$1.60, code $1.00+$0.40=$1.40 -> code = 46.7% of $3.00.
+    gen_note = next(n for n in notes if n.startswith("Generated output"))
+    assert "$1.60" in gen_note and "$1.40" in gen_note
+    assert "46.7% of generation cost is code" in gen_note
+    assert "80,000 prose" in gen_note and "120,000 code/tool" in gen_note
+    tests_note = next(n for n in notes if n.startswith("Code vs tests"))
+    assert "29.4%" in tests_note and "120 code, 50 test" in tests_note
+
+
+def test_by_output_empty_dataset_hints_to_extract():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test data")
+    result = analytics.by_output(empty, "anthropic")
+    assert result.rows == []
+    assert any("No output-composition data" in n for n in result.notes)
+
+
+def test_output_composition_language_costs_reconcile_to_code_cost():
+    comp = analytics.output_composition(_output_ds(), "anthropic")
+    # p1: $1.00 code cost, all Python (churn 110+50=160 all Python) -> Python $1.00.
+    # p3: $0.40 code cost, all SQL -> SQL $0.40. No tooling (both edited files).
+    by_lang = {lng.language: lng for lng in comp.languages}
+    assert by_lang["Python"].code_cost == pytest.approx(1.00, abs=1e-6)
+    assert by_lang["SQL"].code_cost == pytest.approx(0.40, abs=1e-6)
+    assert comp.tooling_cost == pytest.approx(0.0, abs=1e-9)
+    # Per-language code costs + tooling reconcile to the total code cost.
+    summed = sum(lng.code_cost for lng in comp.languages) + comp.tooling_cost
+    assert summed == pytest.approx(comp.code_cost, abs=1e-6)
+    assert comp.code_cost == pytest.approx(1.40, abs=1e-6)
+    assert comp.prose_cost == pytest.approx(1.60, abs=1e-6)
+
+
+def test_output_composition_code_tokens_without_file_edit_go_to_tooling():
+    # A prompt that spent output tokens on tooling (Bash/Read) but edited no file:
+    # no output_files row, so its code cost lands in the tooling bucket.
+    ds = Dataset(
+        sessions=[{"session_id": "s1"}],
+        prompts=[{"session_id": "s1", "prompt_id": "p1", "model": OPUS}],
+        tokens=[_token("s1", "p1", OPUS, "output", 100_000)],
+        categories={},
+        source="test data",
+        output_files=[],
+        output_tokens=[
+            {"prompt_id": "p1", "output_prose_tokens": 50_000, "output_code_tokens": 50_000}
+        ],
+    )
+    comp = analytics.output_composition(ds, "anthropic")
+    assert comp.languages == []
+    assert comp.tooling_cost == pytest.approx(comp.code_cost, abs=1e-9)
+    assert comp.code_cost > 0
+
+
+# ---------------------------------------------------------------------------
+# file_footprint: the unified per-file view (DASH4), Axe C joined to Axe D.
+# ---------------------------------------------------------------------------
+
+
+def _footprint_ds() -> Dataset:
+    """A file edited *and* read (app.py) plus a read-only file (config.json)."""
+    return Dataset(
+        sessions=[{"session_id": "s1"}],
+        prompts=[{"session_id": "s1", "prompt_id": "p1", "project": "a", "model": OPUS}],
+        tokens=[],
+        categories={},
+        source="test data",
+        output_files=[
+            {
+                "prompt_id": "p1",
+                "path": "src/app.py",
+                "language": "Python",
+                "kind": "code",
+                "edits": 3,
+                "lines_added": 120,
+                "lines_deleted": 40,
+            }
+        ],
+        output_tokens=[],
+        context_sources=[
+            {
+                "session_id": "s1",
+                "source": "file_read",
+                "language": "Python",
+                "path": "src/app.py",
+                "tokens": 5000,
+                "items": 4,
+            },
+            {
+                "session_id": "s1",
+                "source": "file_read",
+                "language": "JSON",
+                "path": "config.json",
+                "tokens": 2000,
+                "items": 2,
+            },
+            {
+                "session_id": "s1",
+                "source": "conversation",
+                "language": "-",
+                "path": "-",
+                "tokens": 9000,
+                "items": 10,
+            },
+        ],
+        context_cost=[
+            {
+                "session_id": "s1",
+                "source": "file_read",
+                "language": "Python",
+                "path": "src/app.py",
+                "model": OPUS,
+                "rent_read_tokens": 800_000,
+                "load_write_5m_tokens": 50_000,
+                "load_write_1h_tokens": 0,
+            },
+            {
+                "session_id": "s1",
+                "source": "file_read",
+                "language": "JSON",
+                "path": "config.json",
+                "model": OPUS,
+                "rent_read_tokens": 400_000,
+                "load_write_5m_tokens": 0,
+                "load_write_1h_tokens": 0,
+            },
+            {
+                "session_id": "s1",
+                "source": "conversation",
+                "language": "-",
+                "path": "-",
+                "model": OPUS,
+                "rent_read_tokens": 300_000,
+                "load_write_5m_tokens": 0,
+                "load_write_1h_tokens": 0,
+            },
+        ],
+    )
+
+
+def test_file_footprint_crosses_edits_and_context_cost():
+    rows = analytics.file_footprint(_footprint_ds(), "anthropic").rows
+    by_path = {r["path"]: r for r in rows}
+    # app.py shows BOTH halves: edits + line diff (C) and reads + context cost (D).
+    app = by_path["src/app.py"]
+    assert app["language"] == "Python" and app["kind"] == "code"
+    assert (app["edits"], app["lines_added"], app["lines_deleted"]) == (3, 120, 40)
+    assert app["reads"] == 4
+    assert app["load_usd"] > 0 and app["rent_usd"] > 0
+    assert app["context_usd"] == pytest.approx(app["load_usd"] + app["rent_usd"], abs=1e-9)
+    # The read-only manifest has a pure D footprint (no edits) -- the cut candidate.
+    cfg = by_path["config.json"]
+    assert cfg["edits"] == 0 and cfg["reads"] == 2 and cfg["rent_usd"] > 0
+    # conversation is not a file -> no per-file row.
+    assert "-" not in by_path
+
+
+def test_file_footprint_sorted_by_context_cost_with_note():
+    result = analytics.file_footprint(_footprint_ds(), "anthropic")
+    # app.py (more rent) sorts before config.json.
+    assert [r["path"] for r in result.rows] == ["src/app.py", "config.json"]
+    note = next(n for n in result.notes if "files:" in n)
+    assert "1 edited" in note and "1 read but never edited" in note
+
+
+def test_file_footprint_empty_dataset_hints_to_extract():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test data")
+    result = analytics.file_footprint(empty, "anthropic")
+    assert result.rows == []
+    assert any("No per-file data" in n for n in result.notes)
+
+
+def _multi_project_footprint_ds() -> Dataset:
+    """The same relative path (README.md) in two projects -- the de-conflation case."""
+    return Dataset(
+        sessions=[
+            {"session_id": "sA", "project": "alpha"},
+            {"session_id": "sB", "project": "beta"},
+        ],
+        prompts=[
+            {"session_id": "sA", "prompt_id": "pA", "project": "alpha", "model": OPUS},
+            {"session_id": "sB", "prompt_id": "pB", "project": "beta", "model": OPUS},
+        ],
+        tokens=[],
+        categories={},
+        source="test data",
+        output_files=[
+            {
+                "prompt_id": "pA",
+                "path": "README.md",
+                "language": "Markdown",
+                "kind": "docs",
+                "edits": 1,
+                "lines_added": 10,
+                "lines_deleted": 0,
+            },
+            {
+                "prompt_id": "pB",
+                "path": "README.md",
+                "language": "Markdown",
+                "kind": "docs",
+                "edits": 1,
+                "lines_added": 5,
+                "lines_deleted": 0,
+            },
+        ],
+        output_tokens=[],
+        context_cost=[
+            {
+                "session_id": "sA",
+                "source": "file_read",
+                "language": "Markdown",
+                "path": "README.md",
+                "model": OPUS,
+                "rent_read_tokens": 1_000_000,
+                "load_write_5m_tokens": 0,
+                "load_write_1h_tokens": 0,
+            },
+            {
+                "session_id": "sB",
+                "source": "file_read",
+                "language": "Markdown",
+                "path": "README.md",
+                "model": OPUS,
+                "rent_read_tokens": 2_000_000,
+                "load_write_5m_tokens": 0,
+                "load_write_1h_tokens": 0,
+            },
+        ],
+    )
+
+
+def test_file_footprint_merges_homonyms_by_default():
+    rows = analytics.file_footprint(_multi_project_footprint_ds(), "anthropic").rows
+    assert [r["path"] for r in rows] == ["README.md"]  # one merged row across both repos
+    assert rows[0]["edits"] == 2 and rows[0]["lines_added"] == 15
+    assert "project" not in rows[0]
+
+
+def test_file_footprint_by_project_splits_homonyms():
+    result = analytics.file_footprint(_multi_project_footprint_ds(), "anthropic", by_project=True)
+    assert [c.key for c in result.columns][0] == "project"  # Project leads the table
+    by_proj = {r["project"]: r for r in result.rows}
+    assert set(by_proj) == {"alpha", "beta"}
+    # Within a project the edit (via its prompt) and the read (via its session) merge.
+    assert by_proj["alpha"]["edits"] == 1 and by_proj["alpha"]["lines_added"] == 10
+    assert by_proj["beta"]["edits"] == 1 and by_proj["beta"]["lines_added"] == 5
+    # Rent (opus cache_read $0.50/1M): alpha 1M -> $0.50, beta 2M -> $1.00.
+    assert by_proj["alpha"]["context_usd"] == pytest.approx(0.50, abs=1e-6)
+    assert by_proj["beta"]["context_usd"] == pytest.approx(1.00, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# file_graph: the file cost-graph (Axe C+D / DASH5), centres + edit satellites.
+# ---------------------------------------------------------------------------
+
+
+def test_file_graph_centres_satellites_and_totals():
+    graph = analytics.file_graph(_footprint_ds(), "anthropic")
+
+    # Two file centres, sorted by context cost (app.py's rent puts it first).
+    assert [f.path for f in graph.files] == ["src/app.py", "config.json"]
+    app = graph.files[0]
+    assert app.language == "Python" and app.kind == "code"
+    assert app.edited and app.edits == 3 and app.lines_added == 120 and app.reads == 4
+    assert app.cost == pytest.approx(app.cost, abs=1e-9) and app.cost > 0
+    # The read-only manifest is a lone centre -- pure rent, no edit satellite.
+    cfg = graph.files[1]
+    assert not cfg.edited and cfg.reads == 2
+
+    # Only the edited file has a satellite (its editing prompt), churn = +added/-deleted.
+    assert [(s.prompt_id, s.path) for s in graph.satellites] == [("p1", "src/app.py")]
+    assert graph.satellites[0].churn == 160  # 120 + 40
+    assert graph.satellites[0].category == "(uncategorized)"  # no categories in fixture
+
+    # Population counts + reconciled context total.
+    assert graph.total_files == 2
+    assert graph.edited_files == 1
+    assert graph.readonly_files == 1
+    assert graph.context_total == pytest.approx(app.cost + cfg.cost, abs=1e-6)
+    assert graph.has_data
+
+
+def test_file_graph_top_limits_centres_and_their_satellites():
+    graph = analytics.file_graph(_footprint_ds(), "anthropic", top=1)
+    assert [f.path for f in graph.files] == ["src/app.py"]
+    # Only the kept file's edits orbit; the dropped file would not anyway (read-only).
+    assert {s.path for s in graph.satellites} == {"src/app.py"}
+    # The population count still reflects every file, not just the shown slice.
+    assert graph.total_files == 2
+
+
+def test_file_graph_empty_dataset_has_no_data():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test data")
+    graph = analytics.file_graph(empty, "anthropic")
+    assert graph.files == []
+    assert graph.satellites == []
+    assert not graph.has_data
+
+
+# ---------------------------------------------------------------------------
+# by_context: context cost over time (Axe D, D2).
+# ---------------------------------------------------------------------------
+
+
+def _context_cost_ds() -> Dataset:
+    """Context cost rows + the matching main-chain requests (opus rates).
+
+    opus: cache_read $0.5/1M, cache_write_5m $6.25/1M, cache_write_1h $10/1M.
+
+    * file_read Python: rent 2M ($1.00), load_5m 1M ($6.25) -> total $7.25
+    * conversation:     rent 1M ($0.50), load_1h 0.1M ($1.00) -> total $1.50
+    * (unattributed):   rent 0.2M ($0.10)
+
+    Bill: cache_read 3.2M ($1.60) + write_5m 1M ($6.25) + write_1h 0.1M ($1.00)
+    = $8.85, which the attributed $8.75 + $0.10 unattributed reconciles to.
+    """
+    context_cost = [
+        {
+            "session_id": "s1",
+            "source": "file_read",
+            "language": "Python",
+            "model": OPUS,
+            "rent_read_tokens": 2_000_000,
+            "load_write_5m_tokens": 1_000_000,
+            "load_write_1h_tokens": 0,
+        },
+        {
+            "session_id": "s1",
+            "source": "conversation",
+            "language": "-",
+            "model": OPUS,
+            "rent_read_tokens": 1_000_000,
+            "load_write_5m_tokens": 0,
+            "load_write_1h_tokens": 100_000,
+        },
+        {
+            "session_id": "s1",
+            "source": "(unattributed)",
+            "language": "-",
+            "model": OPUS,
+            "rent_read_tokens": 200_000,
+            "load_write_5m_tokens": 0,
+            "load_write_1h_tokens": 0,
+        },
+    ]
+    requests = [
+        {
+            "session_id": "s1",
+            "prompt_id": "p1",
+            "model": OPUS,
+            "is_sidechain": 0,
+            "cache_read_tokens": 3_200_000,
+            "cache_write_5m_tokens": 1_000_000,
+            "cache_write_1h_tokens": 100_000,
+        },
+        # A subagent request carries its own context: excluded from the bill.
+        {
+            "session_id": "s1",
+            "prompt_id": "p1",
+            "model": OPUS,
+            "is_sidechain": 1,
+            "cache_read_tokens": 9_000_000,
+            "cache_write_5m_tokens": 0,
+            "cache_write_1h_tokens": 0,
+        },
+    ]
+    return Dataset(
+        sessions=[{"session_id": "s1", "project": "alpha"}],
+        prompts=[{"session_id": "s1", "prompt_id": "p1", "project": "alpha", "model": OPUS}],
+        tokens=[],
+        categories={},
+        source="test data",
+        requests=requests,
+        context_cost=context_cost,
+    )
+
+
+def test_context_cost_splits_load_and_rent_per_element():
+    comp = analytics.context_cost(_context_cost_ds(), "anthropic")
+    by_src = {(e.source, e.language): e for e in comp.elements}
+    python = by_src[("file_read", "Python")]
+    assert python.load_cost == pytest.approx(6.25, abs=1e-6)
+    assert python.rent_cost == pytest.approx(1.00, abs=1e-6)
+    conv = by_src[("conversation", "-")]
+    assert conv.load_cost == pytest.approx(1.00, abs=1e-6)
+    assert conv.rent_cost == pytest.approx(0.50, abs=1e-6)
+    # (unattributed) is kept out of the elements but folded into the residual.
+    assert ("(unattributed)", "-") not in by_src
+    assert comp.unattributed_cost == pytest.approx(0.10, abs=1e-6)
+
+
+def test_context_cost_reconciles_to_the_billed_main_chain():
+    ds = _context_cost_ds()
+    comp = analytics.context_cost(ds, "anthropic")
+    engine = analytics.CostEngine("anthropic")
+    bill = analytics._main_chain_cache_cost(ds, engine)
+    assert comp.total_cost == pytest.approx(8.85, abs=1e-6)
+    assert comp.total_cost == pytest.approx(bill, abs=1e-6)  # subagent read excluded
+    assert comp.attributed_cost == pytest.approx(8.75, abs=1e-6)
+
+
+def test_context_cost_exposes_token_counts_for_token_charts():
+    """Each element and the whole ContextCost expose the raw cache tokens behind
+    the prices (rent reads + loading writes), attributed-only, so a view can plot
+    context size in tokens, not just dollars (Prompt 3)."""
+    comp = analytics.context_cost(_context_cost_ds(), "anthropic")
+    by_src = {(e.source, e.language): e for e in comp.elements}
+    python = by_src[("file_read", "Python")]
+    assert python.rent_read_tokens == 2_000_000
+    assert python.load_tokens == 1_000_000  # 5m + 1h
+    assert python.total_tokens == 3_000_000
+    conv = by_src[("conversation", "-")]
+    assert conv.load_write_1h_tokens == 100_000
+    assert conv.total_tokens == 1_100_000
+    # Aggregate totals exclude the (unattributed) 0.2M rent (mirrors elements).
+    assert comp.rent_read_tokens == 3_000_000
+    assert comp.load_write_5m_tokens == 1_000_000
+    assert comp.load_write_1h_tokens == 100_000
+    assert comp.load_tokens == 1_100_000
+    assert comp.total_tokens == 4_100_000
+
+
+def test_by_context_table_sorted_with_total_and_unattributed():
+    result = analytics.by_context(_context_cost_ds(), "anthropic")
+    # Sorted by total cost: file_read Python ($7.25) before conversation ($1.50),
+    # then the (unattributed) line, then TOTAL last.
+    labels = [(r["source"], r["language"]) for r in result.rows]
+    assert labels[0] == ("Files read", "Python")
+    assert labels[1] == ("Conversation", "-")
+    assert ("(unattributed)", "-") in labels
+    assert labels[-1] == ("TOTAL", "")
+    total = result.rows[-1]
+    assert total["total_usd"] == pytest.approx(8.85, abs=1e-4)
+    recon = next(n for n in result.notes if n.startswith("Reconciliation"))
+    assert "$8.75" in recon and "$8.85" in recon
+
+
+def test_by_context_empty_dataset_hints_to_extract():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test data")
+    result = analytics.by_context(empty, "anthropic")
+    assert result.rows == []
+    assert any("No context-cost data" in n for n in result.notes)
+
+
+def test_filter_prompt_ids_narrows_output_rows():
+    ds = _output_ds()
+    kept = analytics.filter_prompt_ids(ds, {"p1"})
+    assert {r["prompt_id"] for r in kept.prompts} == {"p1"}
+    assert {r["prompt_id"] for r in kept.output_files} == {"p1"}
+    assert {r["prompt_id"] for r in kept.output_tokens} == {"p1"}
+    assert {r["prompt_id"] for r in kept.tokens} == {"p1"}
+    # The narrowed dataset feeds the composition view: only Python survives.
+    comp = analytics.output_composition(kept, "anthropic")
+    assert [lng.language for lng in comp.languages] == ["Python"]
+
+
+# ---------------------------------------------------------------------------
+# by_task: cost by task (Axe B2), the task as the unit of work.
+# ---------------------------------------------------------------------------
+
+
+def _task_ds() -> Dataset:
+    """One session, two tasks (a todo spine + an inferred one) and a continuation.
+
+    OPUS rates (per 1M): input 5, output 25, cache_read 0.5, cache_write_5m 6.25.
+    t1 = p1 + p2: input $5 + output $5 + cache_read ($1 + $0.5) = $11.50 ($1.50 ctx).
+    t2 = p3: input $2 + cache_write_5m $6.25 = $8.25 ($6.25 ctx). A continuation
+    token row (no task) is the $0.50 overhead, excluded from every task.
+    """
+    tokens = [
+        _token("s1", "p1", OPUS, "input", 1_000_000),  # $5.00
+        _token("s1", "p1", OPUS, "output", 200_000),  # $5.00
+        _token("s1", "p1", OPUS, "cache_read", 2_000_000),  # $1.00 (context)
+        _token("s1", "p2", OPUS, "cache_read", 1_000_000),  # $0.50 (context)
+        _token("s1", "p3", OPUS, "input", 400_000),  # $2.00
+        _token("s1", "p3", OPUS, "cache_write_5m", 1_000_000),  # $6.25 (context)
+        _token("s1", "s1:cont", OPUS, "cache_read", 1_000_000),  # $0.50 overhead
+    ]
+    tasks = [
+        {
+            "task_id": "s1:t01",
+            "session_id": "s1",
+            "name": "Add the export pipeline",
+            "origin": "todo",
+            "prompts": 2,
+            "first_timestamp": "2026-06-01T08:00:00.000Z",
+            "last_timestamp": "2026-06-01T10:30:00.000Z",
+        },
+        {
+            "task_id": "s1:i01",
+            "session_id": "s1",
+            "name": "fix the failing test",
+            "origin": "inferred",
+            "prompts": 1,
+            "first_timestamp": "2026-06-01T11:00:00.000Z",
+            "last_timestamp": "2026-06-01T11:00:00.000Z",
+        },
+    ]
+    task_prompts = [
+        {"task_id": "s1:t01", "prompt_id": "p1"},
+        {"task_id": "s1:t01", "prompt_id": "p2"},
+        {"task_id": "s1:i01", "prompt_id": "p3"},
+    ]
+    categories = {
+        "p1": {"category": "implementation", "complexity": "3"},
+        "p2": {"category": "implementation", "complexity": "2"},
+        "p3": {"category": "debug", "complexity": "2"},
+    }
+    return Dataset(
+        sessions=[{"session_id": "s1", "project": "alpha"}],
+        prompts=[{"session_id": "s1", "prompt_id": pid} for pid in ("p1", "p2", "p3")],
+        tokens=tokens,
+        categories=categories,
+        source="test data",
+        tasks=tasks,
+        task_prompts=task_prompts,
+    )
+
+
+def test_filter_prompt_ids_narrows_the_task_dimension():
+    """A task whose every prompt is filtered out drops from the dimension, so the
+    task count / averages describe the surviving scope (not the whole corpus)."""
+    kept = analytics.filter_prompt_ids(_task_ds(), {"p3"})
+    assert {t["task_id"] for t in kept.tasks} == {"s1:i01"}
+    assert {row["prompt_id"] for row in kept.task_prompts} == {"p3"}
+    assert analytics.task_graph(kept, "anthropic").total_tasks == 1
+
+
+def test_by_task_cost_split_context_and_dominant_category():
+    rows = {r["task"]: r for r in analytics.by_task(_task_ds(), "anthropic").rows}
+
+    t1 = rows["Add the export pipeline"]
+    assert t1["origin"] == "todo"
+    assert t1["prompts"] == 2
+    assert t1["duration"] == "2h 30m"
+    assert t1["category"] == "implementation"
+    assert t1["cost_usd"] == pytest.approx(11.50, abs=1e-6)
+    assert t1["context_pct"] == round(100 * 1.50 / 11.50, 1)  # 13.0
+    assert t1["cost_share_pct"] == round(100 * 11.50 / 19.75, 1)  # 58.2
+
+    t2 = rows["fix the failing test"]
+    assert t2["origin"] == "inferred"
+    assert t2["duration"] == "<1m"  # single instant
+    assert t2["category"] == "debug"
+    assert t2["cost_usd"] == pytest.approx(8.25, abs=1e-6)
+    assert t2["context_pct"] == round(100 * 6.25 / 8.25, 1)  # 75.8
+
+
+def test_by_task_sorted_by_cost_and_top_truncates():
+    rows = analytics.by_task(_task_ds(), "anthropic").rows
+    assert [r["task"] for r in rows] == ["Add the export pipeline", "fix the failing test"]
+    top1 = analytics.by_task(_task_ds(), "anthropic", top=1).rows
+    assert [r["task"] for r in top1] == ["Add the export pipeline"]
+
+
+def test_by_task_notes_origin_split_context_and_overhead():
+    notes = analytics.by_task(_task_ds(), "anthropic").notes
+    spine = next(n for n in notes if "TodoWrite spine" in n)
+    assert "2 tasks across 1 sessions" in spine
+    assert "1 from the TodoWrite spine, 1 inferred" in spine
+    ctx = next(n for n in notes if n.startswith("Context is"))
+    assert "$7.75 of $19.75" in ctx  # 1.50 + 6.25 of 11.50 + 8.25
+    assert "39.2%" in ctx
+    overhead = next(n for n in notes if n.startswith("Session overhead"))
+    assert "$0.50" in overhead
+
+
+def test_by_task_costs_reconcile_to_the_bill():
+    ds = _task_ds()
+    engine = CostEngine("anthropic")
+    task_cost = sum(r["cost_usd"] for r in analytics.by_task(ds, "anthropic").rows)
+    overhead = engine.cost(OPUS, "cache_read", 1_000_000)  # the continuation row
+    total_bill = sum(engine.cost(t["model"], t["token_type"], t["token_count"]) for t in ds.tokens)
+    assert task_cost + overhead == pytest.approx(total_bill, abs=1e-6)
+
+
+def test_by_task_uncategorized_when_no_categories():
+    ds = _task_ds()
+    ds.categories.clear()
+    result = analytics.by_task(ds, "anthropic")
+    assert all(r["category"] == "(uncategorized)" for r in result.rows)
+    assert any("No categorization found" in n for n in result.notes)
+
+
+def test_by_task_empty_dataset_hints_to_extract():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test data")
+    result = analytics.by_task(empty, "anthropic")
+    assert result.rows == []
+    assert any("No task data" in n for n in result.notes)
+
+
+# ---------------------------------------------------------------------------
+# task_graph: the Axe-B2 force-graph data (task centres + prompt satellites).
+# ---------------------------------------------------------------------------
+
+
+def test_task_graph_centres_satellites_and_totals():
+    graph = analytics.task_graph(_task_ds(), "anthropic")
+
+    # Two task centres, sorted by cost (the $11.50 todo task first).
+    assert [t.name for t in graph.tasks] == ["Add the export pipeline", "fix the failing test"]
+    centre = graph.tasks[0]
+    assert centre.category == "implementation"
+    assert centre.origin == "todo"
+    assert centre.prompts == 2
+    assert centre.cost == pytest.approx(11.50, abs=1e-6)
+    assert centre.context_pct == round(100 * 1.50 / 11.50, 1)
+
+    # Satellites = the prompts of the shown tasks (3 across both), each linked.
+    assert {s.prompt_id for s in graph.satellites} == {"p1", "p2", "p3"}
+    assert {s.task_id for s in graph.satellites} == {"s1:t01", "s1:i01"}
+    p1 = next(s for s in graph.satellites if s.prompt_id == "p1")
+    assert p1.category == "implementation"
+    assert p1.cost == pytest.approx(11.00, abs=1e-6)  # input $5 + output $5 + cache_read $1
+
+    # Population + reconciled totals (overhead excluded, like by_task).
+    assert graph.total_tasks == 2
+    assert graph.todo_tasks == 1
+    assert graph.grand_total == pytest.approx(19.75, abs=1e-6)
+    assert graph.context_total == pytest.approx(7.75, abs=1e-6)
+    assert graph.has_data
+
+
+def test_task_graph_top_limits_centres_and_their_satellites():
+    graph = analytics.task_graph(_task_ds(), "anthropic", top=1)
+    assert [t.task_id for t in graph.tasks] == ["s1:t01"]
+    # Only the kept task's prompts orbit; the dropped task's prompt is gone.
+    assert {s.prompt_id for s in graph.satellites} == {"p1", "p2"}
+    # The population count still reflects every task, not just the shown slice.
+    assert graph.total_tasks == 2
+
+
+def test_task_graph_uncategorized_without_categories():
+    ds = _task_ds()
+    ds.categories.clear()
+    graph = analytics.task_graph(ds, "anthropic")
+    assert all(t.category == "(uncategorized)" for t in graph.tasks)
+    assert all(s.category == "(uncategorized)" for s in graph.satellites)
+
+
+def test_task_graph_dominant_category_is_cost_weighted_not_counted():
+    """The centre's colour follows the *cost*, so cheap trailers can't outvote the
+    one expensive prompt where the real work (and money) actually went."""
+    tokens = [
+        _token("s1", "p1", OPUS, "output", 400_000),  # $10.00 implementation
+        _token("s1", "p2", OPUS, "input", 1_000),  # ~$0.005 ops
+        _token("s1", "p3", OPUS, "input", 1_000),  # ~$0.005 ops
+        _token("s1", "p4", OPUS, "input", 1_000),  # ~$0.005 ops
+    ]
+    tasks = [
+        {
+            "task_id": "s1:t01",
+            "session_id": "s1",
+            "name": "build it",
+            "origin": "todo",
+            "prompts": 4,
+            "first_timestamp": "2026-06-01T08:00:00.000Z",
+            "last_timestamp": "2026-06-01T09:00:00.000Z",
+        }
+    ]
+    task_prompts = [{"task_id": "s1:t01", "prompt_id": pid} for pid in ("p1", "p2", "p3", "p4")]
+    categories = {
+        "p1": {"category": "implementation"},
+        "p2": {"category": "ops"},
+        "p3": {"category": "ops"},
+        "p4": {"category": "ops"},
+    }
+    ds = Dataset(
+        sessions=[{"session_id": "s1", "project": "alpha"}],
+        prompts=[{"session_id": "s1", "prompt_id": pid} for pid in ("p1", "p2", "p3", "p4")],
+        tokens=tokens,
+        categories=categories,
+        source="test data",
+        tasks=tasks,
+        task_prompts=task_prompts,
+    )
+    # Count would say "ops" (3 vs 1); cost says "implementation" (the $10 prompt).
+    assert analytics.task_graph(ds, "anthropic").tasks[0].category == "implementation"
+    assert analytics.by_task(ds, "anthropic").rows[0]["category"] == "implementation"
+
+
+def test_task_graph_empty_dataset_has_no_data():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test data")
+    graph = analytics.task_graph(empty, "anthropic")
+    assert graph.tasks == []
+    assert graph.satellites == []
+    assert not graph.has_data
+
+
+# ---------------------------------------------------------------------------
+# impact: before/after a date pivot (Axe E, the capstone transverse view).
+# ---------------------------------------------------------------------------
+
+
+def _impact_ds() -> Dataset:
+    """Two prompts before a pivot, two after, with clean OPUS-priced costs.
+
+    OPUS rates (per 1M): input 5, output 25, cache_read 0.5.
+    BEFORE (s1, 2026-06-01): p1 = p2 = input 1M ($5) + output 100k ($2.50) +
+    cache_read 1M ($0.50) = $8.00 each -> $16.00, output $5, context $1.
+    AFTER (s2, 2026-06-10): p3 = p4 = input 2M ($10) + output 400k ($10) +
+    cache_read 4M ($2) = $22.00 each -> $44.00, output $20, context $4.
+    One request per prompt (the 'turns'). Pivot 2026-06-05 splits 2 / 2.
+    """
+
+    def _p(session, pid, day):
+        return {"session_id": session, "prompt_id": pid, "timestamp": f"{day}T10:00:00Z"}
+
+    def _req(session, pid):
+        return {"session_id": session, "prompt_id": pid, "is_sidechain": 0}
+
+    tokens = []
+    for pid in ("p1", "p2"):
+        tokens += [
+            _token("s1", pid, OPUS, "input", 1_000_000),
+            _token("s1", pid, OPUS, "output", 100_000),
+            _token("s1", pid, OPUS, "cache_read", 1_000_000),
+        ]
+    for pid in ("p3", "p4"):
+        tokens += [
+            _token("s2", pid, OPUS, "input", 2_000_000),
+            _token("s2", pid, OPUS, "output", 400_000),
+            _token("s2", pid, OPUS, "cache_read", 4_000_000),
+        ]
+    return Dataset(
+        sessions=[{"session_id": "s1"}, {"session_id": "s2"}],
+        prompts=[
+            _p("s1", "p1", "2026-06-01"),
+            _p("s1", "p2", "2026-06-01"),
+            _p("s2", "p3", "2026-06-10"),
+            _p("s2", "p4", "2026-06-10"),
+        ],
+        tokens=tokens,
+        categories={
+            "p1": {"category": "implementation"},
+            "p2": {"category": "implementation"},
+            "p3": {"category": "debug"},
+            "p4": {"category": "implementation"},
+        },
+        source="test data",
+        requests=[_req("s1", "p1"), _req("s1", "p2"), _req("s2", "p3"), _req("s2", "p4")],
+        tasks=[{"task_id": "s1:t1", "session_id": "s1"}],
+        task_prompts=[{"task_id": "s1:t1", "prompt_id": "p1"}],
+    )
+
+
+def _metric(report, label):
+    return next(m for m in report.metrics if m.label == label)
+
+
+def test_impact_report_normalized_ratios_split_on_pivot():
+    report = analytics.impact_report(_impact_ds(), provider="anthropic", pivot="2026-06-05")
+
+    assert report.before_prompts == 2
+    assert report.after_prompts == 2
+    assert report.has_both_sides
+
+    cpp = _metric(report, "Cost per prompt")
+    assert cpp.before == pytest.approx(8.0)  # $16.00 / 2
+    assert cpp.after == pytest.approx(22.0)  # $44.00 / 2
+
+    out_share = _metric(report, "Output cost share")
+    assert out_share.before == pytest.approx(100 * 5 / 16)  # 31.25
+    assert out_share.after == pytest.approx(100 * 20 / 44)  # 45.45
+
+    ctx_share = _metric(report, "Context rent share")
+    assert ctx_share.before == pytest.approx(100 * 1 / 16)  # 6.25
+    assert ctx_share.after == pytest.approx(100 * 4 / 44)  # 9.09
+
+    crpt = _metric(report, "Cache read / turn")
+    assert crpt.before == pytest.approx(2_000_000 / 2)  # two requests before
+    assert crpt.after == pytest.approx(8_000_000 / 2)
+
+    oppt = _metric(report, "Output tokens / prompt")
+    assert oppt.before == pytest.approx(200_000 / 2)
+    assert oppt.after == pytest.approx(800_000 / 2)
+
+
+def test_impact_report_confounders_and_total_reconciles():
+    report = analytics.impact_report(_impact_ds(), provider="anthropic", pivot="2026-06-05")
+
+    before_total = _metric(report, "Total cost").before
+    after_total = _metric(report, "Total cost").after
+    assert before_total == pytest.approx(16.0)
+    assert after_total == pytest.approx(44.0)
+    # The two sides reconcile to the whole bill (every token is on exactly one side).
+    engine = CostEngine("anthropic")
+    bill = sum(
+        engine.cost(t["model"], t["token_type"], t["token_count"]) for t in _impact_ds().tokens
+    )
+    assert before_total + after_total == pytest.approx(bill)
+
+    prompts = _metric(report, "Prompts")
+    assert prompts.confounder and prompts.before == 2 and prompts.after == 2
+    pps = _metric(report, "Prompts / session")
+    assert pps.before == pytest.approx(2.0) and pps.after == pytest.approx(2.0)
+    cats = _metric(report, "Top category")
+    assert cats.before == "implementation"  # 2 implementation
+    assert cats.after == "debug"  # debug wins the 1-1 tie by Counter order (first seen)
+
+
+def test_impact_table_has_confounder_divider_and_honesty_note():
+    result = analytics.impact(_impact_ds(), "anthropic", pivot="2026-06-05")
+    metrics = [r["metric"] for r in result.rows]
+    # Ratios come first, then the divider, then the confounders.
+    assert "Cost per prompt" in metrics
+    divider = next(i for i, m in enumerate(metrics) if "confounders" in m)
+    assert metrics.index("Cost per prompt") < divider < metrics.index("Prompts")
+    # The honesty caveat (observational, not causal) is always present.
+    assert any("observational split" in n for n in result.notes)
+    assert any("Pivot 2026-06-05" in n for n in result.notes)
+    # Percentage-point delta for a share row; signed money delta for a cost row.
+    ctx_row = next(r for r in result.rows if r["metric"] == "Context rent share")
+    assert ctx_row["change"].endswith("pp")
+    cpp_row = next(r for r in result.rows if r["metric"] == "Cost per prompt")
+    assert cpp_row["change"].startswith("+$")
+
+
+def test_impact_empty_side_warns_and_blanks_cells():
+    # A pivot before all the data: the BEFORE side is empty.
+    result = analytics.impact(_impact_ds(), "anthropic", pivot="2026-06-01")
+    report = analytics.impact_report(_impact_ds(), provider="anthropic", pivot="2026-06-01")
+    assert not report.has_both_sides
+    assert any(n.startswith("WARNING: no prompts before") for n in result.notes)
+    cpp_row = next(r for r in result.rows if r["metric"] == "Cost per prompt")
+    assert cpp_row["before"] == "-"  # nothing to normalize on the empty side
+    assert cpp_row["change"] == "-"
+
+
+def test_impact_drops_optional_rows_without_tasks_or_categories():
+    ds = _impact_ds()
+    ds.tasks.clear()
+    ds.categories.clear()
+    report = analytics.impact_report(ds, provider="anthropic", pivot="2026-06-05")
+    labels = {m.label for m in report.metrics}
+    assert "Tasks" not in labels
+    assert "Top category" not in labels
+    assert "Cost per prompt" in labels  # the ratios always stay
+
+
+def test_split_on_pivot_partitions_the_whole():
+    # The dashboard's date-pivot mode (DASH2) splits a dataset into before/after;
+    # the pivot day lands in AFTER, the prior day in BEFORE, and every prompt is on
+    # exactly one side.
+    before, after = analytics.split_on_pivot(_impact_ds(), "2026-06-05")
+    before_ids = {p["prompt_id"] for p in before.prompts}
+    after_ids = {p["prompt_id"] for p in after.prompts}
+    assert before_ids == {"p1", "p2"}  # dated 2026-06-01
+    assert after_ids == {"p3", "p4"}  # dated 2026-06-10 (pivot day onward)
+    assert before_ids.isdisjoint(after_ids)
+    assert before_ids | after_ids == {"p1", "p2", "p3", "p4"}
+
+
+def test_split_on_pivot_includes_pivot_day_in_after():
+    # A pivot exactly on a prompt's day keeps that prompt on the AFTER side.
+    before, after = analytics.split_on_pivot(_impact_ds(), "2026-06-10")
+    assert {p["prompt_id"] for p in before.prompts} == {"p1", "p2"}
+    assert {p["prompt_id"] for p in after.prompts} == {"p3", "p4"}
+
+
+def test_impact_suggestions_folded_into_notes():
+    result = analytics.impact(
+        _impact_ds(),
+        "anthropic",
+        pivot="2026-06-05",
+        suggestions=[("2026-06-03", "webapp/CLAUDE.md")],
+    )
+    assert any("2026-06-03 (webapp/CLAUDE.md)" in n for n in result.notes)
+
+
+def test_suggest_pivots_from_config_mtime_inside_range(tmp_path):
+    import os
+    from datetime import datetime
+
+    project = tmp_path / "webapp"
+    project.mkdir()
+    claude_md = project / "CLAUDE.md"
+    claude_md.write_text("# project memory\n", encoding="utf-8")
+    # Set the mtime to 2026-06-05 12:00 local, strictly inside [06-01, 06-10].
+    pivot_ts = datetime(2026, 6, 5, 12, 0, 0).timestamp()
+    os.utime(claude_md, (pivot_ts, pivot_ts))
+
+    ds = _impact_ds()
+    ds.sessions[0]["cwd"] = str(project)
+    suggestions = analytics.suggest_pivots(ds)
+    assert ("2026-06-05", "webapp/CLAUDE.md") in suggestions
+
+
+def test_suggest_pivots_filters_out_of_range_dates(tmp_path):
+    import os
+    from datetime import datetime
+
+    project = tmp_path / "webapp"
+    project.mkdir()
+    claude_md = project / "CLAUDE.md"
+    claude_md.write_text("x", encoding="utf-8")
+    # Mtime way after the data window -> filtered out (degenerate split).
+    far = datetime(2027, 1, 1, 12, 0, 0).timestamp()
+    os.utime(claude_md, (far, far))
+
+    ds = _impact_ds()
+    ds.sessions[0]["cwd"] = str(project)
+    assert analytics.suggest_pivots(ds) == []

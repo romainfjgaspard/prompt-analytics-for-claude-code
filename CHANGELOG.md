@@ -2,22 +2,101 @@
 
 All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
-adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — kept at
-`0.x` on purpose: the upstream Claude Code JSONL format is unstable, so parsing
-breakage is treated as expected and reflected in the version.
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versioning
+note: pre-1.0, new features land as **minor** bumps and the upstream Claude Code
+JSONL format is unstable, so parsing breakage is treated as expected and reflected
+in patch/minor bumps.
 
 ## [Unreleased]
 
-### Added
-- `--since YYYY-MM-DD` / `--until YYYY-MM-DD` on every analysis command (inclusive
-  date range, e.g. `summary --since 2026-06-01`).
-- `timeline` command: cost / prompts / tokens grouped by `--by day|week|month`.
+## [0.4.0] — 2026-06-22 — Cost by content
+
+Where your cost goes, **by content** — the same reconciled bill attributed across
+the layers of *content* it pays for: **input** (what you ask, by category),
+**output** (what the assistant writes), **context** (what fills the re-read cache),
+and the **files** and **tasks** the work touches. Plus a before/after view to
+measure the impact of a change. Every new number reconciles to the bill by
+construction and stays **metrics-only** — no source code is ever persisted. Exposed
+on both surfaces: new CLI commands and a rebuilt dashboard.
+
+### Added — cost-by-content commands
+- `by-output`: output composition — language mix (by extension), code vs tests,
+  lines added/deleted (exact diff), and the **prose-vs-code split** of generation
+  tokens/cost (priced via a local tokenizer with an offline fallback).
+- `by-context`: what fills the cached, re-read context, by source (config / files
+  read by language / tool output / conversation) — splitting one-off **loading**
+  (`cache_write`) from **rent** (`cache_read`, paid every turn it lingers). Totals
+  reconcile to the main-chain cache bill (with an honest `(unattributed)` bucket).
+- `by-file`: a per-file footprint crossing edits + line diff with reads + context
+  cost (loading + rent) — the actionable "what to keep out of context".
+- `by-task`: cost by **task** (the unit of work, not the prompt) — total cost with
+  its context share, prompt count, span, and dominant category, built from the
+  `TodoWrite` spine with an inference fallback when there are no todos. Cost
+  reconciles to the bill by construction (each prompt belongs to one task); session
+  overhead is excluded and noted.
+- `impact --pivot YYYY-MM-DD`: split the history on a date and show
+  **workload-normalized ratios** (cost per prompt, output cost share, context-rent
+  share, cache-read per turn, output tokens per prompt) with the workload
+  **confounders** (volume, depth, mix) alongside — an observational split, not a
+  controlled experiment, and labelled as such. Without `--pivot`, lists detected
+  config-change dates (mtime of CLAUDE.md / settings.json) as a hint.
+- `timeline`: cost / prompts / tokens grouped by `--by day|week|month`.
+- `extract` now derives the metrics behind these into new CSVs (`output_files`,
+  `output_tokens`, `context_sources`, `context_cost`, `tasks`, `task_prompts`) —
+  metrics only, relative paths as file identity, never content or absolute paths.
+
+### Added — semantic categorization & taxonomy audit
+- `categorize --semantic`: an offline, mono-label semantic classifier on
+  multilingual static embeddings (`model2vec`, torch-free, shipped in the core
+  package — no extra to install, no API key, nothing leaves your machine). It
+  fuses cosine similarity to per-category FR+EN prototypes with a lexical prime,
+  and falls back to `other` below a calibrated threshold. **Opt-in** in the CLI:
+  the heuristic stays the default. Tunable via `--tau` / `--prime-weight` /
+  `--top-k` or a `semantic:` section in `config.yml`.
+- `categorize --audit-categories`: a diagnostic that clusters the whole corpus and
+  compares the natural clusters to the categories (alignment matrix, labels,
+  candidate merges/splits). Writes a report + CSV only; never changes
+  `categories.csv`.
+- `categorize --llm --provider azure`: Azure OpenAI as a provider for the optional
+  LLM refinement pass.
+
+### Added — dashboard
+- A **Composition** page narrating "where your cost goes, by content" — four
+  sections (Input · Output · Context · Files), each a band of **4 KPIs + 2 charts**.
+  Input shows cost by category + a prompt-length histogram (both click-to-filter);
+  Output a prose-vs-code donut + code language mix; Context a loading-vs-rent donut
+  + a tokens Pareto; Files a force-layout **file cost-graph** (files sized by
+  reconciled context cost, coloured by language, with edit-prompt satellites, a
+  project picker and a per-file drill).
+- The detail views split into a **Prompt Explorer** (session → prompt drill,
+  cumulative-cost timeline, full prompt text) and a new **File Explorer** (the
+  per-file footprint table with filters + a per-file drill: who edited it, which
+  sessions kept it in context, and the load + rent it cost), with **deep-links**
+  between them and from the charts.
+- A dedicated **Compare** tab: pick a pivot date and read the five
+  workload-normalized ratios as Before | After, plus two average-based charts
+  (cost/prompt by token type, category mix) — averages and ratios only, never sums,
+  reusing the `impact` numbers verbatim.
+- **Global cross-filters** extended beyond model / project / category / date: a
+  prompts-per-session bar (Sessions) and a prompt-length bucket (Composition) now
+  filter the whole board too, and the category chart is clickable; an active filter
+  offers Explore-prompts / Explore-files drill-throughs and a Reset.
+- The in-app **Refresh** defaults to **semantic** categorization (offline, no API
+  key), with a heuristic fallback when the model can't load.
+- Removed the old **Prompts** tab (folded into Composition and the Prompt
+  Explorer). Tab order: Home · Usage · Models · Sessions · Session depth ·
+  Composition · Prompt Explorer · File Explorer · Optimize · Compare · Quotas · How
+  it works.
 
 ### Changed
-- `by-project` now always shows the cumulative % column; the `--pareto` flag is
+- The local heuristic now labels **thirteen** categories (added `feedback` and
+  `notification`, trimming the `other` long tail).
+- `--since YYYY-MM-DD` / `--until YYYY-MM-DD` on every analysis command (inclusive
+  date range, e.g. `summary --since 2026-06-01`).
+- `by-project` always shows the cumulative % column; the `--pareto` flag is
   deprecated (still accepted as a no-op so existing invocations keep working).
-- `--provider` now documents its expected value (`--provider NAME`) and lists the
-  known providers (`anthropic`, `copilot`) in `--help`.
+- `--provider` documents its expected value (`--provider NAME`) and lists the known
+  providers (`anthropic`, `copilot`) in `--help`.
 
 ## [0.3.1] — 2026-06-15
 

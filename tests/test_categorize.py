@@ -882,6 +882,62 @@ def test_openrouter_classifier_success_and_error_mapping() -> None:
         _OpenRouterClassifier(FakeChat(exc=rate_exc))._call("x")  # type: ignore[arg-type]
 
 
+def test_azure_classifier_success_and_token_param() -> None:
+    """Azure must request ``max_completion_tokens`` (reasoning models reject the
+    16-token ``max_tokens`` cap and would return an empty reply)."""
+    from prompt_analytics.categorize import (
+        AZURE_MAX_COMPLETION_TOKENS,
+        _AzureOpenAIClassifier,
+        _PermanentError,
+        _TransientError,
+    )
+
+    captured: dict[str, Any] = {}
+
+    class FakeChat:
+        def __init__(self, reply: str | None = None, exc: Exception | None = None) -> None:
+            self._reply, self._exc = reply, exc
+
+        @property
+        def chat(self) -> SimpleNamespace:
+            def create(**kw: Any) -> SimpleNamespace:
+                captured.update(kw)
+                if self._exc:
+                    raise self._exc
+                return _chat_reply(self._reply)
+
+            return _ns(completions=_ns(create=create))
+
+    ok = _AzureOpenAIClassifier(FakeChat(reply="implementation | 3"), model="dep")  # type: ignore[arg-type]
+    assert ok.classify("build the endpoint") == ("implementation", "3")
+    assert captured.get("max_completion_tokens") == AZURE_MAX_COMPLETION_TOKENS
+    assert "max_tokens" not in captured  # reasoning models reject it
+
+    auth_exc = type("AuthenticationError", (Exception,), {})()
+    rate_exc = type("RateLimitError", (Exception,), {})()
+    with pytest.raises(_PermanentError):
+        _AzureOpenAIClassifier(FakeChat(exc=auth_exc), model="d")._call("x")  # type: ignore[arg-type]
+    with pytest.raises(_TransientError):
+        _AzureOpenAIClassifier(FakeChat(exc=rate_exc), model="d")._call("x")  # type: ignore[arg-type]
+
+
+def test_build_client_azure_explicit_and_auto(
+    _no_dotenv: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from prompt_analytics.categorize import _AzureOpenAIClassifier
+
+    # Explicit provider with an incomplete env → None (needs key AND endpoint).
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-test")
+    assert categorize.build_client(provider="azure") is None
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://x.openai.azure.com/")
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "gpt-judge")
+    client = categorize.build_client(provider="azure")
+    assert isinstance(client, _AzureOpenAIClassifier)
+    assert client.model == "gpt-judge"
+    # auto with only Azure keys present falls through to Azure.
+    assert isinstance(categorize.build_client(provider="auto"), _AzureOpenAIClassifier)
+
+
 def test_ollama_classifier_success_and_error_is_blank() -> None:
     from prompt_analytics.categorize import _OllamaClassifier
 
@@ -912,6 +968,8 @@ def _no_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
 
 
 def test_build_client_no_key_returns_none(_no_dotenv: None) -> None:

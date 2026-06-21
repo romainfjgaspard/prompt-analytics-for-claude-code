@@ -51,33 +51,67 @@ from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from . import paths
+from .compose import aggregate_output_files, analyze_assistant_content
+from .context import (
+    NO_LANGUAGE,
+    NO_PATH,
+    ContextElement,
+    ContextRequest,
+    assistant_tool_metas,
+    attachment_item,
+    attribute_context_cost,
+    result_text,
+)
 from .pricing import get_model_pricing
 from .schema import (
+    CONTEXT_COST_COLS,
+    CONTEXT_SOURCES_COLS,
+    OUTPUT_FILES_COLS,
+    OUTPUT_TOKENS_COLS,
     PROMPT_TEXT_COLS,
     PROMPTS_COLS,
     REQUESTS_COLS,
     SESSIONS_COLS,
+    TASK_PROMPTS_COLS,
+    TASKS_COLS,
     TOKEN_TYPE_DESCRIPTIONS,
     TOKEN_TYPE_LABELS,
     TOKEN_TYPES,
     TOKEN_TYPES_COLS,
     TOKENS_COLS,
+    ContextCostRow,
+    ContextItem,
+    ContextSourceRow,
+    OutputFileRow,
+    OutputTokenRow,
     ParsedFile,
     ParsedPrompt,
     PromptRow,
     RequestRow,
     SessionRow,
+    TaskPromptRow,
+    TaskRow,
+    TodoEvent,
     TokenRow,
+    ToolEdit,
     UsageRecord,
     continuation_prompt_id,
 )
 from .storage import atomic_write_csv, atomic_write_json
+from .tasks import TaskPromptInput, TaskTodoInput, assemble_tasks
+from .tokenizer import count_tokens
 
 __all__ = ["run_extract", "collect", "parse_file", "ExtractReport", "ExtractResult"]
 
 # Bump whenever parse_file's output shape or logic changes: invalidates the
-# on-disk parse cache.
-CACHE_VERSION = 2
+# on-disk parse cache. V3 adds the Axe C per-record fields (prose/code token
+# weights + file-edit metrics); V4 adds the Axe D context items (sized tool
+# results + attachments) and the prompt ``text_tokens``; V5 adds the
+# project-relative file ``path`` to edits (Axe C) and context items (Axe D) so
+# the unified per-file view joins a file's edits to its reads (DASH4 / D5-D6);
+# V6 adds the Axe B2 ``TodoWrite`` events (the task spine); V7 also feeds that
+# spine from the harness's ``Task*`` family (``TaskCreate``/``TaskUpdate``).
+CACHE_VERSION = 7
 
 PREVIEW_CHARS = 100
 
@@ -213,6 +247,44 @@ def _usage_tokens(usage: dict[str, Any]) -> dict[str, int]:
     return {key: value for key, value in counts.items() if value}
 
 
+def _todo_in_progress_label(tool_input: Any) -> str:
+    """The ``in_progress`` todo's label from a ``TodoWrite`` input (Axe B2).
+
+    Claude Code writes the whole todo list on every call; the active task is the
+    one ``in_progress``. Prefer the imperative ``content`` over ``activeForm``.
+    Empty when nothing is in progress (all pending/completed) -- the assembler
+    ignores those. A Claude-authored task label, never user content.
+    """
+    if not isinstance(tool_input, dict):
+        return ""
+    todos = tool_input.get("todos")
+    if not isinstance(todos, list):
+        return ""
+    for item in todos:
+        if isinstance(item, dict) and item.get("status") == "in_progress":
+            label = item.get("content") or item.get("activeForm") or ""
+            return str(label).strip()
+    return ""
+
+
+def _task_create_subject(tool_input: Any) -> str:
+    """The ``subject`` (task label) of a ``TaskCreate`` input (Axe B2).
+
+    The harness's ``Task*`` tool family is an alternative task spine to
+    ``TodoWrite``: ``TaskCreate`` opens a task (its ``subject`` is the label) and
+    is assigned the next 1-based id of the session, ``TaskUpdate`` flips a task's
+    ``status``. The task left ``in_progress`` is the active task at that moment --
+    exactly the role ``TodoWrite``'s in-progress todo plays -- so both feed the
+    same spine. The agent-control tools (``TaskStop``/``TaskOutput``/``TaskGet``,
+    keyed by an alphanumeric ``task_id``) drive spawned sub-agents, carry no todo
+    label, and are deliberately ignored. A Claude-authored task name, never user
+    content.
+    """
+    if not isinstance(tool_input, dict):
+        return ""
+    return str(tool_input.get("subject") or "").strip()
+
+
 def _dedup_key(message: dict[str, Any], event: dict[str, Any]) -> str:
     """Global deduplication key for an assistant usage line.
 
@@ -267,6 +339,19 @@ def parse_file(filepath: Path) -> ParsedFile:
     first_timestamp = ""
     prompts: list[ParsedPrompt] = []
     usage_records: list[UsageRecord] = []
+    context_items: list[ContextItem] = []
+    todo_events: list[TodoEvent] = []
+    # Axe D: tool-use id -> (source, language), filled from assistant tool calls
+    # so the later ``tool_result`` (which only carries the id) can be classified.
+    tool_use_meta: dict[str, tuple[str, str, str]] = {}
+    # Axe B2: the harness's ``Task*`` spine. ``TaskCreate`` calls get a 1-based
+    # per-session id (verified against the "Task #N created" result -- 0 mismatch
+    # on real logs); this running map lets a later ``TaskUpdate`` resolve its
+    # task's label. A resumed session replays the creates in the same order, so
+    # the per-file count matches the original id (and the replayed updates dedup
+    # by tool-use id, like ``TodoWrite``).
+    task_subjects: dict[str, str] = {}
+    task_create_seq = 0
     lines_total = 0
     lines_invalid = 0
     event_types: Counter[str] = Counter()
@@ -325,6 +410,32 @@ def parse_file(filepath: Path) -> ParsedFile:
             if etype == "mode":
                 current_mode = str(event.get("mode") or current_mode)
             elif etype == "user":
+                message = event.get("message")
+                content = message.get("content") if isinstance(message, dict) else None
+                # Axe D: tool results are file reads / command output entering the
+                # context. Classify each by its originating tool (skip sidechain:
+                # the main-thread context is the snapshot). Metrics only.
+                if isinstance(content, list) and not event.get("isSidechain"):
+                    for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "tool_result":
+                            continue
+                        tool_id = str(block.get("tool_use_id") or "")
+                        source, language, path = tool_use_meta.get(
+                            tool_id, ("tool_output", NO_LANGUAGE, NO_PATH)
+                        )
+                        tokens_count = count_tokens(result_text(block.get("content")))
+                        if tokens_count:
+                            context_items.append(
+                                ContextItem(
+                                    prompt_id=pid,
+                                    post_compact=post_compact,
+                                    source=source,
+                                    language=language,
+                                    path=path,
+                                    tokens=tokens_count,
+                                    dedup_id=tool_id or event_uuid,
+                                )
+                            )
                 if not is_human_message(event):
                     continue  # tool results and other non-human user events
                 text = extract_text(event.get("message", {}).get("content", ""))
@@ -351,6 +462,7 @@ def parse_file(filepath: Path) -> ParsedFile:
                         entrypoint=str(event.get("entrypoint") or ""),
                         version=str(event.get("version") or ""),
                         text=text,
+                        text_tokens=count_tokens(text),
                     )
                 )
             elif etype == "assistant":
@@ -360,6 +472,50 @@ def parse_file(filepath: Path) -> ParsedFile:
                 usage = message.get("usage")
                 tokens = _usage_tokens(usage) if isinstance(usage, dict) else {}
                 content = message.get("content")
+                # Axe D: remember each tool call's (source, language, path) so the
+                # matching tool_result (carrying only the id) is classifiable.
+                # Axe B2: capture the active task -- either a ``TodoWrite`` snapshot
+                # or the ``Task*`` family (``TaskCreate`` names a task, ``TaskUpdate``
+                # marks one ``in_progress``) -- so prompts can be attached to it
+                # (main thread only; a subagent's todos belong to its own context).
+                if not event.get("isSidechain"):
+                    tool_use_meta.update(
+                        assistant_tool_metas(content, str(event.get("cwd") or session_cwd))
+                    )
+                    ts = str(event.get("timestamp") or "")
+                    for block in content if isinstance(content, list) else []:
+                        if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                            continue
+                        name = block.get("name")
+                        if name == "TodoWrite":
+                            todo_events.append(
+                                TodoEvent(
+                                    prompt_id=pid,
+                                    timestamp=ts,
+                                    label=_todo_in_progress_label(block.get("input")),
+                                    dedup_id=str(block.get("id") or event_uuid),
+                                )
+                            )
+                        elif name == "TaskCreate":
+                            task_create_seq += 1
+                            task_subjects[str(task_create_seq)] = _task_create_subject(
+                                block.get("input")
+                            )
+                        elif name == "TaskUpdate":
+                            raw_input = block.get("input")
+                            if (
+                                isinstance(raw_input, dict)
+                                and raw_input.get("status") == "in_progress"
+                            ):
+                                task_id = str(raw_input.get("taskId") or "")
+                                todo_events.append(
+                                    TodoEvent(
+                                        prompt_id=pid,
+                                        timestamp=ts,
+                                        label=task_subjects.get(task_id, ""),
+                                        dedup_id=str(block.get("id") or event_uuid),
+                                    )
+                                )
                 tool_use_ids = [
                     str(block["id"])
                     for block in (content if isinstance(content, list) else [])
@@ -370,6 +526,12 @@ def parse_file(filepath: Path) -> ParsedFile:
                 key = _dedup_key(message, event)
                 if not tokens and not tool_use_ids and not key:
                     continue  # nothing countable (e.g. bare synthetic notices)
+                # Axe C: derive the output-composition metrics (prose/code token
+                # weights + file-edit line/language/kind) while the content is
+                # in hand. Only integers and a relative path identity are kept.
+                prose_tokens, code_tokens, file_edits = analyze_assistant_content(
+                    content, str(event.get("cwd") or session_cwd)
+                )
                 usage_records.append(
                     UsageRecord(
                         prompt_id=pid,
@@ -381,8 +543,36 @@ def parse_file(filepath: Path) -> ParsedFile:
                         post_compact=post_compact,
                         tokens=tokens,
                         tool_use_ids=tool_use_ids,
+                        prose_tokens=prose_tokens,
+                        code_tokens=code_tokens,
+                        file_edits=file_edits,
                     )
                 )
+            elif etype == "attachment":
+                # Axe D: harness-injected setup (skill/tool listings, file
+                # references, reminders) that consumes context. File-bearing
+                # attachments count as file_read, bodied ones as config.
+                if event.get("isSidechain"):
+                    continue
+                classified = attachment_item(
+                    event.get("attachment"), str(event.get("cwd") or session_cwd)
+                )
+                if classified is None:
+                    continue
+                source, language, path, text = classified
+                tokens_count = count_tokens(text)
+                if tokens_count:
+                    context_items.append(
+                        ContextItem(
+                            prompt_id=pid,
+                            post_compact=post_compact,
+                            source=source,
+                            language=language,
+                            path=path,
+                            tokens=tokens_count,
+                            dedup_id=event_uuid,
+                        )
+                    )
 
     return ParsedFile(
         session_id=session_id or filepath.stem,
@@ -391,6 +581,8 @@ def parse_file(filepath: Path) -> ParsedFile:
         first_timestamp=first_timestamp,
         prompts=prompts,
         usage=usage_records,
+        context_items=context_items,
+        todo_events=todo_events,
         lines_total=lines_total,
         lines_invalid=lines_invalid,
         event_types=dict(event_types),
@@ -624,6 +816,10 @@ class _PromptAgg:
     tokens: Counter[tuple[str, str, int]] = field(default_factory=Counter)
     records: list[UsageRecord] = field(default_factory=list)  # non-sidechain
     tool_call_count: int = 0
+    # Axe C: real output tokens prorated into prose vs code/tool (their sum
+    # equals the prompt's total output tokens, summed across all its records).
+    output_prose: int = 0
+    output_code: int = 0
 
 
 def _request_rows(session_id: str, prompt_id: str, records: list[UsageRecord]) -> list[RequestRow]:
@@ -670,6 +866,12 @@ class ExtractResult:
     tokens: list[TokenRow]
     requests: list[RequestRow]
     texts: list[dict[str, str]]
+    output_files: list[OutputFileRow]
+    output_tokens: list[OutputTokenRow]
+    context_sources: list[ContextSourceRow]
+    context_cost: list[ContextCostRow]
+    tasks: list[TaskRow]
+    task_prompts: list[TaskPromptRow]
 
 
 def collect(
@@ -728,6 +930,19 @@ def collect(
     models: Counter[str] = Counter()
     versions: set[str] = set()
     pending_usage: list[tuple[str, UsageRecord]] = []  # (session_id, record)
+    # Axe D: context items (file reads / tool output / config) paired with their
+    # session, deduplicated later; plus the running conversation size (prompts +
+    # main-thread assistant turns), summed straight from the deduplicated rows.
+    pending_context: list[tuple[str, ContextItem]] = []
+    # Axe B2: ``TodoWrite`` snapshots paired with their session (deduplicated
+    # later, then handed to the task assembler as the spine).
+    pending_todos: list[tuple[str, TodoEvent]] = []
+    conv_tokens: Counter[str] = Counter()  # session_id -> conversation tokens
+    conv_items: Counter[str] = Counter()  # session_id -> conversation pieces
+    # Axe D (D2): the conversation size at *prompt* grain, so the cost-over-time
+    # walk knows when each turn of dialogue entered context (the snapshot above
+    # only needs the per-session total). (session_id, prompt_id) -> tokens.
+    conv_by_prompt: Counter[tuple[str, str]] = Counter()
 
     def _in_window(ts: datetime | None) -> bool:
         if ts is None:
@@ -776,9 +991,22 @@ def collect(
                 continue
             prompt_aggs[pid] = _PromptAgg(session_id=session_id, parsed=prompt)
             prompt_order.append(pid)
+            # Axe D: the prompt text is the user's contribution to conversation.
+            conv_tokens[session_id] += prompt["text_tokens"]
+            conv_items[session_id] += 1
+            conv_by_prompt[(session_id, pid)] += prompt["text_tokens"]
 
         for record in parsed["usage"]:
             pending_usage.append((session_id, record))
+
+        # Axe D: a subagent transcript's reads/output belong to the subagent's
+        # own context, not the parent thread's snapshot -- skip them entirely.
+        # Axe B2 todos follow the same rule (the parent thread owns the tasks).
+        if not _subagent_parent_session(filepath):
+            for item in parsed["context_items"]:
+                pending_context.append((session_id, item))
+            for todo in parsed.get("todo_events", []):
+                pending_todos.append((session_id, todo))
 
     if use_cache:
         digests = {
@@ -802,12 +1030,20 @@ def collect(
     chosen: dict[str, tuple[str, UsageRecord]] = {}
     keyless: list[tuple[str, UsageRecord]] = []
     tool_ids_by_prompt: dict[str, list[str]] = defaultdict(list)
+    # Axe C: file-edit metrics, deduplicated by tool_use id like tool_use_ids
+    # (a tool call is replayed across resumed-session files / progressive lines).
+    seen_edit_ids: set[str] = set()
+    file_edits_by_prompt: dict[str, list[ToolEdit]] = defaultdict(list)
     for session_id, record in pending_usage:
         if not record["is_sidechain"] and record["prompt_id"] in prompt_aggs:
             for tool_id in record["tool_use_ids"]:
                 if tool_id not in seen_tool_ids:
                     seen_tool_ids.add(tool_id)
                     tool_ids_by_prompt[record["prompt_id"]].append(tool_id)
+            for edit in record["file_edits"]:
+                if edit["tool_id"] not in seen_edit_ids:
+                    seen_edit_ids.add(edit["tool_id"])
+                    file_edits_by_prompt[record["prompt_id"]].append(edit)
         key = record["dedup_key"]
         if not key:
             keyless.append((session_id, record))
@@ -825,11 +1061,20 @@ def collect(
         report.usage_records += 1
         if record["model"]:
             models[record["model"]] += 1
+        # Axe D: a main-thread assistant turn (its text + tool_use blocks, sized
+        # by the local tokenizer) stays in context as conversation. Sidechain
+        # turns live in the subagent's context and are excluded.
+        turn_tokens = record["prose_tokens"] + record["code_tokens"]
+        if not record["is_sidechain"] and turn_tokens:
+            conv_tokens[session_id] += turn_tokens
+            conv_items[session_id] += 1
 
         pid = record["prompt_id"]
         agg = prompt_aggs.get(pid)
         side = 1 if record["is_sidechain"] else 0
         if agg is not None:
+            if not record["is_sidechain"] and turn_tokens:
+                conv_by_prompt[(agg.session_id, pid)] += turn_tokens
             # Sidechain usage is attached to the parent prompt's cost but
             # excluded from assistant_turns / tool_calls (3.6).
             for token_type, count in record["tokens"].items():
@@ -838,10 +1083,24 @@ def collect(
                 agg.records.append(record)
             if record["tokens"]:
                 request_records[(agg.session_id, pid)].append(record)
+            # Axe C: prorate this message's real output tokens into prose vs
+            # code by the local-tokenizer weight of its text vs tool_use blocks.
+            # Falls back to all-prose when there is no measurable content (the
+            # rounding makes the two parts sum back to the exact output total).
+            out_tokens = record["tokens"].get("output", 0)
+            if out_tokens:
+                weight = record["prose_tokens"] + record["code_tokens"]
+                prose = (
+                    round(out_tokens * record["prose_tokens"] / weight) if weight else out_tokens
+                )
+                agg.output_prose += prose
+                agg.output_code += out_tokens - prose
         else:
             # Session overhead: continuation tails (no prompt id) keep the
             # ``:_continuation`` pseudo id; filtered fake prompts keep theirs.
             pseudo = pid or continuation_prompt_id(session_id)
+            if not record["is_sidechain"] and turn_tokens:
+                conv_by_prompt[(session_id, pseudo)] += turn_tokens
             bucket = overhead_tokens.setdefault((session_id, pseudo), Counter())
             for token_type, count in record["tokens"].items():
                 bucket[(record["model"], token_type, side)] += count
@@ -862,6 +1121,8 @@ def collect(
     token_rows: list[TokenRow] = []
     request_rows: list[RequestRow] = []
     text_rows: list[dict[str, str]] = []
+    output_file_rows: list[OutputFileRow] = []
+    output_token_rows: list[OutputTokenRow] = []
     included_sessions: set[str] = set()
 
     for session_id, pids in prompts_by_session.items():
@@ -927,6 +1188,16 @@ def collect(
             )
             if not no_text:
                 text_rows.append({"prompt_id": pid, "prompt_text": prompt["text"]})
+            # Axe C output composition (real prompts only; metrics only).
+            output_file_rows.extend(aggregate_output_files(pid, file_edits_by_prompt.get(pid, [])))
+            if agg.output_prose or agg.output_code:
+                output_token_rows.append(
+                    OutputTokenRow(
+                        prompt_id=pid,
+                        output_prose_tokens=agg.output_prose,
+                        output_code_tokens=agg.output_code,
+                    )
+                )
 
     for (session_id, pseudo), counts in overhead_tokens.items():
         if (session_id, pseudo) not in overhead_in_window:
@@ -947,6 +1218,154 @@ def collect(
         request_rows.extend(
             _request_rows(session_id, pseudo, request_records.get((session_id, pseudo), []))
         )
+
+    # --- Axe D context composition (session x source x language). ------------
+    # Deduplicate items by their tool-use id / attachment uuid (replayed
+    # sessions repeat them), then aggregate per session. The dialogue source
+    # (``conversation``) is summed separately from prompts + assistant turns.
+    # A session is included on the same rule as everywhere else: it has activity
+    # in the window. Within it the full composition is shown (the snapshot is a
+    # session-level ratio, not sliced mid-session).
+    seen_context_ids: set[str] = set()
+    context_by_session: dict[str, dict[tuple[str, str, str], list[int]]] = defaultdict(dict)
+    # Axe D (D2): the same deduplicated items at prompt grain feed the
+    # cost-over-time walk -- (prompt_id, source, language, path) -> tokens.
+    items_by_prompt: dict[str, Counter[tuple[str, str, str, str]]] = defaultdict(Counter)
+    for session_id, item in pending_context:
+        dedup_id = item["dedup_id"]
+        if dedup_id:
+            if dedup_id in seen_context_ids:
+                continue
+            seen_context_ids.add(dedup_id)
+        ctx_bucket = context_by_session[session_id].setdefault(
+            (item["source"], item["language"], item["path"]), [0, 0]
+        )
+        ctx_bucket[0] += item["tokens"]
+        ctx_bucket[1] += 1
+        item_pid = item["prompt_id"] or continuation_prompt_id(session_id)
+        items_by_prompt[session_id][(item_pid, item["source"], item["language"], item["path"])] += (
+            item["tokens"]
+        )
+
+    context_source_rows: list[ContextSourceRow] = []
+    for session_id in included_sessions:
+        if conv_tokens[session_id]:
+            context_source_rows.append(
+                ContextSourceRow(
+                    session_id=session_id,
+                    source="conversation",
+                    language=NO_LANGUAGE,
+                    path=NO_PATH,
+                    tokens=conv_tokens[session_id],
+                    items=conv_items[session_id],
+                )
+            )
+        for (source, language, path), (tokens_sum, items) in context_by_session.get(
+            session_id, {}
+        ).items():
+            context_source_rows.append(
+                ContextSourceRow(
+                    session_id=session_id,
+                    source=source,
+                    language=language,
+                    path=path,
+                    tokens=tokens_sum,
+                    items=items,
+                )
+            )
+
+    # --- Axe D context cost over time (D2: rent vs load per element). --------
+    # Group the conversation pieces and the main-chain requests by session, then
+    # walk each session: the real per-request cache tokens are attributed across
+    # the context elements present that turn (see context.attribute_context_cost).
+    # The result reconciles to the billed main-chain cache_read/cache_write of the
+    # session exactly; the (unattributed) bucket absorbs cache that lands on a
+    # turn with no measured element (the parentUuid ~= API-context gap, D2 caveat).
+    conv_by_session: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for (session_id, prompt_id), tokens_count in conv_by_prompt.items():
+        if tokens_count:
+            conv_by_session[session_id].append((prompt_id, tokens_count))
+    requests_by_session: dict[str, list[tuple[str, ContextRequest]]] = defaultdict(list)
+    for (session_id, prompt_id), records in request_records.items():
+        for record in records:
+            if record["is_sidechain"]:
+                continue  # the subagent's context is its own, not this snapshot's
+            tokens = record["tokens"]
+            requests_by_session[session_id].append(
+                (
+                    record["timestamp"],
+                    ContextRequest(
+                        prompt_id=prompt_id,
+                        model=record["model"],
+                        cache_read=tokens.get("cache_read", 0),
+                        cache_write_5m=tokens.get("cache_write_5m", 0),
+                        cache_write_1h=tokens.get("cache_write_1h", 0),
+                        post_compact=record["post_compact"],
+                    ),
+                )
+            )
+
+    context_cost_rows: list[ContextCostRow] = []
+    for session_id in included_sessions:
+        elements = [
+            ContextElement(prompt_id, "conversation", NO_LANGUAGE, NO_PATH, tokens_count)
+            for prompt_id, tokens_count in conv_by_session.get(session_id, [])
+        ]
+        elements.extend(
+            ContextElement(prompt_id, source, language, path, tokens_count)
+            for (prompt_id, source, language, path), tokens_count in items_by_prompt.get(
+                session_id, {}
+            ).items()
+        )
+        requests = [
+            req for _, req in sorted(requests_by_session.get(session_id, []), key=lambda r: r[0])
+        ]
+        attributed = attribute_context_cost(requests, elements)
+        for (source, language, path, model), (rent, load_5m, load_1h) in attributed.items():
+            if rent or load_5m or load_1h:
+                context_cost_rows.append(
+                    ContextCostRow(
+                        session_id=session_id,
+                        source=source,
+                        language=language,
+                        path=path,
+                        model=model,
+                        rent_read_tokens=rent,
+                        load_write_5m_tokens=load_5m,
+                        load_write_1h_tokens=load_1h,
+                    )
+                )
+
+    # --- Axe B2 task attribution (todo spine + inference fallback). ----------
+    # Assemble tasks over the in-window real prompts and map each to one. The
+    # cost of a task is not stored: every prompt is in exactly one task, so a
+    # task's input+output+cache cost is its prompts' tokens priced at read time,
+    # reconciled to the bill by construction. Deduplicate the ``TodoWrite``
+    # snapshots (resumed sessions replay them) and resolve their session before
+    # handing them to the assembler. No embedder here: the live/extract path
+    # keeps the fallback gap-only (offline, deterministic); the semantic split is
+    # exercised in tests / available to callers that pass a B1 embedder.
+    seen_todo_ids: set[str] = set()
+    todo_inputs: list[TaskTodoInput] = []
+    for session_id, todo in pending_todos:
+        dedup_id = todo["dedup_id"]
+        if dedup_id:
+            if dedup_id in seen_todo_ids:
+                continue
+            seen_todo_ids.add(dedup_id)
+        todo_inputs.append(
+            TaskTodoInput(session_id=session_id, timestamp=todo["timestamp"], label=todo["label"])
+        )
+    prompt_inputs = [
+        TaskPromptInput(
+            session_id=row["session_id"],
+            prompt_id=row["prompt_id"],
+            timestamp=row["timestamp"],
+            text=prompt_aggs[row["prompt_id"]].parsed["text"],
+        )
+        for row in prompt_rows
+    ]
+    task_rows, task_prompt_rows = assemble_tasks(prompt_inputs, todo_inputs, no_text=no_text)
 
     session_rows: list[SessionRow] = []
     for session_id in included_sessions:
@@ -970,6 +1389,12 @@ def collect(
         key=lambda r: (r["session_id"], r["timestamp"], r["prompt_id"], r["request_index"])
     )
     text_rows.sort(key=lambda r: r["prompt_id"])
+    output_file_rows.sort(key=lambda r: (r["prompt_id"], r["path"]))
+    output_token_rows.sort(key=lambda r: r["prompt_id"])
+    context_source_rows.sort(key=lambda r: (r["session_id"], r["source"], r["language"], r["path"]))
+    context_cost_rows.sort(
+        key=lambda r: (r["session_id"], r["source"], r["language"], r["path"], r["model"])
+    )
 
     # --- Finalize the report. ------------------------------------------------
     report.sessions = len(session_rows)
@@ -998,6 +1423,12 @@ def collect(
         tokens=token_rows,
         requests=request_rows,
         texts=text_rows,
+        output_files=output_file_rows,
+        output_tokens=output_token_rows,
+        context_sources=context_source_rows,
+        context_cost=context_cost_rows,
+        tasks=task_rows,
+        task_prompts=task_prompt_rows,
     )
 
 
@@ -1051,6 +1482,22 @@ def run_extract(
     atomic_write_csv(output_dir / "prompts.csv", PROMPTS_COLS, result.prompts)
     atomic_write_csv(output_dir / "tokens.csv", TOKENS_COLS, result.tokens)
     atomic_write_csv(output_dir / "requests.csv", REQUESTS_COLS, result.requests)
+    # Axe C output composition (metrics only -- no source code, no file paths).
+    atomic_write_csv(output_dir / "output_files.csv", OUTPUT_FILES_COLS, result.output_files)
+    atomic_write_csv(output_dir / "output_tokens.csv", OUTPUT_TOKENS_COLS, result.output_tokens)
+    # Axe D context composition (metrics only -- token sizes by source, never
+    # the content nor any file path).
+    atomic_write_csv(
+        output_dir / "context_sources.csv", CONTEXT_SOURCES_COLS, result.context_sources
+    )
+    # Axe D cost over time (metrics only -- raw cache tokens attributed by size,
+    # priced at read time; reconciles to the billed main-chain cache totals).
+    atomic_write_csv(output_dir / "context_cost.csv", CONTEXT_COST_COLS, result.context_cost)
+    # Axe B2 task attribution (the task dimension + its prompt-membership edges;
+    # cost is derived at read time by joining task_prompts -> tokens, so it
+    # reconciles to the bill -- every real prompt belongs to exactly one task).
+    atomic_write_csv(output_dir / "tasks.csv", TASKS_COLS, result.tasks)
+    atomic_write_csv(output_dir / "task_prompts.csv", TASK_PROMPTS_COLS, result.task_prompts)
     # Window marker (1.5): a windowed extract must never be served later as if
     # it covered the full history -- readers append it to their Source line.
     atomic_write_json(

@@ -32,6 +32,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from prompt_analytics import schema
+from prompt_analytics.compose import detect_kind as schema_detect_kind
+from prompt_analytics.compose import detect_language as schema_detect_language
+from prompt_analytics.context import (
+    NO_LANGUAGE,
+    NO_PATH,
+    ContextElement,
+    ContextRequest,
+    attribute_context_cost,
+)
+from prompt_analytics.tasks import TaskPromptInput, TaskTodoInput, assemble_tasks
 
 SEED = 20260611
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -136,6 +146,141 @@ ENTRYPOINTS = ["cli", "cli", "vscode"]
 MODES = ["default", "default", "plan"]
 VERSIONS = ["2.1.85", "2.1.90", "2.2.0"]
 STOP_REASONS = ["end_turn", "end_turn", "end_turn", "tool_use", "max_tokens"]
+
+# Output composition (Axe C). Per project, the (code language, secondary
+# language) the assistant edits; tests land in the project's test language.
+# Labels match what ``compose.detect_language`` derives from real extensions, so
+# the demo's language mix looks like a real one.
+PROJECT_LANGUAGES: dict[str, tuple[str, str]] = {
+    "webapp-frontend": ("TypeScript", "CSS"),
+    "data-pipeline": ("Python", "SQL"),
+    "ml-experiments": ("Python", "Jupyter Notebook"),
+    "infra-terraform": ("Terraform", "YAML"),
+    "mobile-app": ("Kotlin", "Swift"),
+}
+
+# Category -> code share of the generated output tokens (lo, hi). Code-heavy
+# work (implementation, refactor, tests, debug, ops) emits mostly tool/code
+# tokens; prose-y work (question, docs, plan) skews to text.
+CODE_SHARE: dict[str, tuple[float, float]] = {
+    "implementation": (0.62, 0.85),
+    "refactor": (0.60, 0.82),
+    "test": (0.58, 0.80),
+    "debug": (0.45, 0.72),
+    "ops": (0.40, 0.70),
+    "review": (0.25, 0.50),
+    "plan": (0.15, 0.35),
+    "docs": (0.20, 0.45),
+    "followup": (0.10, 0.35),
+    "question": (0.05, 0.25),
+    "other": (0.10, 0.35),
+}
+
+# Categories that actually edit files on disk, and how (kind weights). The
+# others (question/plan/followup/other) produce no file rows -- only tokens.
+FILE_CATEGORIES = frozenset({"implementation", "refactor", "test", "debug", "ops", "docs"})
+
+# Per-project file pool: a small set of realistic project-relative paths the
+# assistant edits *and* reads, so the unified per-file view shows files with both
+# a C footprint (edits) and a D footprint (reads + context cost). Each project
+# uses its own directory layout so paths stay distinct across projects (relative
+# paths would otherwise conflate, exactly like real data). Language and kind are
+# derived from the path by the real detectors, so the demo can never drift from
+# them. Markdown docs are shared reading everywhere.
+_PROJECT_PATHS: dict[str, list[str]] = {
+    "webapp-frontend": [
+        "src/components/Button.tsx",
+        "src/components/Modal.tsx",
+        "src/pages/Home.tsx",
+        "src/api/client.ts",
+        "src/hooks/useAuth.ts",
+        "src/utils/format.ts",
+        "src/components/__tests__/Button.test.tsx",
+        "tests/api.spec.ts",
+        "src/styles/theme.css",
+        "src/styles/layout.css",
+        "docs/frontend.md",
+        "README.md",
+    ],
+    "data-pipeline": [
+        "pipelines/ingest.py",
+        "pipelines/transform.py",
+        "pipelines/load.py",
+        "pipelines/validate.py",
+        "tests/test_ingest.py",
+        "tests/test_transform.py",
+        "sql/schema.sql",
+        "sql/migrations.sql",
+        "docs/pipeline.md",
+        "README.md",
+    ],
+    "ml-experiments": [
+        "models/train.py",
+        "models/evaluate.py",
+        "data/features.py",
+        "tests/test_train.py",
+        "notebooks/eda.ipynb",
+        "notebooks/baseline.ipynb",
+        "docs/experiments.md",
+        "README.md",
+    ],
+    "infra-terraform": [
+        "modules/network/main.tf",
+        "modules/compute/main.tf",
+        "environments/prod.tf",
+        "environments/staging.tf",
+        "ci/pipeline.yml",
+        "config/values.yml",
+        "docs/infra.md",
+        "README.md",
+    ],
+    "mobile-app": [
+        "app/src/main/MainActivity.kt",
+        "app/src/main/LoginScreen.kt",
+        "app/src/ui/Theme.kt",
+        "app/src/test/MainActivityTest.kt",
+        "ios/AppDelegate.swift",
+        "ios/LoginView.swift",
+        "docs/mobile.md",
+        "README.md",
+    ],
+}
+
+# (project, language, kind) -> the matching paths, indexed once via the real
+# detectors so picks stay consistent with how extraction would classify them.
+_PATHS_BY_LANG_KIND: dict[tuple[str, str, str], list[str]] = {}
+for _project, _paths in _PROJECT_PATHS.items():
+    for _path in _paths:
+        _PATHS_BY_LANG_KIND.setdefault(
+            (_project, schema_detect_language(_path), schema_detect_kind(_path)), []
+        ).append(_path)
+
+
+# Files the assistant *reads* into context but never edits -- dependency
+# manifests, lockfiles, generated config. They have a pure D footprint (context
+# cost, no edits): the unified view's headline "read but never edited" insight,
+# the first candidates to keep out of context.
+_READONLY_PATHS: dict[str, list[str]] = {
+    "webapp-frontend": ["package.json", "tsconfig.json", "node_modules/react/index.d.ts"],
+    "data-pipeline": ["requirements.txt", "pyproject.toml", "config/settings.json"],
+    "ml-experiments": ["requirements.txt", "data/schema.json"],
+    "infra-terraform": ["terraform.tfstate", "versions.json"],
+    "mobile-app": ["build.gradle", "Package.resolved"],
+}
+
+
+def _paths_for(project: str, language: str, kind: str) -> list[str]:
+    """The project's pool paths matching a desired ``(language, kind)``."""
+    return _PATHS_BY_LANG_KIND.get((project, language, kind), [])
+
+
+def _split_lines(total: int, parts: int, rng: random.Random) -> list[int]:
+    """Split ``total`` lines across ``parts`` files (sums back to ``total``)."""
+    if parts <= 1 or total <= 0:
+        return [total] + [0] * (parts - 1)
+    cuts = sorted(rng.randint(0, total) for _ in range(parts - 1))
+    bounds = [0, *cuts, total]
+    return [bounds[i + 1] - bounds[i] for i in range(parts)]
 
 
 def _weighted_choice(rng: random.Random, weighted: dict[str, tuple[float, tuple[int, int]]]) -> str:
@@ -272,6 +417,421 @@ def _emit_requests(
             if count:
                 key = (session_id, prompt_id, model, token_type, side)
                 tokens_acc[key] = tokens_acc.get(key, 0) + count
+
+
+def _accum(
+    files_acc: dict[str, list[int]],
+    rng: random.Random,
+    project: str,
+    language: str,
+    kind: str,
+    n_files: int,
+    added: int,
+    deleted: int,
+) -> None:
+    """Edit ``n_files`` concrete pool files of ``(language, kind)`` in this prompt.
+
+    Picks distinct project files and splits the line totals across them, folding
+    into ``path -> [edits, added, deleted]`` (re-editing a file bumps ``edits``).
+    """
+    paths = _paths_for(project, language, kind)
+    if not paths:
+        return
+    chosen = rng.sample(paths, min(max(1, n_files), len(paths)))
+    adds = _split_lines(added, len(chosen), rng)
+    dels = _split_lines(deleted, len(chosen), rng)
+    for path, a, d in zip(chosen, adds, dels, strict=True):
+        acc = files_acc.setdefault(path, [0, 0, 0])
+        acc[0] += 1
+        acc[1] += a
+        acc[2] += d
+
+
+def _output_composition(
+    prompts: list[dict[str, object]],
+    categories: list[dict[str, object]],
+    tokens_acc: dict[tuple[str, str, str, str, int], int],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Derive output_files.csv + output_tokens.csv from the generated prompts.
+
+    Runs on its own RNG (``SEED + 2``) over the already-built rows, so adding
+    Axe C never perturbs the token/request streams (the committed totals stay
+    byte-identical). The prose/code split always sums to the prompt's real
+    output tokens (the C1 invariant), and file rows carry metrics only.
+    """
+    rng = random.Random(SEED + 2)
+    # Per-prompt real output tokens (non-sidechain), summed from tokens.csv.
+    output_total: dict[str, int] = {}
+    for (_sid, pid, _model, token_type, side), count in tokens_acc.items():
+        if token_type == "output" and side == 0:
+            output_total[pid] = output_total.get(pid, 0) + count
+    cat_by_pid = {
+        str(c["prompt_id"]): (str(c["category"]), int(c["complexity"])) for c in categories
+    }
+
+    output_files: list[dict[str, object]] = []
+    output_tokens: list[dict[str, object]] = []
+    for prompt in prompts:
+        pid = str(prompt["prompt_id"])
+        total = output_total.get(pid, 0)
+        if total <= 0:
+            continue
+        category, complexity = cat_by_pid.get(pid, ("other", 1))
+        project = str(prompt["project"])
+        code_lang, second_lang = PROJECT_LANGUAGES[project]
+
+        # Prose/code token split (sums to the exact output total).
+        lo, hi = CODE_SHARE.get(category, (0.1, 0.35))
+        code = round(total * rng.uniform(lo, hi))
+        code = max(0, min(total, code))
+        output_tokens.append(
+            {
+                "prompt_id": pid,
+                "output_prose_tokens": total - code,
+                "output_code_tokens": code,
+            }
+        )
+
+        # File edits: only the categories that touch disk, and not every time.
+        if category not in FILE_CATEGORIES or rng.random() < 0.2:
+            continue
+        files_acc: dict[str, list[int]] = {}
+        span = 8 + 14 * complexity
+        if category == "test":
+            _accum(
+                files_acc,
+                rng,
+                project,
+                code_lang,
+                "test",
+                rng.randint(1, 2),
+                rng.randint(span, span * 3),
+                0,
+            )
+            if rng.random() < 0.4:
+                _accum(
+                    files_acc,
+                    rng,
+                    project,
+                    code_lang,
+                    "code",
+                    1,
+                    rng.randint(2, span),
+                    rng.randint(0, 6),
+                )
+        elif category == "docs":
+            _accum(
+                files_acc,
+                rng,
+                project,
+                "Markdown",
+                "code",
+                1,
+                rng.randint(5, 40),
+                rng.randint(0, 15),
+            )
+        elif category == "ops":
+            _accum(
+                files_acc,
+                rng,
+                project,
+                second_lang,
+                "code",
+                rng.randint(1, 2),
+                rng.randint(4, span),
+                rng.randint(0, 8),
+            )
+        else:  # implementation / refactor / debug
+            _accum(
+                files_acc,
+                rng,
+                project,
+                code_lang,
+                "code",
+                rng.randint(1, 3),
+                rng.randint(span, span * 4),
+                rng.randint(0, span),
+            )
+            if rng.random() < 0.45:
+                _accum(
+                    files_acc,
+                    rng,
+                    project,
+                    code_lang,
+                    "test",
+                    1,
+                    rng.randint(span, span * 2),
+                    rng.randint(0, 4),
+                )
+            if rng.random() < 0.25:
+                _accum(
+                    files_acc,
+                    rng,
+                    project,
+                    second_lang,
+                    "code",
+                    1,
+                    rng.randint(2, span),
+                    rng.randint(0, 6),
+                )
+
+        for path, (edits, added, deleted) in files_acc.items():
+            output_files.append(
+                {
+                    "prompt_id": pid,
+                    "path": path,
+                    "language": schema_detect_language(path),
+                    "kind": schema_detect_kind(path),
+                    "edits": edits,
+                    "lines_added": added,
+                    "lines_deleted": deleted,
+                }
+            )
+
+    output_files.sort(key=lambda r: (str(r["prompt_id"]), str(r["path"])))
+    output_tokens.sort(key=lambda r: str(r["prompt_id"]))
+    return output_files, output_tokens
+
+
+# Context composition (Axe D). Per project, the dominant language of the files
+# the assistant *reads* into context (the snapshot's file_read mix). Markdown is
+# added on top for every project (docs/plans are read everywhere).
+def _context_composition(
+    prompts: list[dict[str, object]],
+    categories: list[dict[str, object]],
+    requests: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Derive context_sources.csv + context_cost.csv from the generated rows.
+
+    Runs on its own RNG (``SEED + 3``) over the already-built prompts/requests,
+    so adding Axe D never perturbs the token/request streams (the committed
+    totals stay byte-identical). Per prompt we invent metrics-only element sizes
+    (a conversation turn, files read, tool output, a one-off config chunk), then
+    feed them through the very same :func:`attribute_context_cost` walk the
+    extractor uses -- so context_cost.csv reconciles to the demo's billed
+    main-chain cache tokens by construction, exactly like real data.
+    """
+    rng = random.Random(SEED + 3)
+    cat_by_pid = {
+        str(c["prompt_id"]): (str(c["category"]), int(c["complexity"])) for c in categories
+    }
+
+    # Per-session measured context elements (one ``ContextElement`` per piece).
+    elements_by_session: dict[str, list[ContextElement]] = {}
+    # (sid, source, lang, path) -> [tokens, items]
+    snapshot: dict[tuple[str, str, str, str], list[int]] = {}
+
+    def _add(sid: str, pid: str, source: str, language: str, path: str, tokens: int) -> None:
+        if tokens <= 0:
+            return
+        elements_by_session.setdefault(sid, []).append(
+            ContextElement(
+                prompt_id=pid, source=source, language=language, path=path, tokens=tokens
+            )
+        )
+        bucket = snapshot.setdefault((sid, source, language, path), [0, 0])
+        bucket[0] += tokens
+        bucket[1] += 1
+
+    def _read(sid: str, pid: str, project: str, language: str, tokens: int) -> None:
+        """Read one concrete pool file of ``language`` into context (file_read)."""
+        pool = _paths_for(project, language, "code") + _paths_for(project, language, "test")
+        if pool:
+            _add(sid, pid, "file_read", language, rng.choice(pool), tokens)
+
+    for prompt in prompts:
+        sid = str(prompt["session_id"])
+        pid = str(prompt["prompt_id"])
+        depth = int(prompt["prompt_index"])
+        project = str(prompt["project"])
+        code_lang, second_lang = PROJECT_LANGUAGES[project]
+        category, complexity = cat_by_pid.get(pid, ("other", 1))
+        scale = 0.6 + 0.25 * complexity
+
+        # The dialogue turn itself (prompt + assistant reply).
+        _add(
+            sid,
+            pid,
+            "conversation",
+            NO_LANGUAGE,
+            NO_PATH,
+            int(prompt["char_count"]) // 4 + rng.randint(60, 500),
+        )
+        # A one-off fixed prefix (system + CLAUDE.md + MCP) read in on turn 1.
+        if depth == 1:
+            _add(sid, pid, "config", NO_LANGUAGE, NO_PATH, rng.randint(9000, 22000))
+        # Files read into context: code-heavy work reads the most. The same pool
+        # files get edited, so the unified view shows files with both footprints.
+        if category in FILE_CATEGORIES or rng.random() < 0.5:
+            _read(sid, pid, project, code_lang, int(rng.randint(700, 5200) * scale))
+            if rng.random() < 0.55:
+                _read(sid, pid, project, "Markdown", rng.randint(300, 2600))
+            if rng.random() < 0.3:
+                _read(sid, pid, project, second_lang, rng.randint(200, 2400))
+            # A read-only manifest/lockfile pulled in but never edited (its whole
+            # footprint is context cost -- the "what to keep out of context" case).
+            if rng.random() < 0.35:
+                ro = _READONLY_PATHS.get(project, [])
+                if ro:
+                    path = rng.choice(ro)
+                    _add(
+                        sid,
+                        pid,
+                        "file_read",
+                        schema_detect_language(path),
+                        path,
+                        rng.randint(400, 3000),
+                    )
+        # Tool output (Bash / Grep / Glob) for prompts that ran tools.
+        if int(prompt["tool_calls"]) > 0 and rng.random() < 0.8:
+            _add(sid, pid, "tool_output", NO_LANGUAGE, NO_PATH, rng.randint(150, 2200))
+
+    # Pseudo-prompt (continuation) requests carry a compacted conversation that
+    # still gets re-read: give them a conversation element so the post-compaction
+    # rent is attributable (otherwise it would all read as (unattributed)).
+    seen_pseudo: set[tuple[str, str]] = set()
+    for req in requests:
+        pid = str(req["prompt_id"])
+        sid = str(req["session_id"])
+        if ":_continuation" in pid and (sid, pid) not in seen_pseudo:
+            seen_pseudo.add((sid, pid))
+            _add(sid, pid, "conversation", NO_LANGUAGE, NO_PATH, rng.randint(2000, 9000))
+
+    # Main-chain requests per session, chronological (where the cache is billed).
+    reqs_by_session: dict[str, list[tuple[str, ContextRequest]]] = {}
+    for req in requests:
+        if int(req["is_sidechain"]):
+            continue
+        reqs_by_session.setdefault(str(req["session_id"]), []).append(
+            (
+                str(req["timestamp"]),
+                ContextRequest(
+                    prompt_id=str(req["prompt_id"]),
+                    model=str(req["model"]),
+                    cache_read=int(req["cache_read_tokens"]),
+                    cache_write_5m=int(req["cache_write_5m_tokens"]),
+                    cache_write_1h=int(req["cache_write_1h_tokens"]),
+                    post_compact=bool(int(req["post_compact"])),
+                ),
+            )
+        )
+
+    context_sources = [
+        {
+            "session_id": sid,
+            "source": source,
+            "language": language,
+            "path": path,
+            "tokens": tokens,
+            "items": items,
+        }
+        for (sid, source, language, path), (tokens, items) in snapshot.items()
+    ]
+    context_sources.sort(
+        key=lambda r: (str(r["session_id"]), str(r["source"]), str(r["language"]), str(r["path"]))
+    )
+
+    context_cost: list[dict[str, object]] = []
+    for sid, elements in elements_by_session.items():
+        ordered = [req for _, req in sorted(reqs_by_session.get(sid, []), key=lambda r: r[0])]
+        attributed = attribute_context_cost(ordered, elements)
+        for (source, language, path, model), (rent, load_5m, load_1h) in attributed.items():
+            if rent or load_5m or load_1h:
+                context_cost.append(
+                    {
+                        "session_id": sid,
+                        "source": source,
+                        "language": language,
+                        "path": path,
+                        "model": model,
+                        "rent_read_tokens": rent,
+                        "load_write_5m_tokens": load_5m,
+                        "load_write_1h_tokens": load_1h,
+                    }
+                )
+    context_cost.sort(
+        key=lambda r: (
+            str(r["session_id"]),
+            str(r["source"]),
+            str(r["language"]),
+            str(r["path"]),
+            str(r["model"]),
+        )
+    )
+    return context_sources, context_cost
+
+
+# Task attribution (Axe B2). A pool of plausible Claude-authored todo labels the
+# demo's spine sessions advance through (the rest of the dataset is segmented by
+# the inference fallback, so the demo shows both origins). Generic on purpose --
+# they are todo labels, not project code.
+_TODO_LABELS = [
+    "Add the CSV export pipeline",
+    "Refactor the streaming parser",
+    "Fix the failing Windows CI",
+    "Wire the new settings page",
+    "Migrate the billing module",
+    "Harden the quota parser edge cases",
+    "Implement the retry decorator",
+    "Raise filters.py coverage",
+    "Audit the error handling",
+    "Document the release",
+]
+
+
+def _task_attribution(
+    prompts: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Derive tasks.csv + task_prompts.csv from the generated prompts.
+
+    Runs on its own RNG (``SEED + 4``) so adding Axe B2 never perturbs the other
+    streams. About a third of the sessions get a synthetic ``TodoWrite`` spine
+    (split into 1-3 phases, each with a real-looking label) so the demo shows the
+    todo-driven path; the remaining sessions go through the inference fallback
+    (gap + category), exactly like a real history with no todos. Both paths run
+    through the very same :func:`assemble_tasks` the extractor uses, so the demo
+    can never drift from production behaviour.
+    """
+    rng = random.Random(SEED + 4)
+
+    # Group prompts by session, preserving generation (chronological) order.
+    by_session: dict[str, list[dict[str, object]]] = {}
+    for prompt in prompts:
+        by_session.setdefault(str(prompt["session_id"]), []).append(prompt)
+
+    prompt_inputs = [
+        TaskPromptInput(
+            session_id=str(p["session_id"]),
+            prompt_id=str(p["prompt_id"]),
+            timestamp=str(p["timestamp"]),
+            text=str(p["prompt_preview"]),
+        )
+        for p in prompts
+    ]
+
+    todo_inputs: list[TaskTodoInput] = []
+    for session_id, session_prompts in by_session.items():
+        # ~1 session in 3 is todo-driven (and needs >= 2 prompts to phase).
+        if len(session_prompts) < 2 or rng.random() >= 0.34:
+            continue
+        n_phases = min(rng.randint(1, 3), len(session_prompts))
+        labels = rng.sample(_TODO_LABELS, n_phases)
+        # Contiguous phase boundaries: a TodoWrite at each phase's first prompt.
+        starts = sorted(rng.sample(range(1, len(session_prompts)), n_phases - 1))
+        bounds = [0, *starts]
+        for label, start in zip(labels, bounds, strict=True):
+            todo_inputs.append(
+                TaskTodoInput(
+                    session_id=session_id,
+                    timestamp=str(session_prompts[start]["timestamp"]),
+                    label=label,
+                )
+            )
+
+    task_rows, link_rows = assemble_tasks(prompt_inputs, todo_inputs)
+    tasks = [dict(row) for row in task_rows]
+    task_prompts = [dict(row) for row in link_rows]
+    return tasks, task_prompts
 
 
 def generate() -> dict[str, list[dict[str, object]]]:
@@ -434,6 +994,18 @@ def generate() -> dict[str, list[dict[str, object]]]:
 
     quota_log = _generate_quota(rng)
 
+    # Output composition (Axe C) -- derived from the finished prompts/tokens on
+    # a dedicated RNG, so it never shifts the streams above.
+    output_files, output_tokens = _output_composition(prompts, categories, tokens_acc)
+
+    # Context composition (Axe D) -- derived on a dedicated RNG, reconciled to the
+    # billed main-chain cache tokens by reusing the production attribution walk.
+    context_sources, context_cost = _context_composition(prompts, categories, requests)
+
+    # Task attribution (Axe B2) -- todo spine + inference fallback over the
+    # finished prompts, on a dedicated RNG, via the production assembler.
+    tasks, task_prompts = _task_attribution(prompts)
+
     return {
         "sessions": sessions,
         "prompts": prompts,
@@ -442,6 +1014,12 @@ def generate() -> dict[str, list[dict[str, object]]]:
         "categories": categories,
         "token_types": token_types,
         "quota_log": quota_log,
+        "output_files": output_files,
+        "output_tokens": output_tokens,
+        "context_sources": context_sources,
+        "context_cost": context_cost,
+        "tasks": tasks,
+        "task_prompts": task_prompts,
     }
 
 
@@ -508,6 +1086,14 @@ def main() -> None:
     _write_csv(OUT_DIR / "token_types.csv", schema.TOKEN_TYPES_COLS, data["token_types"])
     _write_csv(OUT_DIR / "categories.csv", schema.CATEGORIES_COLS, data["categories"])
     _write_csv(OUT_DIR / "quota_log.csv", schema.QUOTA_LOG_COLS, data["quota_log"])
+    _write_csv(OUT_DIR / "output_files.csv", schema.OUTPUT_FILES_COLS, data["output_files"])
+    _write_csv(OUT_DIR / "output_tokens.csv", schema.OUTPUT_TOKENS_COLS, data["output_tokens"])
+    _write_csv(
+        OUT_DIR / "context_sources.csv", schema.CONTEXT_SOURCES_COLS, data["context_sources"]
+    )
+    _write_csv(OUT_DIR / "context_cost.csv", schema.CONTEXT_COST_COLS, data["context_cost"])
+    _write_csv(OUT_DIR / "tasks.csv", schema.TASKS_COLS, data["tasks"])
+    _write_csv(OUT_DIR / "task_prompts.csv", schema.TASK_PROMPTS_COLS, data["task_prompts"])
 
     # A config.yml so the dashboard's gated pages (categorization, quota) light up.
     (OUT_DIR / "config.yml").write_text(
@@ -519,7 +1105,12 @@ def main() -> None:
         f"Wrote demo dataset to {OUT_DIR}: "
         f"{len(data['sessions'])} sessions, {len(data['prompts'])} prompts, "
         f"{len(data['tokens'])} token rows, {len(data['requests'])} request rows, "
-        f"{len(data['quota_log'])} quota snapshots."
+        f"{len(data['quota_log'])} quota snapshots, "
+        f"{len(data['output_files'])} output-file rows, "
+        f"{len(data['output_tokens'])} output-token rows, "
+        f"{len(data['context_sources'])} context-source rows, "
+        f"{len(data['context_cost'])} context-cost rows, "
+        f"{len(data['tasks'])} tasks, {len(data['task_prompts'])} task-prompt edges."
     )
 
 

@@ -8,9 +8,11 @@ bottom:
    the tallest box so the boxes stay legible). Averages hide the variability that
    makes this interesting; a headline states how a deep prompt compares to an
    opener.
-2. **Why** — the median input-side token mix per prompt by depth, one line per
+2. **Why** — the median token mix per prompt by depth, one small-multiple per
    component: cache *reads* climb (later prompts ride the context) while fresh
-   input and cache *writes* shrink. That's the mechanism behind the cost curve.
+   input and cache *writes* shrink. That's the mechanism behind the cost curve. A
+   fifth panel adds **output** tokens, so the page reads what a prompt produces,
+   not only what it consumes.
 
 Migrated to Apache ECharts (``docs/MIGRATION-ECHARTS.md``). Neither chart emits a
 cross-filter (depth is not a global filter dimension). Zero Plotly remains.
@@ -54,6 +56,12 @@ _COMPONENTS = {
     "cache_write_5m": "Cache write (5m)",
     "cache_write_1h": "Cache write (1h)",
 }
+
+# The small-multiple panels: the four input-side components above + Output, so the
+# page also shows what each prompt *produces* as a session deepens, beside what it
+# consumes. Output is the fifth panel (its own row, left), kept distinct from the
+# input-side mix.
+_PANELS = {**_COMPONENTS, "output": "Output"}
 
 
 def _band_label(index: float) -> str:
@@ -147,7 +155,7 @@ def _cost_box_option(
 
 
 def _token_evolution(tokens: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """Per-prompt input-side token quantiles by depth band, per component.
+    """Per-prompt token quantiles by depth band, per component (4 input-side + output).
 
     Sums each prompt's tokens per component (zero-filled so a prompt missing a
     component still counts as 0), then takes the **median and the p25/p75** across
@@ -164,10 +172,10 @@ def _token_evolution(tokens: pd.DataFrame) -> dict[str, pd.DataFrame]:
     work = tokens.dropna(subset=["prompt_index"]).copy()
     work["prompt_index"] = pd.to_numeric(work["prompt_index"], errors="coerce")
     work = work[work["prompt_index"] >= 1]
-    work = work[work["token_type"].isin(_COMPONENTS)]
+    work = work[work["token_type"].isin(_PANELS)]
     if work.empty:
         return {}
-    work["component"] = work["token_type"].map(_COMPONENTS)
+    work["component"] = work["token_type"].map(_PANELS)
     work["band"] = work["prompt_index"].map(_band_label)
     per_prompt = work.pivot_table(
         index=["prompt_id", "band"],
@@ -180,7 +188,7 @@ def _token_evolution(tokens: pd.DataFrame) -> dict[str, pd.DataFrame]:
     grouped = per_prompt.groupby("band")
     sizes = grouped.size()  # prompts per band, shared by every component
     out: dict[str, pd.DataFrame] = {}
-    for comp in _COMPONENTS.values():
+    for comp in _PANELS.values():
         if comp not in per_prompt.columns:
             continue
         df = pd.DataFrame(
@@ -327,13 +335,18 @@ def main() -> None:
     if evo:
         st.subheader("What one prompt is made of, by depth")
         st.caption(
-            "Median input-side tokens per prompt at each depth; the shaded band "
+            "Median tokens per prompt at each depth — the four input-side "
+            "components plus **Output** (what the prompt produced). The shaded band "
             "is the p25–p75 spread (sessions vary a lot, so a single line would "
             "mislead). Each panel has its own scale; **n** under each depth is "
             "how many prompts that median summarizes."
         )
-        comps = [comp for comp in _COMPONENTS.values() if comp in evo]
-        grid = [st.columns(2), st.columns(2)]
+        # _PANELS order keeps the four input-side panels first (two rows of two),
+        # then Output as the fifth -- its own row, left half. Rows are built to fit
+        # however many components the data actually has.
+        comps = [comp for comp in _PANELS.values() if comp in evo]
+        n_rows = (len(comps) + 1) // 2
+        grid = [st.columns(2) for _ in range(n_rows)]
         for i, comp in enumerate(comps):
             col = grid[i // 2][i % 2]
             with col:

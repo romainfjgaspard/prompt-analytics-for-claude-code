@@ -96,6 +96,85 @@ def test_by_category_dispatch_suggests_categorize(data, capsys):
     assert "categorize" in out
 
 
+def test_by_output_dispatch(fake_claude, capsys):
+    # session_output.jsonl writes src/parser.py (code) + tests/test_parser.py (test).
+    fake_claude.add("session_output.jsonl", project="out")
+    assert main(_args(fake_claude, "by-output")) == 0
+    out = capsys.readouterr().out
+    assert "Output composition" in out
+    assert "Python" in out
+    assert "Code vs tests" in out
+
+
+def test_by_output_empty_history_hints(fake_claude):
+    # No JSONL history at all -> the usual "no data" path (exit 1), not a crash.
+    assert main(_args(fake_claude, "by-output")) == 1
+
+
+def test_by_context_dispatch(fake_claude, capsys):
+    fake_claude.add("session_output.jsonl", project="out")
+    assert main(_args(fake_claude, "by-context")) == 0
+    out = capsys.readouterr().out
+    assert "Context cost over time" in out
+
+
+def test_by_context_empty_history_hints(fake_claude):
+    # No JSONL history at all -> the usual "no data" path (exit 1), not a crash.
+    assert main(_args(fake_claude, "by-context")) == 1
+
+
+def test_by_file_dispatch(fake_claude, capsys):
+    # session_output.jsonl edits src/parser.py -> a per-file footprint row. csv
+    # format keeps the path intact (the rich table folds it at narrow widths).
+    fake_claude.add("session_output.jsonl", project="out")
+    assert main(_args(fake_claude, "by-file", "--format", "csv")) == 0
+    out = capsys.readouterr().out
+    assert "src/parser.py" in out
+
+
+def test_by_file_empty_history_hints(fake_claude):
+    # No JSONL history at all -> the usual "no data" path (exit 1), not a crash.
+    assert main(_args(fake_claude, "by-file")) == 1
+
+
+def test_by_task_dispatch(fake_claude, capsys):
+    # Any session with prompts assembles tasks (inference fallback when no todos).
+    fake_claude.add("session_output.jsonl", project="out")
+    assert main(_args(fake_claude, "by-task")) == 0
+    out = capsys.readouterr().out
+    assert "Cost by task" in out
+
+
+def test_by_task_empty_history_hints(fake_claude):
+    # No JSONL history at all -> the usual "no data" path (exit 1), not a crash.
+    assert main(_args(fake_claude, "by-task")) == 1
+
+
+def test_impact_dispatch_with_pivot(data, capsys):
+    assert main(_args(data, "impact", "--pivot", "2026-05-01")) == 0
+    out = capsys.readouterr().out
+    assert "Impact before/after 2026-05-01" in out
+    assert "workload confounders" in out
+
+
+def test_impact_without_pivot_lists_suggestions_exit_2(data, capsys):
+    # No --pivot: the date-pivot tool gates on a chosen date (exit 2), printing
+    # the detected config-change dates (or a "none found" line) as a typing aid.
+    assert main(_args(data, "impact")) == 2
+    out = capsys.readouterr().out
+    assert "--pivot YYYY-MM-DD" in out
+
+
+def test_impact_bad_pivot_exit_2(data, capsys):
+    assert main(_args(data, "impact", "--pivot", "not-a-date")) == 2
+    err = capsys.readouterr().err
+    assert "Invalid --pivot date" in err
+
+
+def test_impact_empty_history_hints(fake_claude):
+    assert main(_args(fake_claude, "impact", "--pivot", "2026-05-01")) == 1
+
+
 def test_prompts_dispatch(data, capsys):
     assert main(_args(data, "prompts", "--top", "2")) == 0
     out = capsys.readouterr().out
@@ -289,7 +368,9 @@ def test_dashboard_dispatch(data, monkeypatch):
     import subprocess
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert main(_args(data, "dashboard")) == 0
+    # --no-refresh keeps this test focused on dispatch (the refresh path has its
+    # own test); without it the command would extract before launching.
+    assert main(_args(data, "dashboard", "--no-refresh")) == 0
     assert "streamlit" in calls["cmd"]
     assert calls["env"]["PROMPT_ANALYTICS_OUTPUT_DIR"].endswith("out")
 
@@ -308,9 +389,43 @@ def test_dashboard_forwards_unknown_flags_to_streamlit(data, monkeypatch):
     import subprocess
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert main(_args(data, "dashboard", "--server.port", "8599")) == 0
+    assert main(_args(data, "dashboard", "--no-refresh", "--server.port", "8599")) == 0
     # Streamlit config flags are appended after the script path, untouched.
     assert calls["cmd"][-2:] == ["--server.port", "8599"]
+
+
+def test_dashboard_refreshes_data_before_launch(data, monkeypatch):
+    """Without --no-refresh, `dashboard` extracts into the output dir first."""
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert main(_args(data, "dashboard")) == 0
+    # The refresh ran the extract step, so the CSVs the dashboard reads exist.
+    assert (data.out / "prompts.csv").exists()
+    assert (data.out / "sessions.csv").exists()
+
+
+def test_dashboard_skips_refresh_on_demo(data, monkeypatch):
+    """CCA_DEMO=1 must never overwrite data (the demo dataset is committed)."""
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setenv("CCA_DEMO", "1")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert main(_args(data, "dashboard")) == 0
+    # No extraction happened, so the output dir stays untouched.
+    assert not (data.out / "prompts.csv").exists()
 
 
 def test_unknown_flag_on_non_dashboard_still_exits_2(data):

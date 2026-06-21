@@ -1,12 +1,12 @@
-"""Explorer: drill from day -> session -> prompt with detailed tables.
+"""Prompt Explorer: drill from session -> prompt with detailed tables.
 
 The single place to inspect raw detail, so the analytical pages can stay light.
 It respects the **global cross-filters** (a project / model / date / category
 clicked on any chart carries through here -- that is the "drill-through on the
-current selection"), and adds a local **day -> session -> prompt** drill via
-``session_state``: pick a day to narrow the session list, pick a session to see
-its prompts. Charts elsewhere deep-link here by setting ``drill_session`` (e.g.
-the Usage top-10 table, the Sessions treemap).
+current selection"), and adds a local **session -> prompt** drill via
+``session_state``: pick a session to see its prompts. Charts elsewhere deep-link
+here by setting ``drill_session`` (e.g. the Usage top-10 table, the Sessions
+treemap), which preselects that session straight away.
 
 Mostly table-first (``st.dataframe`` row selection for the drill); the one chart
 is the per-session **cumulative cost** timeline at the prompt level. Because it
@@ -16,17 +16,48 @@ other chart pages) and ``main()`` runs only under a real server.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 from streamlit import runtime
 
-from prompt_analytics.dashboard import data, echarts, filters, theme
+from prompt_analytics.dashboard import data, echarts, filters, tables, theme
 
-DRILL_DATE = "drill_date"
 DRILL_SESSION = "drill_session"
+# The File Explorer reads these to preselect a file's drill (kept as literals so
+# this page need not import the numbered page module, which renders on import).
+# ``DRILL_FILE_PROJECT`` disambiguates which repo's copy of the path to drill into.
+DRILL_FILE = "drill_file"
+DRILL_FILE_PROJECT = "drill_file_project"
+_FILE_EXPLORER_PAGE = "pages/12_file_explorer.py"
+
+# The two row-selection tables. Their keys are popped when leaving a drill so the
+# sticky ``st.dataframe`` selection can't re-apply the just-cleared drill on the
+# next rerun (these literals also appear in ``filters._DRILL_KEYS`` so the global
+# Reset clears them too).
+_KEY_SESSIONS_TABLE = "explorer_sessions"
+_KEY_PROMPTS_TABLE = "explorer_prompts"
+
+
+def _files_edited_by(prompt_id: str, ds: Any | None = None) -> list[str]:
+    """Project-relative paths the given prompt edited (for the deep-link out).
+
+    ``ds`` defaults to the active dataset; it is injectable so the helper can be
+    unit-tested without a data directory.
+    """
+    if not prompt_id:
+        return []
+    if ds is None:
+        ds = data.load_dataset()
+    seen: dict[str, None] = {}
+    for row in ds.output_files:
+        if str(row.get("prompt_id") or "") != prompt_id:
+            continue
+        path = str(row.get("path") or "")
+        if path and path != "-":
+            seen.setdefault(path, None)
+    return list(seen)
 
 
 def _title(text: str) -> dict[str, Any]:
@@ -169,22 +200,6 @@ def _session_first_date(prompts: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _by_day(prompts: pd.DataFrame, tokens: pd.DataFrame, cost: str) -> pd.DataFrame:
-    """Per-day rollup: sessions, prompts and cost (newest first)."""
-    if prompts.empty or "date" not in prompts.columns:
-        return pd.DataFrame()
-    p = prompts.dropna(subset=["date"]).copy()
-    p["day"] = pd.to_datetime(p["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    agg = p.groupby("day").agg(sessions=("session_id", "nunique"), prompts=("prompt_id", "nunique"))
-    if not tokens.empty and "date" in tokens.columns and cost in tokens.columns:
-        t = tokens.dropna(subset=["date"]).copy()
-        t["day"] = pd.to_datetime(t["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        agg["cost"] = t.groupby("day")[cost].sum()
-    agg["cost"] = agg.get("cost", pd.Series(dtype=float)).fillna(0.0)
-    out: pd.DataFrame = agg.reset_index().sort_values("day", ascending=False).reset_index(drop=True)
-    return out
-
-
 def _by_session(
     prompts: pd.DataFrame, tokens: pd.DataFrame, sessions: pd.DataFrame, cost: str
 ) -> pd.DataFrame:
@@ -209,8 +224,8 @@ def _by_session(
 
 
 def main() -> None:
-    """Render the Explorer page."""
-    st.title("Explorer")
+    """Render the Prompt Explorer page."""
+    st.title("Prompt Explorer")
 
     frames_all = data.load_all()
     filters.render_sidebar(frames_all)
@@ -228,14 +243,11 @@ def main() -> None:
 
     st.caption(
         "The detail drill. It already reflects the dashboard's active filters "
-        "(click a chart anywhere, then come here); pick a day to narrow the "
-        "sessions, then a session to see its prompts."
+        "(click a chart anywhere, then come here); pick a session to see its prompts."
     )
 
-    # Resolve session focus up front so BOTH the day and session tables narrow to
-    # it. A focused session = deep-linked (Sessions treemap / Usage top-10) or
-    # selected below; its day becomes the day context, so the day table isn't left
-    # showing every date.
+    # Resolve session focus: a focused session = deep-linked (Sessions treemap /
+    # Usage top-10) or selected below; the table then narrows to that one session.
     by_session = _by_session(prompts, tokens, sessions, cost)
     drill = st.session_state.get(DRILL_SESSION)
     focused = (
@@ -243,56 +255,9 @@ def main() -> None:
         if (drill and not by_session.empty and drill in set(by_session["session_id"]))
         else None
     )
-    focused_day: str | None = None
-    if focused and "day" in by_session.columns:
-        d = by_session.loc[by_session["session_id"] == focused, "day"]
-        if not d.empty and pd.notna(d.iloc[0]):
-            focused_day = str(d.iloc[0])
-
-    # --- Day level ---------------------------------------------------------
-    day_filter = focused_day or st.session_state.get(DRILL_DATE)
-    by_day = _by_day(prompts, tokens, cost)
-    if focused_day and not by_day.empty and "day" in by_day.columns:
-        by_day = by_day[by_day["day"] == focused_day].reset_index(drop=True)
-    st.subheader("By day")
-    if by_day.empty:
-        st.info("No dated activity.")
-    else:
-        view = by_day.rename(
-            columns={
-                "day": "Day",
-                "sessions": "Sessions",
-                "prompts": "Prompts",
-                "cost": "Cost (USD)",
-            }
-        )
-        event = st.dataframe(
-            view.style.format({"Cost (USD)": "${:,.2f}"}),
-            width="stretch",
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            key="explorer_days",
-        )
-        rows = list(event.get("selection", {}).get("rows", []))
-        if rows:
-            picked = str(by_day.iloc[rows[0]]["day"])
-            if picked != st.session_state.get(DRILL_DATE):
-                st.session_state[DRILL_DATE] = picked
-                st.session_state.pop(DRILL_SESSION, None)  # day picked -> leave session focus
-                st.rerun()
-        # "Clear day" only for an explicit day pick (a session focus owns its day).
-        if day_filter and not focused:
-            left, right = st.columns([5, 1])
-            left.caption(f"Filtered to **{day_filter}** — sessions below are limited to that day.")
-            if right.button("Clear day", width="stretch"):
-                st.session_state.pop(DRILL_DATE, None)
-                st.rerun()
 
     # --- Session level -----------------------------------------------------
-    if day_filter and not by_session.empty and "day" in by_session.columns:
-        by_session = by_session[by_session["day"] == day_filter].reset_index(drop=True)
-    st.subheader("Sessions" + (f" on {day_filter}" if day_filter else ""))
+    st.subheader("Sessions")
     if by_session.empty:
         st.info("No sessions for the current selection.")
         return
@@ -302,7 +267,11 @@ def main() -> None:
         fcol = st.columns([5, 1])
         fcol[0].caption(f"🔎 Focused on session **{focused[:8]}…** — its prompts are below.")
         if fcol[1].button("← All sessions", width="stretch", key="clear_drill_session"):
-            st.session_state.pop(DRILL_SESSION, None)
+            # Pop the table selections too: otherwise the sticky row-selection
+            # re-applies the same drill on the next rerun (the "← back doesn't
+            # return to the list" bug) -- it would re-focus the top session.
+            for k in (DRILL_SESSION, _KEY_SESSIONS_TABLE, _KEY_PROMPTS_TABLE):
+                st.session_state.pop(k, None)
             st.rerun()
     table_src = (
         by_session[by_session["session_id"] == focused].reset_index(drop=True)
@@ -323,15 +292,17 @@ def main() -> None:
     if "Model" in view.columns:
         view["Model"] = view["Model"].map(lambda m: theme.model_label(m) if pd.notna(m) else m)
     event = st.dataframe(
-        view.style.format({"Cost (USD)": "${:,.2f}"}),
+        tables.bar_table(view, count_cols=("Prompts",), cost_cols=("Cost (USD)",)),
         width="stretch",
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
-        key="explorer_sessions",
+        key=_KEY_SESSIONS_TABLE,
     )
     rows = list(event.get("selection", {}).get("rows", []))
-    if rows:
+    # Bound-check: a sticky selection index can outlive the table when it shrinks to
+    # the focused session on the next rerun (else iloc raises out-of-bounds).
+    if rows and rows[0] < len(table_src):
         picked = str(table_src.iloc[rows[0]]["session_id"])
         if picked != st.session_state.get(DRILL_SESSION):
             st.session_state[DRILL_SESSION] = picked
@@ -351,7 +322,9 @@ def main() -> None:
     if timeline is not None:
         echarts.render(timeline, key="explorer_timeline", height="360px")
     pcols = [
-        c for c in ["prompt_index", "model", "category", cost, "prompt_preview"] if c in sub.columns
+        c
+        for c in ["prompt_index", "model", "category", "char_count", cost, "prompt_preview"]
+        if c in sub.columns
     ]
     if sub.empty or not pcols:
         st.info("No prompts for this session.")
@@ -361,24 +334,20 @@ def main() -> None:
             "prompt_index": "#",
             "model": "Model",
             "category": "Category",
+            "char_count": "Chars",
             cost: "Cost (USD)",
             "prompt_preview": "Prompt",
         }
     )
     if "Model" in detail.columns:
         detail["Model"] = detail["Model"].map(lambda m: theme.model_label(m) if pd.notna(m) else m)
-    # Annotated to match Styler.format's formatter type exactly (dict value type
-    # is invariant, so a bare dict[str, str] is rejected by pandas-stubs).
-    detail_fmt: dict[Any, str | Callable[[object], str] | None] = (
-        {"Cost (USD)": "${:,.2f}"} if cost in sub.columns else {}
-    )
     event = st.dataframe(
-        detail.style.format(detail_fmt),
+        tables.bar_table(detail, count_cols=("Chars",), cost_cols=("Cost (USD)",)),
         width="stretch",
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
-        key="explorer_prompts",
+        key=_KEY_PROMPTS_TABLE,
     )
     if cost in sub.columns:
         st.caption(
@@ -388,7 +357,7 @@ def main() -> None:
     # Full prompt text on demand: the table shows only the truncated preview, so
     # a selected row reveals the complete prompt (from prompts_text.csv if present).
     rows = list(event.get("selection", {}).get("rows", []))
-    if rows:
+    if rows and rows[0] < len(sub):
         row = sub.iloc[rows[0]]
         texts = data.load_prompt_texts()
         full = texts.get(str(row.get("prompt_id", "")), "") or str(row.get("prompt_preview", ""))
@@ -397,6 +366,21 @@ def main() -> None:
                 st.markdown(f"> {full}".replace("\n", "\n> "))
             else:
                 st.info("No prompt text available (extracted with --no-text, or text disabled).")
+
+        # Deep-link out: the files this prompt edited, each jumping to the File
+        # Explorer with that file's drill preselected (same principle as Explore →).
+        edited_files = _files_edited_by(str(row.get("prompt_id", "")))
+        if edited_files:
+            st.caption("Files this prompt edited — open one in the **File Explorer**:")
+            for i, path in enumerate(edited_files):
+                if st.button(f"📄 {path} →", key=f"explore_file_{i}", width="stretch"):
+                    st.session_state[DRILL_FILE] = path
+                    st.session_state[DRILL_FILE_PROJECT] = str(row.get("project") or "")
+                    # Clear any stale row-selection on the target table, else its
+                    # sticky pick would override this deep-link on arrival ("fe_files"
+                    # is the File Explorer's table key).
+                    st.session_state.pop("fe_files", None)
+                    st.switch_page(_FILE_EXPLORER_PAGE)
 
 
 # Render only under a real Streamlit server: the timeline is ECharts, which can't

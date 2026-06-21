@@ -12,7 +12,7 @@ Other tools tell you what you spent **per day** or **per session**. This one goe
 
 - **Tokens and cost per prompt and per project.** A real dataset, not a daily total: which prompts and which projects actually cost you money, with a Pareto view of where it concentrates.
 - **Meta-analyses across long sessions.** How the marginal cost of a prompt changes with its depth in the session, how the cache read/write mix shifts — the questions you can only ask once you have per-prompt rows.
-- **Automatic categorization of your prompts.** A local, zero-dependency heuristic labels every prompt across eleven categories (plan / implementation / debug / refactor / review / test / docs / ops / question / followup / other) and scores its observed complexity 1–5. An optional LLM pass refines it (opt-in — see [Categorization](#categorization)).
+- **Automatic categorization of your prompts.** A local, zero-dependency heuristic labels every prompt across thirteen categories (plan / implementation / debug / refactor / review / test / docs / ops / question / followup / feedback / notification / other) and scores its observed complexity 1–5. An offline **semantic** classifier (multilingual embeddings, still no API key) and an optional LLM pass can refine it (opt-in — see [Categorization](#categorization)).
 
 It validates its token totals against [ccusage](https://github.com/ryoppippi/ccusage) (see [How the numbers stay accurate](#how-the-numbers-stay-accurate)). Think of it as the per-prompt dataset layer that sits alongside the report-style tools.
 
@@ -82,9 +82,10 @@ Prefer a UI? Install with the `dashboard` extra and point it at your own data:
 
 ```bash
 uv tool install "prompt-analytics-for-claude-code[dashboard]"
-prompt-analytics run --categorize   # extract + snapshot + local categorize → ./output
-prompt-analytics dashboard          # launches Streamlit on http://localhost:8501
+prompt-analytics dashboard          # refresh your data, then launch Streamlit on http://localhost:8501
 ```
+
+`dashboard` refreshes the data first (extract + snapshot + local categorize, no API key) and then opens the board — so a fresh launch never shows stale numbers. Pass `--no-refresh` to skip that and open on the existing CSVs.
 
 No data yet, or just curious? The [**live demo**](https://prompt-analytics-demo.streamlit.app) runs the same dashboard on synthetic data. Install, data-dir resolution, and a tour of every page are in the wiki ([Dashboard](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Dashboard)).
 
@@ -152,6 +153,18 @@ Commands that price tokens take `--provider NAME` to choose the rate card for th
 | `prompts` | `--top N` `--provider NAME` | The N most expensive prompts, with a preview. |
 | `sessions` | `--depth` \| `--top N`, `--project NAME` | Sessions ranked by cost, or `--depth` for the marginal-cost-by-depth meta-analysis; `--project` restricts to one. |
 
+**Cost by content** — the same reconciled bill, attributed across four levels of *content* (input → output → context → task), each metrics-only (no source code is ever stored):
+
+| Command | Shows |
+| --- | --- |
+| `by-output` | **Output** composition: language mix (by extension), code vs tests, lines +/−, and the prose-vs-code split of generation cost. |
+| `by-context` | **Context** composition: what fills the re-read cache by source, splitting one-off **loading** (`cache_write`) from **rent** (`cache_read` paid every turn it lingers). |
+| `by-file` | Per-**file** footprint: edits + line diff (output) crossed with reads + context cost — the actionable "what to keep out of context". |
+| `by-task` | Cost by **task** (the unit of work, not the prompt): total cost with context share, prompts, span, dominant category. Built from the `TodoWrite` spine with an inference fallback. |
+| `impact` | **Before/after** a `--pivot YYYY-MM-DD` date: workload-normalized ratios (cost/prompt, output share, context rent share) with the workload confounders alongside — an observational split, not a controlled experiment. |
+
+These power the dashboard's **Composition** page ("where your cost goes, by content") and its dedicated before/after **Compare** tab.
+
 Beyond these, there are **power-user analyses** on the request grain (`context`, `ttl`, `compactions`, `overhead`, `model-category`, `recommend`, `burn-rate`, `break-even`) and the **pricing / export / pipeline** commands (`compare`, `export`, `extract`, `snapshot`, `categorize`, `run`, `dashboard`, `config init`). The full reference, grouped by purpose with every flag, is in the wiki:
 
 - 📖 [**CLI Commands** — power-user analyses](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/CLI-Commands#power-user-analyses-request-grain)
@@ -203,7 +216,7 @@ prompt-analytics categorize        # heuristic, writes categories.csv
 prompt-analytics by-category
 ```
 
-A weighted FR+EN regex classifier labels each prompt across eleven categories (plan / implementation / debug / refactor / review / test / docs / ops / question / followup / other), and an **observed** complexity 1–5 is derived from the effort it actually triggered (turns, tool calls, length, cost) — a measurement, not a guess. Read `$/prompt (med)` alongside the total: a category can top the bill on volume alone, but a high median per prompt flags work that is *intrinsically* expensive (here `debug` is costly both ways at $0.73/prompt, while `followup` stays cheap at $0.26).
+A weighted FR+EN regex classifier labels each prompt across thirteen categories (plan / implementation / debug / refactor / review / test / docs / ops / question / followup / feedback / notification / other), and an **observed** complexity 1–5 is derived from the effort it actually triggered (turns, tool calls, length, cost) — a measurement, not a guess. Read `$/prompt (med)` alongside the total: a category can top the bill on volume alone, but a high median per prompt flags work that is *intrinsically* expensive (here `debug` is costly both ways at $0.73/prompt, while `followup` stays cheap at $0.26).
 
 <details>
 <summary><strong>Example: <code>by-category</code> output</strong></summary>
@@ -233,6 +246,25 @@ Cost by category
 </details>
 
 <details>
+<summary><strong>Offline semantic refinement (no API key)</strong></summary>
+
+`categorize --semantic` adds a third, **fully offline** classifier between the heuristic and the LLM: it reads *meaning* via multilingual embeddings, so it places FR+EN prompts the regex can't and trims the `other` long tail — with **no API key and nothing leaving your machine**.
+
+```bash
+prompt-analytics categorize --semantic   # offline embeddings, writes categories.csv
+```
+
+The embeddings ship **in the core package** — there is no heavy extra to install. It uses a static, torch-free [`model2vec`](https://github.com/MinishLab/model2vec) model (a few tens of MB, pure-numpy at inference, fetched once then cached for offline use). It is **mono-label**: each prompt scores the cosine similarity to per-category prototype examples (FR+EN), fused with a light lexical prime for `ops`/`feedback`; the top score wins, or falls back to `other` below a threshold τ.
+
+It is **opt-in on purpose** — the heuristic stays the default. A litmus + LLM-judge evaluation on the demo corpus (`scripts/eval_semantic.py`) had the heuristic edge it out (80% vs 72% litmus), partly because synthetic, keyword-rich prompts favor the regex and human agreement on prompt intent tops out around ~0.7. The semantic mode is most useful on real, multilingual, open-ended prompts. Like the LLM, it only **supersedes heuristic** rows, never LLM-classified ones.
+
+Power users can tune the calibrated defaults (`τ`, lexical prime weight, prototype top-k) via `--tau` / `--prime-weight` / `--top-k`, or a `semantic:` section in `config.yml` (CLI flag > config > calibrated default).
+
+`categorize --audit-categories` is a related diagnostic: it clusters the **whole corpus** (HDBSCAN) and compares the natural clusters to the thirteen categories — flagging candidate merges/splits and the `other` bucket. It only writes a report + CSV; it never changes `categories.csv`.
+
+</details>
+
+<details>
 <summary><strong>Optional LLM refinement</strong></summary>
 
 `categorize --llm` re-labels prompts with an LLM; it only overwrites heuristic rows, never the reverse. Providers:
@@ -240,6 +272,7 @@ Cost by category
 - `--provider anthropic` (default when `ANTHROPIC_API_KEY` is set; `--batch` uses the Message Batches API, −50% cost).
 - `--provider openrouter` — **a third party.** Up to ~2000 characters of each prompt are sent to OpenRouter; the command warns you at runtime before sending.
 - `--provider ollama` — a **local** model via the OpenAI-compatible API at `localhost:11434/v1`. Free, no key, nothing leaves your machine.
+- `--provider azure` — **a third party** (Azure OpenAI); like OpenRouter, prompt excerpts are sent to it.
 
 Set keys in a `.env` file (see [`.env.example`](.env.example)). Most Claude Code Pro/Max subscribers have no Console API key — that is exactly why the heuristic is the default.
 
