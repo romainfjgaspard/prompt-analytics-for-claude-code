@@ -835,6 +835,9 @@ def _render_files_section(graph: analytics.FileGraph, project: str | None) -> No
         if st.button("Open in File Explorer →", key="comp_open_file_explorer"):
             st.session_state["drill_file"] = focus
             st.session_state["drill_file_project"] = project or ""
+            # Clear any stale selection on the target table so its sticky row
+            # can't override this deep-link on arrival ("fe_files" = its table key).
+            st.session_state.pop("fe_files", None)
             st.switch_page("pages/12_file_explorer.py")
 
 

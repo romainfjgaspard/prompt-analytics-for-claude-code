@@ -163,7 +163,7 @@ Commands that price tokens take `--provider NAME` to choose the rate card for th
 | `by-task` | Cost by **task** (the unit of work, not the prompt): total cost with context share, prompts, span, dominant category. Built from the `TodoWrite` spine with an inference fallback. |
 | `impact` | **Before/after** a `--pivot YYYY-MM-DD` date: workload-normalized ratios (cost/prompt, output share, context rent share) with the workload confounders alongside — an observational split, not a controlled experiment. |
 
-These power the dashboard's **Composition** page ("where your cost goes, by content") and a global before/after **compare mode**.
+These power the dashboard's **Composition** page ("where your cost goes, by content") and its dedicated before/after **Compare** tab.
 
 Beyond these, there are **power-user analyses** on the request grain (`context`, `ttl`, `compactions`, `overhead`, `model-category`, `recommend`, `burn-rate`, `break-even`) and the **pricing / export / pipeline** commands (`compare`, `export`, `extract`, `snapshot`, `categorize`, `run`, `dashboard`, `config init`). The full reference, grouped by purpose with every flag, is in the wiki:
 

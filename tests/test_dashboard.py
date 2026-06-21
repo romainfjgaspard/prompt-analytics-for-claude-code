@@ -9,7 +9,11 @@ non-regression. The Streamlit pages are run headless through
 from __future__ import annotations
 
 import datetime
+import importlib.util
+import sys
+import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -959,3 +963,207 @@ def test_category_share_uncategorized_when_no_label() -> None:
         source="test data",
     )
     assert impact.category_share(ds) == {"(uncategorized)": pytest.approx(100.0)}
+
+
+# ---------------------------------------------------------------------------
+# Reset clears the Explorer drill *and* its sticky table selections (phase 10).
+# A row-selection that outlived a cleared drill would re-apply it on the next
+# rerun ("Reset / ← back doesn't return to the list") -- the keys must go too.
+# ---------------------------------------------------------------------------
+
+
+def test_reset_filters_clears_explorer_drill_and_table_selections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import streamlit as st
+
+    from prompt_analytics.dashboard import filters
+
+    state: dict[str, object] = {
+        # chart-click drill + Explorer focus + sticky st.dataframe selections
+        "xf_projects": ["beta"],
+        "drill_session": "s1",
+        "drill_file": "README.md",
+        "drill_file_project": "alpha",
+        "explorer_sessions": {"selection": {"rows": [0]}},
+        "explorer_prompts": {"selection": {"rows": [2]}},
+        "fe_files": {"selection": {"rows": [5]}},
+        # persistent sidebar selection -- must SURVIVE a Reset
+        "flt_projects": ["alpha"],
+    }
+    # ``filters`` does ``import streamlit as st``, so patching the streamlit module
+    # object swaps the session_state it reads (no real runtime in a unit test).
+    monkeypatch.setattr(st, "session_state", state)
+
+    filters.reset_filters()
+
+    for cleared in (
+        "xf_projects",
+        "drill_session",
+        "drill_file",
+        "drill_file_project",
+        "explorer_sessions",
+        "explorer_prompts",
+        "fe_files",
+    ):
+        assert cleared not in state, f"{cleared} should be cleared by Reset"
+    # The sidebar filter is deliberately left untouched.
+    assert state["flt_projects"] == ["alpha"]
+
+
+# ---------------------------------------------------------------------------
+# Explorer / File Explorer page helpers (phase 10 dedicated pass). The page
+# modules render ECharts, which can't register outside a real server, so we load
+# them with a stubbed ``streamlit_echarts`` and exercise the pure helpers only
+# (``main()`` never runs here -- it is gated on ``runtime.exists()``).
+# ---------------------------------------------------------------------------
+
+
+def _stub_streamlit_echarts() -> None:
+    """Register a no-op ``streamlit_echarts`` so the chart pages import offline."""
+    if "streamlit_echarts" not in sys.modules:
+        stub = types.ModuleType("streamlit_echarts")
+        stub.st_echarts = lambda *a, **k: None  # type: ignore[attr-defined]
+        stub.JsCode = lambda x: x  # type: ignore[attr-defined]
+        sys.modules["streamlit_echarts"] = stub
+
+
+_PAGE_CACHE: dict[str, Any] = {}
+
+
+def _load_page(filename: str) -> Any:
+    """Import a numbered dashboard page module by path (helpers only, no render)."""
+    if filename not in _PAGE_CACHE:
+        _stub_streamlit_echarts()
+        spec = importlib.util.spec_from_file_location(
+            f"_page_{Path(filename).stem}", PAGES_DIR / filename
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _PAGE_CACHE[filename] = module
+    return _PAGE_CACHE[filename]
+
+
+def test_files_edited_by_dedups_and_skips_no_path() -> None:
+    """The deep-link helper returns each edited path once, order-preserved, no '-'."""
+    ex = _load_page("11_explorer.py")
+    ds = analytics.Dataset(
+        sessions=[],
+        prompts=[],
+        tokens=[],
+        categories={},
+        source="test data",
+        output_files=[
+            {"prompt_id": "p1", "path": "src/a.py"},
+            {"prompt_id": "p1", "path": "src/b.py"},
+            {"prompt_id": "p1", "path": "src/a.py"},  # duplicate -> collapsed
+            {"prompt_id": "p1", "path": "-"},  # NO_PATH sentinel -> skipped
+            {"prompt_id": "p2", "path": "src/c.py"},
+        ],
+    )
+    assert ex._files_edited_by("p1", ds) == ["src/a.py", "src/b.py"]
+    assert ex._files_edited_by("p2", ds) == ["src/c.py"]
+    assert ex._files_edited_by("", ds) == []
+
+
+def test_by_session_rolls_up_and_sorts_by_cost() -> None:
+    """``_by_session`` is one row per session: project, day, prompts, cost desc."""
+    ex = _load_page("11_explorer.py")
+    prompts = pd.DataFrame(
+        {
+            "prompt_id": ["p1", "p2", "p3"],
+            "session_id": ["s1", "s1", "s2"],
+            "date": pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"], utc=True),
+            "model": ["claude-opus-4-8", "claude-opus-4-8", "claude-haiku-4-5"],
+        }
+    )
+    cost = "cost_anthropic_usd"
+    tokens = pd.DataFrame({"session_id": ["s1", "s2"], cost: [10.0, 5.0]})
+    sessions = pd.DataFrame({"session_id": ["s1", "s2"], "project": ["alpha", "beta"]})
+
+    out = ex._by_session(prompts, tokens, sessions, cost)
+
+    assert list(out["session_id"]) == ["s1", "s2"]  # sorted by cost desc
+    s1 = out[out["session_id"] == "s1"].iloc[0]
+    assert int(s1["prompts"]) == 2
+    assert float(s1[cost]) == 10.0
+    assert s1["project"] == "alpha"
+    assert s1["day"] == "2026-01-01"  # earliest prompt date in the session
+
+
+def test_file_explorer_edited_by_aggregates_per_prompt_with_task() -> None:
+    """``_edited_by`` sums a prompt's edits on a file and tags it with its task."""
+    fe = _load_page("12_file_explorer.py")
+    ds = analytics.Dataset(
+        sessions=[{"session_id": "s1", "project": "alpha"}],
+        prompts=[],
+        tokens=[],
+        categories={},
+        source="test data",
+        output_files=[
+            {"prompt_id": "p1", "path": "a.py", "edits": 2, "lines_added": 10, "lines_deleted": 3},
+            {"prompt_id": "p1", "path": "a.py", "edits": 1, "lines_added": 5, "lines_deleted": 0},
+            {"prompt_id": "p2", "path": "a.py", "edits": 1, "lines_added": 1, "lines_deleted": 1},
+            {"prompt_id": "p3", "path": "b.py", "edits": 9, "lines_added": 9, "lines_deleted": 9},
+        ],
+        tasks=[{"task_id": "t1", "name": "Build feature"}],
+        task_prompts=[{"prompt_id": "p1", "task_id": "t1"}],
+    )
+    prompts = pd.DataFrame(
+        {
+            "prompt_id": ["p1", "p2"],
+            "session_id": ["s1", "s1"],
+            "prompt_index": [1, 2],
+            "category": ["implementation", "debug"],
+        }
+    )
+
+    out = fe._edited_by(ds, "a.py", prompts)
+
+    assert set(out["prompt_id"]) == {"p1", "p2"}  # b.py's p3 excluded
+    p1 = out[out["prompt_id"] == "p1"].iloc[0]
+    assert int(p1["edits"]) == 3  # 2 + 1 aggregated
+    assert int(p1["lines_added"]) == 15
+    assert p1["task"] == "Build feature"
+    p2 = out[out["prompt_id"] == "p2"].iloc[0]
+    assert p2["task"] == ""  # no task edge -> blank, not a crash
+
+
+def test_file_explorer_read_in_costs_context_per_session() -> None:
+    """``_read_in`` summarizes reads + reconciled context cost per session."""
+    fe = _load_page("12_file_explorer.py")
+    ds = analytics.Dataset(
+        sessions=[{"session_id": "s1", "project": "alpha"}],
+        prompts=[],
+        tokens=[],
+        categories={},
+        source="test data",
+        context_sources=[
+            {"source": "file_read", "path": "a.py", "session_id": "s1", "items": 3, "tokens": 1000},
+            # a different file -> must not leak into a.py's read summary
+            {"source": "file_read", "path": "z.py", "session_id": "s1", "items": 9, "tokens": 99},
+        ],
+        context_cost=[
+            {
+                "source": "file_read",
+                "path": "a.py",
+                "session_id": "s1",
+                "model": _OPUS,
+                "rent_read_tokens": 1_000_000,
+                "load_write_5m_tokens": 0,
+                "load_write_1h_tokens": 0,
+            }
+        ],
+    )
+    sessions = pd.DataFrame({"session_id": ["s1"], "project": ["alpha"]})
+
+    out = fe._read_in(ds, "anthropic", "a.py", sessions)
+
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert int(row["reads"]) == 3
+    assert int(row["tokens"]) == 1000
+    assert row["project"] == "alpha"
+    # 1M Opus cache_read tokens priced at $0.50/M -> $0.50 of context rent.
+    assert float(row["context_usd"]) == pytest.approx(0.5)

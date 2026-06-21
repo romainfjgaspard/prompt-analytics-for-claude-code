@@ -68,10 +68,26 @@ XF_CHAR_BUCKET = "xf_char_bucket"
 
 _XF_KEYS = (XF_DATE_RANGE, XF_MODELS, XF_PROJECTS, XF_CATEGORIES, XF_PROMPT_COUNT, XF_CHAR_BUCKET)
 
-# The Explorer's local day / session focus, also cleared by Reset (a treemap /
-# top-10 tile click sets ``drill_session``; ``_xf_treemap_applied`` is the
-# treemap's sticky-value guard, cleared so a re-click after Reset fires again).
-_DRILL_KEYS = ("drill_date", "drill_session", "_xf_treemap_applied")
+# The Explorer pages' local focus, also cleared by Reset. A treemap / top-10 tile
+# click sets ``drill_session``; a prompt-detail / Composition link sets
+# ``drill_file`` (+ ``drill_file_project``); ``_xf_treemap_applied`` is the
+# treemap's sticky-value guard, cleared so a re-click after Reset fires again.
+#
+# The three ``st.dataframe`` *widget keys* are listed here too: their row-selection
+# is sticky (Streamlit keeps it keyed by ``key`` across reruns), so clearing only
+# the drill would leave a stale selection that re-applies the same drill on the
+# very next rerun -- the "Reset / ← All doesn't return to the list" bug. Popping
+# the widget key resets the selection so the page truly lands back on the overview.
+_DRILL_KEYS = (
+    "drill_date",
+    "drill_session",
+    "drill_file",
+    "drill_file_project",
+    "_xf_treemap_applied",
+    "explorer_sessions",
+    "explorer_prompts",
+    "fe_files",
+)
 
 # Map a sidebar widget key (what the chart-click callers still reference) to its
 # cross-filter twin. A click writes the twin, never the sidebar key.

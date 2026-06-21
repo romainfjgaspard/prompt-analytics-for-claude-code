@@ -32,12 +32,24 @@ DRILL_FILE = "drill_file"
 DRILL_FILE_PROJECT = "drill_file_project"
 _FILE_EXPLORER_PAGE = "pages/12_file_explorer.py"
 
+# The two row-selection tables. Their keys are popped when leaving a drill so the
+# sticky ``st.dataframe`` selection can't re-apply the just-cleared drill on the
+# next rerun (these literals also appear in ``filters._DRILL_KEYS`` so the global
+# Reset clears them too).
+_KEY_SESSIONS_TABLE = "explorer_sessions"
+_KEY_PROMPTS_TABLE = "explorer_prompts"
 
-def _files_edited_by(prompt_id: str) -> list[str]:
-    """Project-relative paths the given prompt edited (for the deep-link out)."""
+
+def _files_edited_by(prompt_id: str, ds: Any | None = None) -> list[str]:
+    """Project-relative paths the given prompt edited (for the deep-link out).
+
+    ``ds`` defaults to the active dataset; it is injectable so the helper can be
+    unit-tested without a data directory.
+    """
     if not prompt_id:
         return []
-    ds = data.load_dataset()
+    if ds is None:
+        ds = data.load_dataset()
     seen: dict[str, None] = {}
     for row in ds.output_files:
         if str(row.get("prompt_id") or "") != prompt_id:
@@ -255,7 +267,11 @@ def main() -> None:
         fcol = st.columns([5, 1])
         fcol[0].caption(f"🔎 Focused on session **{focused[:8]}…** — its prompts are below.")
         if fcol[1].button("← All sessions", width="stretch", key="clear_drill_session"):
-            st.session_state.pop(DRILL_SESSION, None)
+            # Pop the table selections too: otherwise the sticky row-selection
+            # re-applies the same drill on the next rerun (the "← back doesn't
+            # return to the list" bug) -- it would re-focus the top session.
+            for k in (DRILL_SESSION, _KEY_SESSIONS_TABLE, _KEY_PROMPTS_TABLE):
+                st.session_state.pop(k, None)
             st.rerun()
     table_src = (
         by_session[by_session["session_id"] == focused].reset_index(drop=True)
@@ -281,7 +297,7 @@ def main() -> None:
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
-        key="explorer_sessions",
+        key=_KEY_SESSIONS_TABLE,
     )
     rows = list(event.get("selection", {}).get("rows", []))
     # Bound-check: a sticky selection index can outlive the table when it shrinks to
@@ -331,7 +347,7 @@ def main() -> None:
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
-        key="explorer_prompts",
+        key=_KEY_PROMPTS_TABLE,
     )
     if cost in sub.columns:
         st.caption(
@@ -360,6 +376,10 @@ def main() -> None:
                 if st.button(f"📄 {path} →", key=f"explore_file_{i}", width="stretch"):
                     st.session_state[DRILL_FILE] = path
                     st.session_state[DRILL_FILE_PROJECT] = str(row.get("project") or "")
+                    # Clear any stale row-selection on the target table, else its
+                    # sticky pick would override this deep-link on arrival ("fe_files"
+                    # is the File Explorer's table key).
+                    st.session_state.pop("fe_files", None)
                     st.switch_page(_FILE_EXPLORER_PAGE)
 
 

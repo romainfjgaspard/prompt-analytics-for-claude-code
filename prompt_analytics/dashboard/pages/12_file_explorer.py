@@ -34,6 +34,11 @@ from prompt_analytics.dashboard import data, filters, tables
 DRILL_FILE = "drill_file"
 DRILL_FILE_PROJECT = "drill_file_project"
 
+# The file table's row-selection widget key. Popped when leaving a drill so the
+# sticky ``st.dataframe`` selection can't re-apply the just-cleared drill on the
+# next rerun (also listed in ``filters._DRILL_KEYS`` for the global Reset).
+_KEY_FILES_TABLE = "fe_files"
+
 # Raw footprint keys -> display labels for the main table.
 _FILE_HEADERS = {
     "project": "Project",
@@ -160,8 +165,10 @@ def _render_file_drill(
     top[0].subheader(f"📄 {path}")
     top[0].caption(f"{lang_txt} · {rec.get('kind', '')}")
     if top[1].button("← All files", width="stretch", key="clear_drill_file"):
-        st.session_state.pop(DRILL_FILE, None)
-        st.session_state.pop(DRILL_FILE_PROJECT, None)
+        # Pop the table selection too: otherwise its sticky row re-applies the same
+        # file drill on the next rerun (the "← back doesn't return to the list" bug).
+        for k in (DRILL_FILE, DRILL_FILE_PROJECT, _KEY_FILES_TABLE):
+            st.session_state.pop(k, None)
         st.rerun()
 
     cols = st.columns(4)
@@ -324,7 +331,7 @@ def main() -> None:
         on_select="rerun",
         selection_mode="single-row",
         column_config={"File": st.column_config.TextColumn("File", width="large")},
-        key="fe_files",
+        key=_KEY_FILES_TABLE,
     )
     rows = list(event.get("selection", {}).get("rows", []))
     if rows and rows[0] < len(view):
@@ -361,7 +368,13 @@ def main() -> None:
         )
     elif focus:
         # The deep-linked / previously selected file fell out of the current
-        # filters: drop the stale focus rather than show an empty panel.
+        # filters (or its project): say so, then drop the stale focus so the next
+        # interaction is clean -- better than a silent no-op or an empty panel.
+        st.divider()
+        st.info(
+            f"📄 **{focus}** isn't in the current selection — the active filters "
+            "narrowed it out. Clear or widen the filters, or pick another file above."
+        )
         st.session_state.pop(DRILL_FILE, None)
         st.session_state.pop(DRILL_FILE_PROJECT, None)
 
