@@ -829,6 +829,10 @@ def _render_files_section(graph: analytics.FileGraph, project: str | None) -> No
             f"context, {churn}, {f0.reads:,} reads. Each satellite is a prompt that edited it, "
             f"sized by the lines it changed."
         )
+        if st.button("Open in File Explorer →", key="comp_open_file_explorer"):
+            st.session_state["drill_file"] = focus
+            st.session_state["drill_file_project"] = project or ""
+            st.switch_page("pages/12_file_explorer.py")
 
 
 def _render_file_side(graph: analytics.FileGraph, *, side: str, pivot: str, key: str) -> None:

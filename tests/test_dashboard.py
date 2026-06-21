@@ -851,3 +851,20 @@ def test_refresh_data_falls_back_to_heuristic_when_embedder_unavailable(
 
     assert modes == [True, False]  # tried semantic, then fell back to heuristic
     assert "3 prompts" in summary
+
+
+def test_bar_table_shades_counts_and_costs() -> None:
+    """The shared Explorer styler formats money + ints and shades cells per column.
+
+    ``st.dataframe`` renders a Styler's solid ``background-color`` (not bar
+    gradients), so the heat shade is emitted as ``rgba`` of the count/cost colours.
+    """
+    from prompt_analytics.dashboard import tables
+
+    df = pd.DataFrame({"File": ["a", "b"], "Edits": [1, 4], "Cost (USD)": [1.5, 3.0]})
+    html = tables.bar_table(df, count_cols=("Edits",), cost_cols=("Cost (USD)",)).to_html()
+    assert "$3.00" in html  # money format on the cost column
+    assert "rgba(59, 130, 246" in html  # count column shaded blue
+    assert "rgba(217, 119, 87" in html  # cost column shaded coral
+    # An empty frame is returned formatted but unshaded (no numeric range to scale).
+    assert tables.bar_table(df.iloc[0:0], count_cols=("Edits",)) is not None

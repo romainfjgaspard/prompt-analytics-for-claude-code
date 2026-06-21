@@ -46,6 +46,8 @@ import streamlit as st
 
 __all__ = [
     "PALETTE",
+    "BAR_COUNT_COLOR",
+    "BAR_COST_COLOR",
     "TOKEN_TYPE_COLORS",
     "SEMANTIC_COLORS",
     "CATEGORY_COLORS",
@@ -83,6 +85,13 @@ PALETTE = [
     "#EC4899",  # pink
     "#6B7280",  # gray
 ]
+
+# In-cell data-bar colors for the Explorer tables (shared so the Prompt Explorer
+# and the File Explorer read identically): plain **counts** in cool blue, **costs**
+# in the brand coral that means "spend" everywhere else on the board.
+BAR_COUNT_COLOR = "#3B82F6"
+BAR_COST_COLOR = "#D97757"
+
 
 # Keyed by display label (token_type_label) AND machine key, so both work.
 # The Token palette: a cool "flow" set (no warm hue, so nothing competes with the

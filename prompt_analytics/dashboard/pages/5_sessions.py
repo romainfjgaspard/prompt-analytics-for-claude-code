@@ -387,6 +387,11 @@ def main() -> None:
         option, session_ids = treemap
         clicked = echarts.render(option, key="sessions_treemap", height="440px", click=True)
         _apply_treemap_drill(clicked, session_ids)
+        st.caption(
+            "👆 Click a session tile to open that session's prompts in the **Prompt "
+            "Explorer**. Apply a filter on any chart, then use the **Explore →** button in "
+            "the filter badge to inspect the selection."
+        )
 
     theme.section("Session economics")
     counts = prompts.groupby("session_id").size().reset_index(name="prompt_count")
@@ -414,12 +419,6 @@ def main() -> None:
             clicked = echarts.render(option, key="sessions_cost_box", height="360px", click=True)
             echarts.apply_click(clicked, filters.KEY_MODELS)
             st.caption(box_caption)
-
-    st.caption(
-        "👆 Click a treemap session tile to open that session's day → session → "
-        "prompt detail in the **Prompt Explorer**. Apply a filter on any chart, then "
-        "use the **Explore →** button in the filter badge to inspect the selection."
-    )
 
 
 # Render only under a real Streamlit server: streamlit-echarts cannot register

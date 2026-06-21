@@ -25,14 +25,18 @@ from streamlit import runtime
 
 from prompt_analytics import analytics
 from prompt_analytics.context import NO_LANGUAGE
-from prompt_analytics.dashboard import data, filters
+from prompt_analytics.dashboard import data, filters, tables
 
 # Set by other pages (e.g. the Prompt Explorer's prompt detail) to preselect a
-# file's drill on arrival -- the file analogue of ``drill_session``.
+# file's drill on arrival -- the file analogue of ``drill_session``. ``DRILL_FILE``
+# is the project-relative path; ``DRILL_FILE_PROJECT`` disambiguates which repo's
+# copy (the same path recurs across projects), so the drill scopes to that project.
 DRILL_FILE = "drill_file"
+DRILL_FILE_PROJECT = "drill_file_project"
 
 # Raw footprint keys -> display labels for the main table.
 _FILE_HEADERS = {
+    "project": "Project",
     "path": "File",
     "language": "Language",
     "kind": "Kind",
@@ -45,16 +49,10 @@ _FILE_HEADERS = {
     "context_usd": "Context $",
 }
 
-_TABLE_COLUMN_CONFIG: dict[str, Any] = {
-    "File": st.column_config.TextColumn("File", width="large"),
-    "Edits": st.column_config.NumberColumn("Edits", format="%d"),
-    "Lines +": st.column_config.NumberColumn("Lines +", format="%d"),
-    "Lines −": st.column_config.NumberColumn("Lines −", format="%d"),
-    "Reads": st.column_config.NumberColumn("Reads", format="%d"),
-    "Load $": st.column_config.NumberColumn("Load $", format="$%.2f"),
-    "Rent $": st.column_config.NumberColumn("Rent $", format="$%.2f"),
-    "Context $": st.column_config.NumberColumn("Context $", format="$%.2f"),
-}
+
+# Magnitude columns that carry an in-cell bar: counts in blue, costs in coral.
+_FILE_COUNT_COLS = ("Edits", "Lines +", "Lines −", "Reads")
+_FILE_COST_COLS = ("Context $", "Load $", "Rent $")
 
 
 def _edited_by(ds: analytics.Dataset, path: str, prompts: pd.DataFrame) -> pd.DataFrame:
@@ -163,6 +161,7 @@ def _render_file_drill(
     top[0].caption(f"{lang_txt} · {rec.get('kind', '')}")
     if top[1].button("← All files", width="stretch", key="clear_drill_file"):
         st.session_state.pop(DRILL_FILE, None)
+        st.session_state.pop(DRILL_FILE_PROJECT, None)
         st.rerun()
 
     cols = st.columns(4)
@@ -203,14 +202,9 @@ def _render_file_drill(
             if c in view.columns
         ]
         st.dataframe(
-            view[order],
+            tables.bar_table(view[order], count_cols=("Edits", "Lines +", "Lines −")),
             width="stretch",
             hide_index=True,
-            column_config={
-                "Edits": st.column_config.NumberColumn("Edits", format="%d"),
-                "Lines +": st.column_config.NumberColumn("Lines +", format="%d"),
-                "Lines −": st.column_config.NumberColumn("Lines −", format="%d"),
-            },
         )
         st.caption(f"{len(edited):,} prompt(s) edited this file.")
 
@@ -232,14 +226,9 @@ def _render_file_drill(
             c for c in ("Session", "Project", "Reads", "Tokens", "Context $") if c in view.columns
         ]
         st.dataframe(
-            view[order],
+            tables.bar_table(view[order], count_cols=("Reads", "Tokens"), cost_cols=("Context $",)),
             width="stretch",
             hide_index=True,
-            column_config={
-                "Reads": st.column_config.NumberColumn("Reads", format="%d"),
-                "Tokens": st.column_config.NumberColumn("Tokens", format="%d"),
-                "Context $": st.column_config.NumberColumn("Context $", format="$%.2f"),
-            },
         )
         st.caption(
             f"{len(read_in):,} session(s) kept this file in context "
@@ -268,7 +257,10 @@ def main() -> None:
     # narrows the session-grained context rows to those sessions).
     kept_ids = set(prompts["prompt_id"])
     ds = analytics.filter_prompt_ids(data.load_dataset(), kept_ids)
-    table = analytics.file_footprint(ds, primary)
+    # by_project keys each row on (project, path): the same relative path recurs
+    # across repos, and without the split a shared name (README.md) would merge
+    # every repo's copy into one misleading line.
+    table = analytics.file_footprint(ds, primary, by_project=True)
     if not table.rows:
         st.info(
             "No per-file data yet. The file identity (relative path) ships with the latest "
@@ -279,23 +271,32 @@ def main() -> None:
     st.caption(
         "One row per file: **edits** + line diff (output) crossed with **reads** + the "
         "**context cost** they drove (loading + rent) — the file's whole cost of ownership. "
-        "It reflects the dashboard's active filters; search, sort, then select a row to drill "
-        "into a file. Metrics only — relative paths, never content."
+        "It reflects the dashboard's active filters; filter the columns, sort, then select a "
+        "row to drill into a file. Metrics only — relative paths, never content."
     )
 
     raw = pd.DataFrame(table.rows)
     df = raw.rename(columns=_FILE_HEADERS)
 
-    controls = st.columns([3, 2])
+    # Per-column filters above the table (offline, no grid dependency): a text
+    # search plus a dropdown for each categorical column.
+    controls = st.columns([3, 2, 2, 2, 2])
     query = controls[0].text_input(
-        "Filter files",
-        key="fe_file_filter",
-        placeholder="path or language…",
-        label_visibility="collapsed",
+        "Filter files", key="fe_file_filter", placeholder="path…", label_visibility="collapsed"
     )
-    scope = controls[1].selectbox(
+    projects = ["All projects", *sorted(p for p in df["Project"].dropna().unique() if p)]
+    project = controls[1].selectbox(
+        "Project", projects, key="fe_project", label_visibility="collapsed"
+    )
+    languages = ["All languages", *sorted(x for x in df["Language"].dropna().unique() if x)]
+    language = controls[2].selectbox(
+        "Language", languages, key="fe_language", label_visibility="collapsed"
+    )
+    kinds = ["All kinds", *sorted(x for x in df["Kind"].dropna().unique() if x)]
+    kind = controls[3].selectbox("Kind", kinds, key="fe_kind", label_visibility="collapsed")
+    scope = controls[4].selectbox(
         "Footprint",
-        ["All files", "Edited", "Read but never edited"],
+        ["All files", "Edited", "Read-only"],
         key="fe_file_scope",
         label_visibility="collapsed",
     )
@@ -303,48 +304,66 @@ def main() -> None:
     view = df
     if query:
         q = query.strip().lower()
-        view = view[
-            view["File"].str.lower().str.contains(q, regex=False)
-            | view["Language"].str.lower().str.contains(q, regex=False)
-        ]
+        view = view[view["File"].str.lower().str.contains(q, regex=False)]
+    if project != "All projects":
+        view = view[view["Project"] == project]
+    if language != "All languages":
+        view = view[view["Language"] == language]
+    if kind != "All kinds":
+        view = view[view["Kind"] == kind]
     if scope == "Edited":
         view = view[view["Edits"] > 0]
-    elif scope == "Read but never edited":
+    elif scope == "Read-only":
         view = view[(view["Edits"] == 0) & (view["Reads"] > 0)]
     view = view.reset_index(drop=True)
 
     event = st.dataframe(
-        view,
+        tables.bar_table(view, count_cols=_FILE_COUNT_COLS, cost_cols=_FILE_COST_COLS),
         width="stretch",
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
-        column_config=_TABLE_COLUMN_CONFIG,
+        column_config={"File": st.column_config.TextColumn("File", width="large")},
         key="fe_files",
     )
     rows = list(event.get("selection", {}).get("rows", []))
-    if rows:
+    if rows and rows[0] < len(view):
         picked = str(view.iloc[rows[0]]["File"])
-        if picked != st.session_state.get(DRILL_FILE):
+        picked_project = str(view.iloc[rows[0]].get("Project", "") or "")
+        if (picked, picked_project) != (
+            st.session_state.get(DRILL_FILE),
+            st.session_state.get(DRILL_FILE_PROJECT),
+        ):
             st.session_state[DRILL_FILE] = picked
+            st.session_state[DRILL_FILE_PROJECT] = picked_project
             st.rerun()
 
     edited = int((df["Edits"] > 0).sum())
     read_only = int(((df["Edits"] == 0) & (df["Reads"] > 0)).sum())
     st.caption(
-        f"{len(df):,} files — {edited:,} edited, **{read_only:,} read but never edited** "
-        "(pure context cost, the first candidates to keep out of context)."
+        f"{len(view):,} of {len(df):,} files shown — {edited:,} edited, **{read_only:,} read "
+        "but never edited** (pure context cost, the first candidates to keep out of context)."
     )
 
     # --- File drill --------------------------------------------------------
     focus = st.session_state.get(DRILL_FILE)
-    if focus and focus in set(raw["path"]):
+    focus_project = st.session_state.get(DRILL_FILE_PROJECT) or ""
+    # Scope the drill to the selected file's project so its edits/reads aren't
+    # re-merged across repos (the table is already split per project).
+    scoped = analytics.filter_project(ds, focus_project) if focus_project else ds
+    raw_focus = raw[raw["path"] == focus]
+    if focus_project and "project" in raw.columns:
+        raw_focus = raw_focus[raw_focus["project"] == focus_project]
+    if focus and not raw_focus.empty:
         st.divider()
-        _render_file_drill(ds, primary, raw, str(focus), prompts, sessions)
+        _render_file_drill(
+            scoped, primary, raw_focus.reset_index(drop=True), str(focus), prompts, sessions
+        )
     elif focus:
         # The deep-linked / previously selected file fell out of the current
         # filters: drop the stale focus rather than show an empty panel.
         st.session_state.pop(DRILL_FILE, None)
+        st.session_state.pop(DRILL_FILE_PROJECT, None)
 
 
 # Render only under a real Streamlit server (parity with the other filter-driven

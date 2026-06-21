@@ -689,21 +689,31 @@ def render_active_filter_badge(
     the Prompt Explorer page, which inspects the same selection as day → session →
     prompt detail. ``explore_link=False`` on the Prompt Explorer itself (no self-link).
 
-    Only the chart-click drill raises the badge; the persistent sidebar filters
-    never do (they are changed only in the sidebar). ``frames`` is kept for the
-    call-site signature but no longer read.
+    The badge appears **only when a chart-click drill is active** (the persistent
+    sidebar filters never raise it). When it does, it carries the **drill-through**:
+    two *Explore* buttons that dive into either detail view -- the **Prompt
+    Explorer** or the **File Explorer** -- on the current selection. ``frames`` is
+    kept for the call-site signature but no longer read.
     """
     parts = _xf_parts()
     if not parts:
         return
     if explore_link:
-        summary, explore, button = st.columns([4, 1, 1])
-        if explore.button(
-            "Explore →",
-            help="Open the matching day / session / prompt detail in the Prompt Explorer",
+        summary, explore_p, explore_f, button = st.columns([3, 1.3, 1.3, 1])
+        if explore_p.button(
+            "Explore prompts →",
+            help="Open the Prompt Explorer on the current selection",
             width="stretch",
+            key="badge_explore_prompts",
         ):
             st.switch_page("pages/11_explorer.py")
+        if explore_f.button(
+            "Explore files →",
+            help="Open the File Explorer on the current selection",
+            width="stretch",
+            key="badge_explore_files",
+        ):
+            st.switch_page("pages/12_file_explorer.py")
     else:
         summary, button = st.columns([5, 1])
     summary.info("🔎 Filtered: " + " · ".join(parts))

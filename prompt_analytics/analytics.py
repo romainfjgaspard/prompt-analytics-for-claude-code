@@ -1557,7 +1557,7 @@ def by_context(ds: Dataset, provider: str) -> TableResult:
 # ---------------------------------------------------------------------------
 
 
-def file_footprint(ds: Dataset, provider: str) -> TableResult:
+def file_footprint(ds: Dataset, provider: str, *, by_project: bool = False) -> TableResult:
     """One row per file crossing Axe C (edits) and Axe D (reads + context cost).
 
     The Explorer-style scorecard: a file's total cost of ownership in a single
@@ -1567,8 +1567,33 @@ def file_footprint(ds: Dataset, provider: str) -> TableResult:
     the project-relative path so a file edited *and* kept in context shows both
     halves. Rows are sorted by context cost (the actionable "what to cut") then
     line churn. Metrics only -- relative paths, never a byte of content.
+
+    Paths are *project-relative*, so the same name (``README.md``, ``conftest.py``)
+    recurs across repos. ``by_project=True`` keys each row on ``(project, path)``
+    and adds a ``project`` column, so those homonyms no longer merge into one line
+    (the dashboard File Explorer uses this); the default keys on the path alone.
     """
     engine = CostEngine(provider, ds.pricing_path)
+
+    # by_project keys on a (project, path) composite so cross-repo homonyms split;
+    # the default keeps the bare path. ``key_meta`` maps each key back to its parts.
+    sep = "\x00"
+    prompt_project = (
+        {str(r.get("prompt_id")): str(r.get("project") or "") for r in ds.prompts}
+        if by_project
+        else {}
+    )
+    session_project = (
+        {str(r.get("session_id")): str(r.get("project") or "") for r in ds.sessions}
+        if by_project
+        else {}
+    )
+    key_meta: dict[str, tuple[str, str]] = {}
+
+    def _key(project: str, path: str) -> str:
+        k = f"{project}{sep}{path}" if by_project else path
+        key_meta.setdefault(k, (project, path))
+        return k
 
     edits: Counter[str] = Counter()
     added: Counter[str] = Counter()
@@ -1576,20 +1601,21 @@ def file_footprint(ds: Dataset, provider: str) -> TableResult:
     language: dict[str, str] = {}
     kind: dict[str, str] = {}
 
-    def _note_lang(path: str, value: str | None) -> None:
-        if value and value != NO_LANGUAGE and path not in language:
-            language[path] = value
+    def _note_lang(key: str, value: str | None) -> None:
+        if value and value != NO_LANGUAGE and key not in language:
+            language[key] = value
 
     for row in ds.output_files:
         path = row.get("path") or ""
         if not path or path == NO_PATH:
             continue
-        edits[path] += int(row.get("edits") or 0)
-        added[path] += int(row.get("lines_added") or 0)
-        deleted[path] += int(row.get("lines_deleted") or 0)
-        _note_lang(path, row.get("language"))
-        if path not in kind:
-            kind[path] = row.get("kind") or detect_kind(path)
+        key = _key(prompt_project.get(str(row.get("prompt_id")), ""), path)
+        edits[key] += int(row.get("edits") or 0)
+        added[key] += int(row.get("lines_added") or 0)
+        deleted[key] += int(row.get("lines_deleted") or 0)
+        _note_lang(key, row.get("language"))
+        if key not in kind:
+            kind[key] = row.get("kind") or detect_kind(path)
 
     reads: Counter[str] = Counter()
     for row in ds.context_sources:
@@ -1598,8 +1624,9 @@ def file_footprint(ds: Dataset, provider: str) -> TableResult:
         path = row.get("path") or ""
         if not path or path == NO_PATH:
             continue
-        reads[path] += int(row.get("items") or 0)
-        _note_lang(path, row.get("language"))
+        key = _key(session_project.get(str(row.get("session_id")), ""), path)
+        reads[key] += int(row.get("items") or 0)
+        _note_lang(key, row.get("language"))
 
     load: dict[str, float] = defaultdict(float)
     rent: dict[str, float] = defaultdict(float)
@@ -1609,31 +1636,34 @@ def file_footprint(ds: Dataset, provider: str) -> TableResult:
         path = row.get("path") or ""
         if not path or path == NO_PATH:
             continue
+        key = _key(session_project.get(str(row.get("session_id")), ""), path)
         model = row.get("model") or ""
-        rent[path] += engine.cost(model, "cache_read", int(row.get("rent_read_tokens") or 0))
-        load[path] += engine.cost(
+        rent[key] += engine.cost(model, "cache_read", int(row.get("rent_read_tokens") or 0))
+        load[key] += engine.cost(
             model, "cache_write_5m", int(row.get("load_write_5m_tokens") or 0)
         ) + engine.cost(model, "cache_write_1h", int(row.get("load_write_1h_tokens") or 0))
-        _note_lang(path, row.get("language"))
+        _note_lang(key, row.get("language"))
 
-    all_paths = set(edits) | set(reads) | set(load) | set(rent)
+    all_keys = set(edits) | set(reads) | set(load) | set(rent)
     rows: list[dict[str, Any]] = []
-    for path in all_paths:
-        context_usd = load.get(path, 0.0) + rent.get(path, 0.0)
-        rows.append(
-            {
-                "path": path,
-                "language": language.get(path, NO_LANGUAGE),
-                "kind": kind.get(path) or detect_kind(path),
-                "edits": edits.get(path, 0),
-                "lines_added": added.get(path, 0),
-                "lines_deleted": deleted.get(path, 0),
-                "reads": reads.get(path, 0),
-                "load_usd": round(load.get(path, 0.0), 4),
-                "rent_usd": round(rent.get(path, 0.0), 4),
-                "context_usd": round(context_usd, 4),
-            }
-        )
+    for key in all_keys:
+        project, path = key_meta[key]
+        context_usd = load.get(key, 0.0) + rent.get(key, 0.0)
+        row_out: dict[str, Any] = {
+            "path": path,
+            "language": language.get(key, NO_LANGUAGE),
+            "kind": kind.get(key) or detect_kind(path),
+            "edits": edits.get(key, 0),
+            "lines_added": added.get(key, 0),
+            "lines_deleted": deleted.get(key, 0),
+            "reads": reads.get(key, 0),
+            "load_usd": round(load.get(key, 0.0), 4),
+            "rent_usd": round(rent.get(key, 0.0), 4),
+            "context_usd": round(context_usd, 4),
+        }
+        if by_project:
+            row_out = {"project": project, **row_out}
+        rows.append(row_out)
     rows.sort(
         key=lambda r: (-r["context_usd"], -(r["lines_added"] + r["lines_deleted"]), r["path"])
     )
@@ -1652,20 +1682,22 @@ def file_footprint(ds: Dataset, provider: str) -> TableResult:
             "(pure context cost -- the first candidates to keep out of context)."
         )
 
+    columns = [Column("project", "Project")] if by_project else []
+    columns += [
+        Column("path", "File"),
+        Column("language", "Language"),
+        Column("kind", "Kind"),
+        Column("edits", "Edits", "int"),
+        Column("lines_added", "Lines +", "int"),
+        Column("lines_deleted", "Lines −", "int"),
+        Column("reads", "Reads", "int"),
+        Column("load_usd", "Load $", "money"),
+        Column("rent_usd", "Rent $", "money"),
+        Column("context_usd", "Context $", "money"),
+    ]
     return TableResult(
         f"Per-file footprint ({provider})",
-        [
-            Column("path", "File"),
-            Column("language", "Language"),
-            Column("kind", "Kind"),
-            Column("edits", "Edits", "int"),
-            Column("lines_added", "Lines +", "int"),
-            Column("lines_deleted", "Lines −", "int"),
-            Column("reads", "Reads", "int"),
-            Column("load_usd", "Load $", "money"),
-            Column("rent_usd", "Rent $", "money"),
-            Column("context_usd", "Context $", "money"),
-        ],
+        columns,
         rows,
         notes,
     )

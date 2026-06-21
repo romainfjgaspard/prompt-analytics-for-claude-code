@@ -866,6 +866,86 @@ def test_file_footprint_empty_dataset_hints_to_extract():
     assert any("No per-file data" in n for n in result.notes)
 
 
+def _multi_project_footprint_ds() -> Dataset:
+    """The same relative path (README.md) in two projects -- the de-conflation case."""
+    return Dataset(
+        sessions=[
+            {"session_id": "sA", "project": "alpha"},
+            {"session_id": "sB", "project": "beta"},
+        ],
+        prompts=[
+            {"session_id": "sA", "prompt_id": "pA", "project": "alpha", "model": OPUS},
+            {"session_id": "sB", "prompt_id": "pB", "project": "beta", "model": OPUS},
+        ],
+        tokens=[],
+        categories={},
+        source="test data",
+        output_files=[
+            {
+                "prompt_id": "pA",
+                "path": "README.md",
+                "language": "Markdown",
+                "kind": "docs",
+                "edits": 1,
+                "lines_added": 10,
+                "lines_deleted": 0,
+            },
+            {
+                "prompt_id": "pB",
+                "path": "README.md",
+                "language": "Markdown",
+                "kind": "docs",
+                "edits": 1,
+                "lines_added": 5,
+                "lines_deleted": 0,
+            },
+        ],
+        output_tokens=[],
+        context_cost=[
+            {
+                "session_id": "sA",
+                "source": "file_read",
+                "language": "Markdown",
+                "path": "README.md",
+                "model": OPUS,
+                "rent_read_tokens": 1_000_000,
+                "load_write_5m_tokens": 0,
+                "load_write_1h_tokens": 0,
+            },
+            {
+                "session_id": "sB",
+                "source": "file_read",
+                "language": "Markdown",
+                "path": "README.md",
+                "model": OPUS,
+                "rent_read_tokens": 2_000_000,
+                "load_write_5m_tokens": 0,
+                "load_write_1h_tokens": 0,
+            },
+        ],
+    )
+
+
+def test_file_footprint_merges_homonyms_by_default():
+    rows = analytics.file_footprint(_multi_project_footprint_ds(), "anthropic").rows
+    assert [r["path"] for r in rows] == ["README.md"]  # one merged row across both repos
+    assert rows[0]["edits"] == 2 and rows[0]["lines_added"] == 15
+    assert "project" not in rows[0]
+
+
+def test_file_footprint_by_project_splits_homonyms():
+    result = analytics.file_footprint(_multi_project_footprint_ds(), "anthropic", by_project=True)
+    assert [c.key for c in result.columns][0] == "project"  # Project leads the table
+    by_proj = {r["project"]: r for r in result.rows}
+    assert set(by_proj) == {"alpha", "beta"}
+    # Within a project the edit (via its prompt) and the read (via its session) merge.
+    assert by_proj["alpha"]["edits"] == 1 and by_proj["alpha"]["lines_added"] == 10
+    assert by_proj["beta"]["edits"] == 1 and by_proj["beta"]["lines_added"] == 5
+    # Rent (opus cache_read $0.50/1M): alpha 1M -> $0.50, beta 2M -> $1.00.
+    assert by_proj["alpha"]["context_usd"] == pytest.approx(0.50, abs=1e-6)
+    assert by_proj["beta"]["context_usd"] == pytest.approx(1.00, abs=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # file_graph: the file cost-graph (Axe C+D / DASH5), centres + edit satellites.
 # ---------------------------------------------------------------------------

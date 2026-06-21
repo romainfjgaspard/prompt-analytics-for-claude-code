@@ -314,22 +314,22 @@ def _spend_heatmap_option(
         return None
     # Fill the **whole** 7×24 grid (zero where there was no spend) so every cell is
     # drawn and mapped by the visualMap: a no-spend slot then takes the ramp's floor
-    # (white) instead of showing the dark page background. The reading is one
-    # continuum -- white = nothing, ever-deeper blue = more money.
+    # (the page background) instead of a hole. The reading is one continuum --
+    # background = nothing, then warm yellow → orange → red as the spend climbs.
     points = [[h, d, spend.get((h, d), 0.0)] for d in range(len(_WEEKDAYS)) for h in range(24)]
     max_cost = max(spend.values()) or 1.0
 
     c = echarts.colors()
     dark = echarts.is_dark()
-    # Sequential blue ramp (design brief, "Heatmaps"): a cool single-hue scale
-    # reads as data intensity and avoids competing with the coral chrome. The floor
-    # (value 0 / no spend) is **white** so empty slots read as blank, and spend
-    # deepens to a saturated blue -- one continuum, white = nothing → deep blue =
-    # the peak. The darkest stop stays a solid blue (never the navy page color).
+    # Classic warm "heat" ramp (ColorBrewer YlOrRd): the floor (value 0 / no spend)
+    # is the page background so empty slots vanish into the dark board, and spend
+    # climbs through yellow → orange → red, the peak a saturated red. This reads as
+    # heat intensity at a glance and stops the big white block that jarred against
+    # the dark chrome. Light mode keeps a white floor so empties read as blank.
     ramp = (
-        ["#FFFFFF", "#BFDBFE", "#60A5FA", "#3B82F6", "#1D4ED8"]
+        ["#0B1220", "#FECC5C", "#FD8D3C", "#F03B20", "#BD0026"]
         if dark
-        else ["#FFFFFF", "#BFDBFE", "#60A5FA", "#2563EB", "#1E3A8A"]
+        else ["#FFFFFF", "#FED976", "#FD8D3C", "#F03B20", "#BD0026"]
     )
     tz_label = f"UTC{tz_offset:+d}" if tz_offset != 0 else "UTC"
     option = echarts.base_option()
@@ -482,8 +482,8 @@ def main() -> None:
         echarts.render(heatmap, key="overview_heatmap", height="340px")
         st.caption(
             "Each cell is the **total $** spent in that weekday × hour slot over the "
-            "filtered period (not an average) — white = no spend, ever-deeper blue "
-            "= more spend. Hover for the exact amount."
+            "filtered period (not an average) — dark = no spend, then yellow → orange → "
+            "red as it climbs (red = the peak). Hover for the exact amount."
         )
 
     # Per-session / per-prompt detail lives on the Prompt Explorer now (no tables
