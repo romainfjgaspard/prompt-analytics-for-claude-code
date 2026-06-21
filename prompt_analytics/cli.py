@@ -29,6 +29,22 @@ __all__ = ["build_parser", "main"]
 DEFAULT_OUTPUT_DIR = "./output"
 OUTPUT_DIR_ENV = "PROMPT_ANALYTICS_OUTPUT_DIR"
 
+# Branded dark theme, forced for `dashboard` launches. Streamlit otherwise
+# follows the visitor's OS theme and only reads `.streamlit/config.toml` from the
+# launch cwd -- which an installed tool (`uv tool` / `pip`) never has, so the
+# board would render light while the ECharts chrome is hard-coded dark. We set
+# the same values as `.streamlit/config.toml` via STREAMLIT_THEME_* env vars so
+# an installed board matches the deployed demo (dark, no light/dark toggle).
+# Kept in sync with `.streamlit/config.toml` by tests/test_dashboard_theme.py.
+DASHBOARD_THEME_ENV: dict[str, str] = {
+    "STREAMLIT_THEME_BASE": "dark",
+    "STREAMLIT_THEME_PRIMARY_COLOR": "#D97757",
+    "STREAMLIT_THEME_BACKGROUND_COLOR": "#0B1220",
+    "STREAMLIT_THEME_SECONDARY_BACKGROUND_COLOR": "#111827",
+    "STREAMLIT_THEME_TEXT_COLOR": "#F8FAFC",
+    "STREAMLIT_THEME_BORDER_COLOR": "#2B3954",
+}
+
 _EXAMPLES = """\
 examples:
   prompt-analytics summary                       totals, tokens and cost in the terminal
@@ -1387,6 +1403,13 @@ def _handle_dashboard(args: argparse.Namespace) -> int:
 
     env = dict(os.environ)
     env[OUTPUT_DIR_ENV] = str(output_dir)
+
+    # Force the branded dark theme (see DASHBOARD_THEME_ENV): an installed launch
+    # has no `.streamlit/config.toml`, so without this the board follows the OS
+    # theme and renders light against the dark-only ECharts chrome. `setdefault`
+    # so an explicit user STREAMLIT_THEME_* override still wins.
+    for theme_key, theme_value in DASHBOARD_THEME_ENV.items():
+        env.setdefault(theme_key, theme_value)
 
     # Forward any extra flags (e.g. --server.port 8599) straight to Streamlit;
     # `streamlit run app.py` accepts config options after the script path.
