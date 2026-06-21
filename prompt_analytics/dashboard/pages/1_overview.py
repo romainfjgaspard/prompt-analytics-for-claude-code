@@ -143,7 +143,13 @@ def _render_token_volume_section(tokens: pd.DataFrame) -> None:
 
     cache_vol = float(by_type.loc[by_type[label] == "Cache read", "token_count"].sum())
     cache_pct = 100.0 * cache_vol / total
-    st.metric("Cache reads", f"{cache_pct:.1f}% of token volume")
+    st.metric(
+        "Cache reads",
+        f"{cache_pct:.1f}% of all tokens",
+        help="Re-reading cached context dominates the token count — so it is "
+        "pulled out here as the headline and kept out of the bar below, where it "
+        "would otherwise flatten every other type into an unreadable sliver.",
+    )
 
     rest = by_type[by_type[label] != "Cache read"].sort_values("token_count", ascending=True)
     if rest.empty:
@@ -151,7 +157,10 @@ def _render_token_volume_section(tokens: pd.DataFrame) -> None:
     names = rest[label].tolist()
     option = echarts.base_option()
     option["title"] = {
-        "text": "Non-cache token volume",
+        # Names the deliberate split: the bar is everything *except* the cache reads
+        # that the headline metric above already owns (not a separate "non-cache"
+        # concept the reader has to puzzle out).
+        "text": "Token volume — every type except cache reads",
         "left": 0,
         "textStyle": {"color": echarts.colors()["text"], "fontSize": 16, "fontWeight": 600},
     }
@@ -184,6 +193,10 @@ def _render_token_volume_section(tokens: pd.DataFrame) -> None:
         }
     ]
     echarts.render(option, key="overview_token_volume", height="220px")
+    st.caption(
+        f"Cache reads ({cache_pct:.0f}% of all tokens) are the headline above, on "
+        "purpose; this bar is the rest."
+    )
 
 
 def _render_subagents_section(tokens: pd.DataFrame, primary: str) -> None:
@@ -255,6 +268,17 @@ def _render_subagents_section(tokens: pd.DataFrame, primary: str) -> None:
     ]
     echarts.render(option, key="overview_subagents", height="220px")
 
+    # Verified against the real data: subagents take 5m cache writes and reads but
+    # *no* 1h writes (the 1h TTL is a long-lived main-chain optimization; spawned
+    # agents are short-lived). So a missing "Cache write (1h)" bar is the data, not
+    # a silently dropped zero -- say so rather than leave the reader wondering.
+    present_types = set(side["token_type"].unique()) if "token_type" in side.columns else set()
+    if "cache_write_1h" not in present_types:
+        st.caption(
+            "No 1h cache writes here — subagents are short-lived, so they only take "
+            "5m cache writes (the 1h TTL is a main-chain optimization)."
+        )
+
 
 _WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
@@ -281,34 +305,42 @@ def _spend_heatmap_option(
 
     hours = [f"{h:02d}h" for h in range(24)]
     wd_index = {name: i for i, name in enumerate(_WEEKDAYS)}
-    points = [
-        [int(row.hour), wd_index[row.weekday], round(float(getattr(row, col)), 2)]
+    spend = {
+        (int(row.hour), wd_index[row.weekday]): round(float(getattr(row, col)), 2)
         for row in grid.itertuples(index=False)
         if row.weekday in wd_index
-    ]
-    if not points:
+    }
+    if not spend:
         return None
-    max_cost = max(p[2] for p in points) or 1.0
+    # Fill the **whole** 7×24 grid (zero where there was no spend) so every cell is
+    # drawn and mapped by the visualMap: a no-spend slot then takes the ramp's floor
+    # (white) instead of showing the dark page background. The reading is one
+    # continuum -- white = nothing, ever-deeper blue = more money.
+    points = [[h, d, spend.get((h, d), 0.0)] for d in range(len(_WEEKDAYS)) for h in range(24)]
+    max_cost = max(spend.values()) or 1.0
 
     c = echarts.colors()
     dark = echarts.is_dark()
     # Sequential blue ramp (design brief, "Heatmaps"): a cool single-hue scale
-    # reads as data intensity and avoids competing with the coral chrome. Dark
-    # climbs from the navy background up through Tailwind blues; light mirrors it
-    # from a near-white blue up to a deep blue.
+    # reads as data intensity and avoids competing with the coral chrome. The floor
+    # (value 0 / no spend) is **white** so empty slots read as blank, and spend
+    # deepens to a saturated blue -- one continuum, white = nothing → deep blue =
+    # the peak. The darkest stop stays a solid blue (never the navy page color).
     ramp = (
-        ["#0B1220", "#1E293B", "#3B82F6", "#60A5FA", "#BFDBFE"]
+        ["#FFFFFF", "#BFDBFE", "#60A5FA", "#3B82F6", "#1D4ED8"]
         if dark
-        else ["#F8FAFC", "#BFDBFE", "#60A5FA", "#3B82F6", "#1E40AF"]
+        else ["#FFFFFF", "#BFDBFE", "#60A5FA", "#2563EB", "#1E3A8A"]
     )
     tz_label = f"UTC{tz_offset:+d}" if tz_offset != 0 else "UTC"
     option = echarts.base_option()
     option["title"] = {
-        "text": f"When the money is spent ({primary}, {tz_label})",
+        # The section header already says "When the money is spent"; this states
+        # what each cell *is* -- the total $ spent in that weekday × hour slot.
+        "text": f"Total $ by weekday × hour ({primary}, {tz_label})",
         "left": 0,
         "textStyle": {"color": c["text"], "fontSize": 16, "fontWeight": 600},
     }
-    option["grid"] = {"left": 60, "right": 24, "top": 48, "bottom": 70, "containLabel": True}
+    option["grid"] = {"left": 60, "right": 24, "top": 48, "bottom": 40, "containLabel": True}
     option["tooltip"] = {
         "backgroundColor": c["tooltip_bg"],
         "borderColor": c["axis"],
@@ -321,26 +353,30 @@ def _spend_heatmap_option(
             "return D[p.data[1]]+' '+H[p.data[0]]+': $'+Number(p.data[2]).toFixed(2);}"
         ),
     }
+    # No ``splitArea``: it drew an alternating grey/dark *checkerboard* behind the
+    # whole grid, which on the empty night hours read as ambiguous grey/black blocks.
+    # With the grid now zero-filled every cell is a real (often white) tile, so the
+    # per-cell border below is what gives the grid its structure.
     xaxis = echarts.category_axis(hours)
-    xaxis["splitArea"] = {"show": True}
     yaxis = echarts.category_axis(_WEEKDAYS, inverse=True)
-    yaxis["splitArea"] = {"show": True}
     option["xAxis"] = xaxis
     option["yAxis"] = yaxis
+    # visualMap maps cost -> ramp color but its on-screen control is hidden
+    # (``show: False``): the bottom slider added no signal once the cells carry the
+    # intensity and the tooltip gives the exact $.
     option["visualMap"] = {
         "min": 0,
         "max": max_cost,
-        "calculable": True,
-        "orient": "horizontal",
-        "left": "center",
-        "bottom": 0,
-        "textStyle": {"color": c["text"]},
+        "show": False,
         "inRange": {"color": ramp},
     }
     option["series"] = [
         {
             "type": "heatmap",
             "data": points,
+            # A faint border per cell outlines the grid (every cell is drawn now
+            # that it is zero-filled), separating adjacent tiles without a checkerboard.
+            "itemStyle": {"borderColor": c["grid"], "borderWidth": 1},
             "emphasis": {"itemStyle": {"shadowBlur": 8, "shadowColor": "rgba(0,0,0,0.4)"}},
         }
     ]
@@ -444,6 +480,11 @@ def main() -> None:
     heatmap = _spend_heatmap_option(tokens, primary, tz_offset=tz_offset)
     if heatmap is not None:
         echarts.render(heatmap, key="overview_heatmap", height="340px")
+        st.caption(
+            "Each cell is the **total $** spent in that weekday × hour slot over the "
+            "filtered period (not an average) — white = no spend, ever-deeper blue "
+            "= more spend. Hover for the exact amount."
+        )
 
     # Per-session / per-prompt detail lives on the Explorer page now (no tables
     # on the analytical pages): apply a filter here, then use the "Explore →"

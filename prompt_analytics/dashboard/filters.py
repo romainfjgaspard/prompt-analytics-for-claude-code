@@ -54,8 +54,13 @@ XF_DATE_RANGE = "xf_date_range"
 XF_MODELS = "xf_models"
 XF_PROJECTS = "xf_projects"
 XF_CATEGORIES = "xf_categories"
+# Prompts-per-session drill: clicking a bar on the Sessions page narrows the whole
+# dashboard to sessions of exactly that prompt count. Unlike the others it has no
+# sidebar twin (it is an *aggregate* of prompts, not a prompt column), so it is a
+# drill-only dimension applied by :func:`apply_filters` after the row masks.
+XF_PROMPT_COUNT = "xf_prompt_count"
 
-_XF_KEYS = (XF_DATE_RANGE, XF_MODELS, XF_PROJECTS, XF_CATEGORIES)
+_XF_KEYS = (XF_DATE_RANGE, XF_MODELS, XF_PROJECTS, XF_CATEGORIES, XF_PROMPT_COUNT)
 
 # The Explorer's local day / session focus, also cleared by Reset (a treemap /
 # top-10 tile click sets ``drill_session``; ``_xf_treemap_applied`` is the
@@ -189,6 +194,7 @@ def get_filter_state() -> dict[str, Any]:
         "xf_models": st.session_state.get(XF_MODELS),
         "xf_projects": st.session_state.get(XF_PROJECTS),
         "xf_categories": st.session_state.get(XF_CATEGORIES),
+        "xf_prompt_count": st.session_state.get(XF_PROMPT_COUNT),
     }
 
 
@@ -309,6 +315,17 @@ def apply_filters(
         mask &= _date_mask(prompts, state.get("xf_date_range"))
 
         prompts = prompts[mask]
+
+        # Prompts-per-session drill, applied last because it is an *aggregate*:
+        # keep only sessions whose surviving prompt count is in the selected set.
+        # Counting on the already-masked prompts matches exactly what the Sessions
+        # bar shows (it bins the filtered prompts), so a click re-narrows to that
+        # single bar and the cascade below restricts tokens / sessions in step.
+        xf_prompt_count = state.get("xf_prompt_count")
+        if xf_prompt_count and "session_id" in prompts.columns:
+            counts = prompts.groupby("session_id").size()
+            keep_sessions = set(counts[counts.isin(xf_prompt_count)].index)
+            prompts = prompts[prompts["session_id"].isin(keep_sessions)]
 
     # Cascade: keep only tokens / sessions referenced by surviving prompts.
     surviving_prompt_ids = set(prompts["prompt_id"]) if "prompt_id" in prompts.columns else set()
@@ -562,6 +579,8 @@ def _xf_parts() -> list[str]:
         parts.append(str(p))
     for c in state.get("xf_categories") or []:
         parts.append(str(c))
+    for n in state.get("xf_prompt_count") or []:
+        parts.append(f"{n} prompt/session" if n == 1 else f"{n} prompts/session")
 
     xf_date = state.get("xf_date_range")
     if xf_date:
@@ -585,6 +604,27 @@ def set_cross_filter(filter_key: str, value: list[Any]) -> bool:
         return False
     st.session_state[xf_key] = value
     return True
+
+
+def apply_prompt_count_click(value: Any) -> None:
+    """Clicked prompts-per-session bar -> filter every page to that prompt count.
+
+    A new global cross-filter dimension (Sessions page): the bar's category is the
+    integer prompt count (``"1"``, ``"2"``, …), so a click narrows the dashboard to
+    the sessions of that size. Lands on the drill key :data:`XF_PROMPT_COUNT` (badge
+    + Reset, never the sidebar), and reruns only on a real change so the
+    component's sticky value cannot re-apply every rerun.
+    """
+    if not isinstance(value, str):
+        return
+    try:
+        n = int(value)
+    except ValueError:
+        return
+    if st.session_state.get(XF_PROMPT_COUNT) == [n]:
+        return
+    st.session_state[XF_PROMPT_COUNT] = [n]
+    st.rerun()
 
 
 def reset_filters() -> None:

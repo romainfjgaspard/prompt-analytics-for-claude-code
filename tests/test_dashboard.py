@@ -696,6 +696,34 @@ def test_apply_filters_ands_drill_on_top_of_sidebar(monkeypatch: pytest.MonkeyPa
     assert set(out["prompts"]["prompt_id"]) == {"p3"}
 
 
+def test_apply_filters_by_prompt_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prompts-per-session drill keeps only sessions of that prompt count.
+
+    In ``_frames`` s1 has two prompts (p1, p2) and s2 has one (p3), so a drill to
+    ``1`` keeps s2 (and its session-overhead tail), and ``2`` keeps s1.
+    """
+    from prompt_analytics.dashboard import filters
+
+    _patch_state(monkeypatch, xf_prompt_count=[1])
+    one = filters.apply_filters(_frames())
+    assert set(one["prompts"]["prompt_id"]) == {"p3"}
+    assert set(one["tokens"]["prompt_id"]) == {"p3", "s2:_continuation"}
+
+    _patch_state(monkeypatch, xf_prompt_count=[2])
+    two = filters.apply_filters(_frames())
+    assert set(two["prompts"]["prompt_id"]) == {"p1", "p2"}
+
+
+def test_xf_parts_reports_prompt_count_drill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prompts-per-session drill shows in the badge (singular for 1)."""
+    from prompt_analytics.dashboard import filters
+
+    _patch_state(monkeypatch, xf_prompt_count=[1])
+    assert "1 prompt/session" in filters._xf_parts()
+    _patch_state(monkeypatch, xf_prompt_count=[3])
+    assert "3 prompts/session" in filters._xf_parts()
+
+
 # ---------------------------------------------------------------------------
 # Refresh-data button pipeline (sidebar "Refresh data").
 # ---------------------------------------------------------------------------

@@ -110,13 +110,17 @@ SEMANTIC_COLORS = {
     "subagents": "#14B8A6",
 }
 
-# Input-side mix components (Session depth page). Cache writes stay split by
-# TTL (1.3): 1h writes are billed 2x and can dominate the 5m bucket 10:1.
+# Token-mix components (Session depth page). The four input-side components --
+# cache writes stay split by TTL (1.3): 1h writes are billed 2x and can dominate
+# the 5m bucket 10:1 -- plus **Output**, shown as a fifth panel beside them so the
+# page reads what a prompt produces, not only what it consumes. Output keeps its
+# token-palette cyan (matches ``TOKEN_TYPE_COLORS["Output"]``).
 MIX_COLORS = {
     "Fresh input": "#3B82F6",
     "Cache read": "#10B981",
     "Cache write (5m)": "#A78BFA",
     "Cache write (1h)": "#8B5CF6",
+    "Output": "#06B6D4",
 }
 
 # Prompt categories (Prompts page only): grouped by intent so the legend keeps a

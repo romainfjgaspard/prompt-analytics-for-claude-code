@@ -7,10 +7,12 @@ Migrated to Apache ECharts (``docs/MIGRATION-ECHARTS.md``). Emitters (§4):
 * the **treemap** is a *drill* trigger, not a filter -- clicking a session tile
   opens that session in the Explorer (``st.session_state['drill_session']``);
 * the **per-session cost box plot** emits the model dimension
-  (``filters.KEY_MODELS``), consistent with the Models page.
+  (``filters.KEY_MODELS``), consistent with the Models page;
+* the **prompts-per-session bar** emits a *new* global dimension
+  (``filters.XF_PROMPT_COUNT``) -- clicking the "1" bar narrows the whole
+  dashboard to one-prompt sessions, and so on.
 
-The prompts-per-session bar is read-only. Per-session / per-prompt detail lives
-on the Explorer page.
+Per-session / per-prompt detail lives on the Explorer page.
 
 ⚠️ Color stability: one ``project_color_map`` is built **once** from the
 *unfiltered* project universe (``frames_all``) and shared by the pareto and
@@ -225,7 +227,11 @@ def _apply_treemap_drill(value: Any, session_ids: set[str]) -> None:
 
 
 def _prompts_per_session_option(counts: pd.DataFrame, n_sessions: int) -> dict[str, Any]:
-    """Discrete bar: how many sessions have each prompt count (read-only)."""
+    """Discrete bar: how many sessions have each prompt count.
+
+    A click on a bar returns its category (the prompt count as a string) and is
+    turned into the global :data:`filters.XF_PROMPT_COUNT` drill by the caller.
+    """
     c = echarts.colors()
     vc = counts["prompt_count"].value_counts().sort_index()
     x = [str(int(i)) for i in vc.index.tolist()]
@@ -388,10 +394,16 @@ def main() -> None:
 
     left, right = st.columns(2)
     with left:
-        echarts.render(
+        clicked = echarts.render(
             _prompts_per_session_option(counts, n_sessions),
             key="sessions_per_session",
             height="360px",
+            click=True,
+        )
+        filters.apply_prompt_count_click(clicked)
+        st.caption(
+            "👆 Click a bar to filter every page to the sessions with that many "
+            "prompts (Reset clears it)."
         )
     with right:
         box = _cost_by_model_box_option(session_cost, model_map, cost, primary)
