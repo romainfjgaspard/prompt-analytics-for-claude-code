@@ -724,6 +724,36 @@ def test_xf_parts_reports_prompt_count_drill(monkeypatch: pytest.MonkeyPatch) ->
     assert "3 prompts/session" in filters._xf_parts()
 
 
+def test_apply_filters_by_char_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prompt-length drill keeps only prompts whose char_count is in the bucket.
+
+    ``[lo, hi)`` is half-open; ``hi=None`` is the open-ended top bucket. Here p1/p2/p3
+    carry 50 / 300 / 1500 chars, so ``[100, 500)`` keeps p2 and ``[1000, None]`` keeps p3.
+    """
+    from prompt_analytics.dashboard import filters
+
+    frames = _frames()
+    frames["prompts"] = frames["prompts"].assign(char_count=[50, 300, 1500])
+
+    _patch_state(monkeypatch, xf_char_bucket=[100, 500])
+    keep = filters.apply_filters(frames)
+    assert set(keep["prompts"]["prompt_id"]) == {"p2"}
+
+    _patch_state(monkeypatch, xf_char_bucket=[1000, None])
+    top = filters.apply_filters(frames)
+    assert set(top["prompts"]["prompt_id"]) == {"p3"}
+
+
+def test_xf_parts_reports_char_bucket_drill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prompt-length drill shows in the badge (≥ form for the open top bucket)."""
+    from prompt_analytics.dashboard import filters
+
+    _patch_state(monkeypatch, xf_char_bucket=[100, 500])
+    assert "100–500 chars" in filters._xf_parts()
+    _patch_state(monkeypatch, xf_char_bucket=[5000, None])
+    assert "≥5,000 chars" in filters._xf_parts()
+
+
 # ---------------------------------------------------------------------------
 # Refresh-data button pipeline (sidebar "Refresh data").
 # ---------------------------------------------------------------------------

@@ -204,6 +204,5 @@ def render_impact_panel(ds: analytics.Dataset, provider: str, pivot: str) -> Non
         "Ratios are **workload-normalized** (per prompt, per turn, or as a cost share) so the "
         "change reads through the workload; the confounders describe how the workload itself "
         "moved. This is an **observational split, not a controlled experiment** — if volume, "
-        "depth or task mix shifted a lot, read the deltas as correlation, not proven causation. "
-        "👉 Same split on the command line: `prompt-analytics impact --pivot " + pivot + "`."
+        "depth or task mix shifted a lot, read the deltas as correlation, not proven causation."
     )

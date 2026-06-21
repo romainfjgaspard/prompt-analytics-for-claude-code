@@ -10,8 +10,8 @@ work.
 
 * **Input** (categories) -- a cost-by-category recap of the Prompts page, so the
   spine starts here too (DASH1).
-* **Output** (Axe C) -- language mix, code vs tests, cost per language, and the
-  prose-vs-code split of the generated tokens: the differentiator cc-lens never
+* **Output** (Axe C) -- the prose-vs-code split of the generated spend and the
+  language mix (code side) of what was written: the differentiator cc-lens never
   filled in (its ``languages`` field stays empty) and never priced.
 * **Context** (Axe D) -- what fills the cached, re-read context, split into the
   one-off **loading** and the **rent** paid every turn it lingers; the attributed
@@ -47,7 +47,6 @@ from prompt_analytics.dashboard import data, echarts, filters, impact, theme
 
 # How many languages to show before folding the long tail into an "Other" slice.
 _MIX_TOP = 12
-_COST_TOP = 10
 # How many rows the categorical bars (categories, context elements) show.
 _CAT_TOP = 12
 _CTX_TOP = 12
@@ -63,18 +62,6 @@ _CTX_LABELS = {
 # with the token palette so the mechanic is legible (purple write, green read).
 _LOAD_COLOR = theme.TOKEN_TYPE_COLORS["cache_write_1h"]
 _RENT_COLOR = theme.TOKEN_TYPE_COLORS["cache_read"]
-
-
-def _fold_other(
-    pairs: list[tuple[str, float]], top: int, other_label: str = "Other languages"
-) -> list[tuple[str, float]]:
-    """Keep the ``top`` largest pairs (by value), summing the rest into one bucket."""
-    ordered = sorted(pairs, key=lambda kv: -kv[1])
-    head = ordered[:top]
-    tail_sum = sum(v for _, v in ordered[top:])
-    if tail_sum > 0:
-        head.append((other_label, tail_sum))
-    return head
 
 
 def _hbar(
@@ -132,6 +119,21 @@ def _hbar(
 # Input section (categories) -- the spine starts here too (DASH1).
 # ---------------------------------------------------------------------------
 
+# Char-count histogram buckets for the prompt-length distribution. Fixed edges
+# (not data-derived) so the bar labels stay stable and a click maps to a known
+# range; the top bucket is open-ended (``hi`` is ``None``). The label is the
+# bridge between the chart (axis text) and the cross-filter (the clicked range).
+_CHAR_BINS: list[tuple[int, int | None, str]] = [
+    (0, 100, "0–100"),
+    (100, 250, "100–250"),
+    (250, 500, "250–500"),
+    (500, 1000, "500–1k"),
+    (1000, 2000, "1k–2k"),
+    (2000, 5000, "2k–5k"),
+    (5000, None, "5k+"),
+]
+_CHAR_RANGE_BY_LABEL = {label: (lo, hi) for lo, hi, label in _CHAR_BINS}
+
 
 def _category_cost_option(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Horizontal bar of cost per category (the spend split of what you asked)."""
@@ -147,28 +149,91 @@ def _category_cost_option(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     return _hbar("Where the spend goes, by category", names, values, colors, labels)
 
 
-def _render_input_section(ds: analytics.Dataset, provider: str) -> None:
+def _char_distribution_option(prompts: pd.DataFrame) -> dict[str, Any] | None:
+    """Vertical histogram of prompt length in characters; emits ``XF_CHAR_BUCKET``.
+
+    Reads ``char_count`` (native on every prompt) and bins it on the fixed
+    :data:`_CHAR_BINS` edges so a clicked bar maps back to a known range. A
+    companion to the category bar: together they answer "what you asked, by
+    intent and by length".
+    """
+    if "char_count" not in prompts.columns:
+        return None
+    cc = pd.to_numeric(prompts["char_count"], errors="coerce").dropna()
+    if cc.empty:
+        return None
+    counts: list[int] = []
+    for lo, hi, _label in _CHAR_BINS:
+        mask = cc >= lo
+        if hi is not None:
+            mask &= cc < hi
+        counts.append(int(mask.sum()))
+    labels = [label for _, _, label in _CHAR_BINS]
+
+    c = echarts.colors()
+    option = echarts.base_option(color=[theme.PALETTE[1]])
+    option["legend"] = {"show": False}
+    option["title"] = {
+        "text": "How long your prompts are (characters)",
+        "left": 0,
+        "textStyle": {"color": c["text"], "fontSize": 16, "fontWeight": 600},
+    }
+    option["grid"] = {"left": 64, "right": 24, "top": 64, "bottom": 56, "containLabel": True}
+    option["tooltip"].update({"trigger": "axis", "axisPointer": {"type": "shadow"}})
+    option["xAxis"] = echarts.category_axis(labels)
+    option["xAxis"]["name"] = "Characters"
+    option["xAxis"]["nameLocation"] = "middle"
+    option["xAxis"]["nameGap"] = 32
+    option["yAxis"] = echarts.value_axis(name="Prompts")
+    option["yAxis"]["nameLocation"] = "middle"
+    option["yAxis"]["nameGap"] = 46
+    option["series"] = [
+        {
+            "type": "bar",
+            "data": counts,
+            "itemStyle": {"color": theme.PALETTE[1], "borderRadius": [4, 4, 0, 0]},
+            "label": {"show": True, "position": "top", "color": c["text"]},
+        }
+    ]
+    return option
+
+
+def _apply_char_click(value: Any) -> None:
+    """Clicked char-histogram bar -> narrow the dashboard to that length bucket.
+
+    The clicked value is the bar's label (e.g. ``"500–1k"``); it is mapped back to
+    its ``[lo, hi]`` range and written to the :data:`filters.XF_CHAR_BUCKET` drill
+    (badge + Reset, never the sidebar). Reruns only on a real change, so the
+    component's sticky value cannot re-apply the same bucket every rerun.
+    """
+    if not isinstance(value, str):
+        return
+    rng = _CHAR_RANGE_BY_LABEL.get(value)
+    if rng is None:
+        return
+    if filters.set_cross_filter(filters.XF_CHAR_BUCKET, [rng[0], rng[1]]):
+        st.rerun()
+
+
+def _render_input_section(ds: analytics.Dataset, provider: str, prompts: pd.DataFrame) -> None:
     """Cost-by-category recap of the Prompts page (the input half of the spine)."""
     table = analytics.by_category(ds, provider)
     rows = [r for r in table.rows if str(r.get("category")) != "TOTAL"]
     categorized = [r for r in rows if str(r.get("category")) != "(uncategorized)"]
     if not categorized:
-        st.info(
-            "No categorized prompts in range. Run `prompt-analytics categorize` to fill the "
-            "**input** breakdown (the full view lives on the **Prompts** tab)."
-        )
+        st.info("No categorized prompts in range. Run `prompt-analytics categorize` to fill it.")
         return
 
-    total_prompts = sum(int(r["prompts"] or 0) for r in rows)
-    top = max(categorized, key=lambda r: float(r["cost_usd"] or 0.0))
-    # Fresh-input cost only (token type ``input``) -- NOT by_category's cost_usd,
-    # which is the whole prompt (input + output + cache ≈ the entire bill).
+    total_prompts = len(prompts)
+    # Fresh-input tokens / cost only (token type ``input``) -- NOT by_category's
+    # cost_usd, which is the whole prompt (input + output + cache ≈ the bill).
+    input_tokens = sum(r["token_count"] for r in ds.tokens if r["token_type"] == "input")
     fresh_input_cost = analytics.input_cost(ds, provider)
 
     cols = st.columns(4)
     cols[0].metric("Prompts", f"{total_prompts:,}")
-    cols[1].metric("Categories", f"{len(categorized):,}")
-    cols[2].metric("Top category", str(top["category"]).title())
+    cols[1].metric("Tokens", f"{input_tokens:,}", delta="fresh input only", delta_color="off")
+    cols[2].metric("Categories", f"{len(categorized):,}")
     cols[3].metric(
         f"Input cost ({provider})",
         f"${fresh_input_cost:,.2f}",
@@ -176,13 +241,27 @@ def _render_input_section(ds: analytics.Dataset, provider: str) -> None:
         delta_color="off",
     )
 
-    option = _category_cost_option(rows)
-    if option is not None:
-        echarts.render(option, key="comp_category_cost", height="360px")
+    left, right = st.columns([2, 3])
+    with left:
+        option = _category_cost_option(rows)
+        if option is not None:
+            clicked = echarts.render(option, key="comp_category_cost", height="360px", click=True)
+            echarts.apply_click(
+                clicked, filters.KEY_CATEGORIES, synthetic=frozenset({"(uncategorized)"})
+            )
+        else:
+            st.info("No category spend to show in range.")
+    with right:
+        dist = _char_distribution_option(prompts)
+        if dist is not None:
+            clicked = echarts.render(dist, key="comp_char_dist", height="360px", click=True)
+            _apply_char_click(clicked)
+        else:
+            st.info("No prompt-length data in range.")
+
     st.caption(
-        "What you **asked for**, priced by category. The full breakdown — prompt counts, "
-        "complexity, cost per prompt — lives on the **Prompts** tab; here it anchors the "
-        "left end of the spine (input → output → context)."
+        "👆 Click a **category** bar to filter the dashboard to that intent, or a **length** "
+        "bar to filter to prompts of that size."
     )
 
 
@@ -208,14 +287,14 @@ def _language_mix_option(comp: analytics.OutputComposition) -> dict[str, Any] | 
     c = echarts.colors()
     option = echarts.base_option()
     option["title"] = {
-        "text": "Language mix — lines written",
+        "text": "Language mix — code lines written",
         "left": 0,
         "textStyle": {"color": c["text"], "fontSize": 16, "fontWeight": 600},
     }
     option["legend"] = {"bottom": 0, "textStyle": {"color": c["text"]}, "icon": "roundRect"}
-    option["grid"] = {"left": 8, "right": 56, "top": 48, "bottom": 40, "containLabel": True}
+    option["grid"] = {"left": 8, "right": 56, "top": 64, "bottom": 48, "containLabel": True}
     option["tooltip"].update({"trigger": "axis", "axisPointer": {"type": "shadow"}})
-    option["xAxis"] = echarts.value_axis(name="Lines added")
+    option["xAxis"] = echarts.value_axis()
     option["yAxis"] = echarts.category_axis(names, inverse=True)
     option["series"] = [
         {
@@ -236,65 +315,60 @@ def _language_mix_option(comp: analytics.OutputComposition) -> dict[str, Any] | 
     return option
 
 
-def _prose_vs_code_option(comp: analytics.OutputComposition) -> dict[str, Any] | None:
-    """Two labeled bars: the prose half vs the code half of the output spend.
+def _prose_vs_code_pie(comp: analytics.OutputComposition) -> dict[str, Any] | None:
+    """A donut of the prose half vs the code half of the output spend.
 
-    The headline of the section -- you see *both* parts of the output and the
-    dollars next to each (not a percentage hidden behind a hover). Prose on top
-    (cyan, "what comes out"), code below (coral).
+    The headline of the section: you see *both* parts of the output and the
+    dollars + share of each. Prose is cyan ("what comes out"), code coral.
     """
     prose, code = round(comp.prose_cost, 2), round(comp.code_cost, 2)
     if prose <= 0 and code <= 0:
         return None
-    total = prose + code
-    names = ["Prose / explanation", "Code / tooling"]
-    values = [prose, code]
-    colors = [theme.TOKEN_TYPE_COLORS["output"], theme.PALETTE[0]]
-    tokens = [comp.prose_tokens, comp.code_tokens]
-    labels = [
-        f"${v:,.2f}  ·  {pct:.0f}%  ·  {tok:,} tok"
-        for v, tok, pct in zip(
-            values, tokens, [100 * v / total if total else 0 for v in values], strict=True
-        )
-    ]
-    return _hbar(f"Output spend — prose vs code ({comp.provider})", names, values, colors, labels)
 
-
-def _cost_by_language_option(comp: analytics.OutputComposition) -> dict[str, Any] | None:
-    """Horizontal bars of the estimated output spend by language (code side) + tooling."""
-    pairs: list[tuple[str, float]] = [
-        (lng.language, round(lng.code_cost, 4)) for lng in comp.languages if lng.code_cost > 0
+    c = echarts.colors()
+    option = echarts.base_option()
+    option["title"] = {
+        "text": f"Output spend — prose vs code ({comp.provider})",
+        "left": 0,
+        "textStyle": {"color": c["text"], "fontSize": 16, "fontWeight": 600},
+    }
+    option["legend"] = {"bottom": 0, "textStyle": {"color": c["text"]}, "icon": "circle"}
+    option["tooltip"] = {**option["tooltip"], "trigger": "item", "formatter": "{b}: ${c} ({d}%)"}
+    option["series"] = [
+        {
+            "type": "pie",
+            "radius": ["40%", "66%"],
+            "center": ["50%", "50%"],
+            "avoidLabelOverlap": True,
+            "itemStyle": {"borderColor": c["grid"], "borderWidth": 2},
+            "label": {"color": c["text"], "formatter": "{b}\n${c} · {d}%"},
+            "data": [
+                {
+                    "value": prose,
+                    "name": "Prose",
+                    "itemStyle": {"color": theme.TOKEN_TYPE_COLORS["output"]},
+                },
+                {
+                    "value": code,
+                    "name": "Code",
+                    "itemStyle": {"color": theme.PALETTE[0]},
+                },
+            ],
+        }
     ]
-    if comp.tooling_cost > 0:
-        pairs.append(("(other tooling)", round(comp.tooling_cost, 4)))
-    if not pairs:
-        return None
-    folded = _fold_other(pairs, _COST_TOP)
-    names = [name for name, _ in folded]
-    values = [round(value, 2) for _, value in folded]
-    color_map = theme.language_color_map(names)
-    colors = [color_map.get(name, "#9CA3AF") for name in names]
-    labels = [f"${v:,.2f}" for v in values]
-    return _hbar(
-        f"Where the code spend went, by language ({comp.provider})", names, values, colors, labels
-    )
+    return option
 
 
 def _render_output_headline(comp: analytics.OutputComposition) -> None:
     """Four KPI cards summarizing what the assistant produced."""
     gen_cost = comp.prose_cost + comp.code_cost
+    gen_tokens = comp.prose_tokens + comp.code_tokens
     code_share = round(100 * comp.code_cost / gen_cost, 1) if gen_cost else 0.0
-    test_pct = round(100 * comp.total_test / comp.total_added, 1) if comp.total_added else 0.0
 
     cols = st.columns(4)
-    cols[0].metric(
-        "Lines written (+)",
-        f"{comp.total_added:,}",
-        delta=f"−{comp.total_deleted:,} removed" if comp.total_deleted else None,
-        delta_color="off",
-    )
-    cols[1].metric("Files touched", f"{comp.total_files:,}")
-    cols[2].metric("Output that is tests", f"{test_pct:.0f}%")
+    cols[0].metric("Files touched", f"{comp.total_files:,}")
+    cols[1].metric("Lines written (+)", f"{comp.total_added:,}")
+    cols[2].metric("Tokens", f"{gen_tokens:,}", delta="generated output", delta_color="off")
     cols[3].metric(
         f"Generation cost ({comp.provider})",
         f"${gen_cost:,.2f}",
@@ -304,48 +378,31 @@ def _render_output_headline(comp: analytics.OutputComposition) -> None:
 
 
 def _render_output_section(comp: analytics.OutputComposition) -> None:
-    """The Axe-C output composition: prose/code headline + language drill."""
+    """The Axe-C output composition: KPI row + prose/code pie + language mix."""
     _render_output_headline(comp)
 
-    prose_code = _prose_vs_code_option(comp)
-    if prose_code is not None:
-        echarts.render(prose_code, key="comp_prose_vs_code", height="220px")
-        gen_cost = comp.prose_cost + comp.code_cost
-        st.caption(
-            f"Every output message is part **explanation** (its text) and part "
-            f"**code/tooling** (its tool calls). Of the **${gen_cost:,.2f}** spent "
-            f"generating output, here is the split. _Estimate:_ each prompt's real "
-            f"output cost is prorated by a local tokenizer's prose/code token weight."
-        )
-    else:
-        st.info("No generated-output tokens in range.")
-
-    st.subheader("Inside the code")
-    left, right = st.columns(2)
+    left, right = st.columns([2, 3])
     with left:
-        cost_lang = _cost_by_language_option(comp)
-        if cost_lang is not None:
-            echarts.render(cost_lang, key="comp_cost_by_language", height="420px")
+        pie = _prose_vs_code_pie(comp)
+        if pie is not None:
+            echarts.render(pie, key="comp_prose_vs_code", height="400px")
             st.caption(
-                f"The **${comp.code_cost:,.2f}** code half, attributed to each language by "
-                "line churn (`(other tooling)` = code tokens spent on Bash/Read/etc., no "
-                "file edited)."
+                "Output is part **explanation** (text) and part **code/tooling** (tool calls), "
+                "split by a local tokenizer's prose/code weight."
             )
         else:
-            st.info("No code spend to attribute to a language in range.")
+            st.info("No generated-output tokens in range.")
     with right:
         mix = _language_mix_option(comp)
         if mix is not None:
-            echarts.render(mix, key="comp_language_mix", height="420px")
+            echarts.render(mix, key="comp_language_mix", height="400px")
             st.caption(
-                f"Exact line diffs: {comp.total_added:,} lines added across "
-                f"{comp.total_files:,} files · {comp.total_test:,} in tests"
+                f"**Code side only** — prose isn't tracked by language. {comp.total_added:,} "
+                f"lines added · {comp.total_test:,} in tests"
                 + ("" if len(comp.languages) <= _MIX_TOP else f" · top {_MIX_TOP} shown")
             )
         else:
             st.info("No file-edit metrics in range (prose only, or read-only tools).")
-
-    st.caption("👉 The same breakdown on the command line: `prompt-analytics by-output`.")
 
 
 # ---------------------------------------------------------------------------
@@ -359,110 +416,183 @@ def _context_label(element: analytics.ContextElementCost) -> str:
     return f"{base} · {element.language}" if element.language != NO_LANGUAGE else base
 
 
-def _load_vs_rent_option(comp: analytics.ContextCost) -> dict[str, Any] | None:
-    """Two labeled bars: the one-off loading vs the rent of the whole context."""
-    load, rent = round(comp.load_cost, 2), round(comp.rent_cost, 2)
+def _load_vs_rent_pie(comp: analytics.ContextCost) -> dict[str, Any] | None:
+    """A donut of the one-off loading vs the rent of the whole context, in tokens.
+
+    Tokens, not dollars (the dollar figure lives in the KPI row): the headline is
+    the *size* of what is written once vs re-read every turn. Loading is a cache
+    write (purple), rent a cache read (green) -- the token palette makes the
+    mechanic legible.
+    """
+    load, rent = comp.load_tokens, comp.rent_read_tokens
     if load <= 0 and rent <= 0:
         return None
-    total = load + rent
-    names = ["Loading (one-off)", "Rent (every turn)"]
-    values = [load, rent]
-    colors = [_LOAD_COLOR, _RENT_COLOR]
-    labels = [f"${v:,.2f}  ·  {(100 * v / total if total else 0):.0f}%" for v in values]
-    return _hbar(
-        f"Context spend — loading vs rent ({comp.provider})", names, values, colors, labels
-    )
-
-
-def _context_breakdown_option(comp: analytics.ContextCost) -> dict[str, Any] | None:
-    """Horizontal stacked bar of the top context elements, split loading vs rent."""
-    elements = [e for e in comp.elements if e.total_cost > 0][:_CTX_TOP]
-    if not elements:
-        return None
-    names = [_context_label(e) for e in elements]
-    load = [round(e.load_cost, 4) for e in elements]
-    rent = [round(e.rent_cost, 4) for e in elements]
 
     c = echarts.colors()
     option = echarts.base_option()
     option["title"] = {
-        "text": "Top context cost — what lingers",
+        "text": "Context size — loading vs rent (tokens)",
         "left": 0,
         "textStyle": {"color": c["text"], "fontSize": 16, "fontWeight": 600},
     }
-    option["legend"] = {"bottom": 0, "textStyle": {"color": c["text"]}, "icon": "roundRect"}
-    option["grid"] = {"left": 8, "right": 80, "top": 48, "bottom": 40, "containLabel": True}
-    option["tooltip"].update({"trigger": "axis", "axisPointer": {"type": "shadow"}})
-    xaxis = echarts.value_axis(money=True, name="USD")
-    option["xAxis"] = xaxis
-    option["yAxis"] = echarts.category_axis(names, inverse=True)
+    option["legend"] = {"bottom": 0, "textStyle": {"color": c["text"]}, "icon": "circle"}
+    option["tooltip"] = {**option["tooltip"], "trigger": "item", "formatter": "{b}: {c} ({d}%)"}
     option["series"] = [
         {
-            "name": "Loading",
+            "type": "pie",
+            "radius": ["40%", "66%"],
+            "center": ["50%", "50%"],
+            "avoidLabelOverlap": True,
+            "itemStyle": {"borderColor": c["grid"], "borderWidth": 2},
+            "label": {"color": c["text"], "formatter": "{b}\n{d}%"},
+            "data": [
+                {
+                    "value": load,
+                    "name": "Loading (one-off)",
+                    "itemStyle": {"color": _LOAD_COLOR},
+                },
+                {
+                    "value": rent,
+                    "name": "Rent (every turn)",
+                    "itemStyle": {"color": _RENT_COLOR},
+                },
+            ],
+        }
+    ]
+    return option
+
+
+def _context_pareto_option(comp: analytics.ContextCost) -> dict[str, Any] | None:
+    """Pareto of the top context elements by token size: bars + cumulative share.
+
+    Tokens (not dollars): the bars are each element's total tokens (rent + load)
+    descending, the line the running cumulative share of *all* attributed context
+    tokens -- so the eye reads how few elements drive most of the context.
+    """
+    elements = [e for e in comp.elements if e.total_tokens > 0][:_CTX_TOP]
+    if not elements:
+        return None
+    names = [_context_label(e) for e in elements]
+    tokens = [e.total_tokens for e in elements]
+    total = comp.total_tokens or 1
+    cumulative: list[float] = []
+    running = 0
+    for t in tokens:
+        running += t
+        cumulative.append(round(100 * running / total, 1))
+
+    c = echarts.colors()
+    option = echarts.base_option()
+    option["title"] = {
+        "text": "Top context tokens — what lingers",
+        "left": 0,
+        "textStyle": {"color": c["text"], "fontSize": 16, "fontWeight": 600},
+    }
+    option["legend"] = {"show": False}
+    # ``containLabel`` makes ``bottom`` reach to the *outer edge of the rotated
+    # axis labels*, so a large bottom would leave that margin as empty canvas
+    # below them -- keep it small and let containLabel reserve the label height.
+    option["grid"] = {"left": 8, "right": 56, "top": 44, "bottom": 8, "containLabel": True}
+    option["tooltip"].update({"trigger": "axis", "axisPointer": {"type": "shadow"}})
+    xaxis = echarts.category_axis(names)
+    xaxis["axisLabel"] = {"color": c["text"], "rotate": 30, "interval": 0, "fontSize": 10}
+    option["xAxis"] = xaxis
+    # Tokens axis in millions (the raw counts run into the billions, so the long
+    # ``1,000,000,000`` labels collided with the axis name); ``{c}M`` stays compact.
+    left_y = echarts.value_axis(name="Tokens (millions)")
+    left_y["nameLocation"] = "middle"
+    left_y["nameGap"] = 52
+    left_y["axisLabel"] = {
+        "color": c["text"],
+        "formatter": echarts.js("function(v){return (v/1e6).toLocaleString()+'M';}"),
+    }
+    option["yAxis"] = [
+        left_y,
+        {
+            "type": "value",
+            "name": "Cumulative %",
+            "nameLocation": "middle",
+            "nameGap": 44,
+            "min": 0,
+            "max": 100,
+            "position": "right",
+            "axisLabel": {"color": c["text"], "formatter": "{value}%"},
+            "axisLine": {"lineStyle": {"color": c["axis"]}},
+            "splitLine": {"show": False},
+            "nameTextStyle": {"color": c["muted"]},
+        },
+    ]
+    option["series"] = [
+        {
+            "name": "Tokens",
             "type": "bar",
-            "stack": "ctx",
-            "data": load,
-            "itemStyle": {"color": _LOAD_COLOR},
+            "data": tokens,
+            "itemStyle": {"color": theme.PALETTE[5], "borderRadius": [4, 4, 0, 0]},
+            "yAxisIndex": 0,
         },
         {
-            "name": "Rent",
-            "type": "bar",
-            "stack": "ctx",
-            "data": rent,
-            "itemStyle": {"color": _RENT_COLOR, "borderRadius": [0, 4, 4, 0]},
+            "name": "Cumulative %",
+            "type": "line",
+            "data": cumulative,
+            "yAxisIndex": 1,
+            "smooth": False,
+            "symbol": "circle",
+            "symbolSize": 6,
+            "lineStyle": {"color": theme.PALETTE[0], "width": 2},
+            "itemStyle": {"color": theme.PALETTE[0]},
         },
     ]
     return option
 
 
+def _top_context_source(comp: analytics.ContextCost) -> str | None:
+    """The context source (conversation / files / …) with the highest cost."""
+    by_source: dict[str, float] = {}
+    for e in comp.elements:
+        by_source[e.source] = by_source.get(e.source, 0.0) + e.total_cost
+    if not by_source:
+        return None
+    return max(by_source.items(), key=lambda kv: kv[1])[0]
+
+
 def _render_context_section(comp: analytics.ContextCost) -> None:
-    """The Axe-D context cost: loading-vs-rent headline + top-elements drill."""
+    """The Axe-D context cost: KPI row + loading-vs-rent pie + token Pareto."""
     total = comp.total_cost
     rent_share = round(100 * comp.rent_cost / total, 1) if total else 0.0
-    unattr_share = round(100 * comp.unattributed_cost / total, 1) if total else 0.0
+    top_source = _top_context_source(comp)
+    top_source_label = _CTX_LABELS.get(top_source, top_source) if top_source else "—"
 
     cols = st.columns(4)
-    cols[0].metric(f"Context cost ({comp.provider})", f"${total:,.2f}")
-    cols[1].metric(
-        "Rent (re-read each turn)",
-        f"${comp.rent_cost:,.2f}",
-        delta=f"{rent_share:.0f}% of cache",
-        delta_color="off",
-    )
-    cols[2].metric("Loading (one-off)", f"${comp.load_cost:,.2f}")
-    cols[3].metric(
-        "Unattributed",
-        f"${comp.unattributed_cost:,.2f}",
-        delta=f"{unattr_share:.0f}% of total",
-        delta_color="off",
-    )
+    cols[0].metric("Context tokens", f"{comp.total_tokens:,}")
+    cols[1].metric("Rent share", f"{rent_share:.0f}%", delta="of context cost", delta_color="off")
+    cols[2].metric("Top source", str(top_source_label))
+    cols[3].metric(f"Context cost ({comp.provider})", f"${total:,.2f}")
 
-    headline = _load_vs_rent_option(comp)
-    if headline is not None:
-        echarts.render(headline, key="comp_load_vs_rent", height="220px")
-        st.caption(
-            f"Context is cached once (**loading**, a cache *write*) then paid again every "
-            f"turn it stays (**rent**, a cache *read* = size × turns of presence). "
-            f"**{rent_share:.0f}%** of the cache bill is rent — the cost of context that "
-            f"lingers, which `/compact` and a leaner CLAUDE.md cut."
-        )
-
-    breakdown = _context_breakdown_option(comp)
-    if breakdown is not None:
-        echarts.render(breakdown, key="comp_context_breakdown", height="420px")
-        if comp.elements:
-            top = comp.elements[0]
+    left, right = st.columns([2, 3])
+    with left:
+        pie = _load_vs_rent_pie(comp)
+        if pie is not None:
+            echarts.render(pie, key="comp_load_vs_rent", height="400px")
             st.caption(
-                f"Biggest context cost: **{_context_label(top)}** at ${top.total_cost:,.2f} "
-                f"(${top.load_cost:,.2f} load + ${top.rent_cost:,.2f} rent). The attributed "
-                f"total reconciles to the billed cache cost to the dollar; the "
-                f"{unattr_share:.0f}% unattributed is cache on turns with no measured element "
-                f"(post-compaction summaries — the parentUuid ≈ API-context caveat)."
+                f"**Loading** is the one-off cache *write*; **rent** the cache *read* paid "
+                f"every turn the context lingers. Rent is **{rent_share:.0f}%** of the cache "
+                f"bill — the lingering-context cost you cut by compacting (`/compact`) and "
+                f"keeping CLAUDE.md short."
             )
-    else:
-        st.info("No per-element context cost in range.")
-
-    st.caption("👉 The same breakdown on the command line: `prompt-analytics by-context`.")
+        else:
+            st.info("No context tokens in range.")
+    with right:
+        pareto = _context_pareto_option(comp)
+        if pareto is not None:
+            echarts.render(pareto, key="comp_context_pareto", height="400px")
+            if comp.elements:
+                top = comp.elements[0]
+                st.caption(
+                    f"Biggest: **{_context_label(top)}** at {top.total_tokens:,} tokens "
+                    f"(${top.total_cost:,.2f}). A few elements usually drive most of the context."
+                )
+        else:
+            st.info("No per-element context size in range.")
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +674,7 @@ def _render_files_section(ds: analytics.Dataset, provider: str) -> None:
         f"**context cost** they drove (loading + rent). {len(df):,} files — {edited:,} edited, "
         f"**{read_only:,} read but never edited** (pure context cost, the first candidates to "
         f"keep out of context). Sort by any column; metrics only — relative paths, never "
-        f"content. 👉 On the command line: `prompt-analytics by-file`."
+        f"content."
     )
 
 
@@ -742,7 +872,7 @@ def _render_tasks_section(graph: analytics.TaskGraph) -> None:
             f"dominant category); the **prompts** that served it orbit around it. Top "
             f"{min(len(shown), _TASK_TOP)} of {graph.total_tasks:,} tasks shown — pick one above "
             f"to zoom into its prompts. Drag nodes, scroll to zoom, toggle a category in the "
-            f"legend. 👉 On the command line: `prompt-analytics by-task`."
+            f"legend."
         )
     else:
         focused = next(t for t in shown if t.task_id == focus)
@@ -794,9 +924,7 @@ def _render_tasks_comparison(ds: analytics.Dataset, provider: str, pivot: str) -
     st.caption(
         "Each **task** is a centre of gravity (size = cost, colour = dominant category), its "
         "**prompts** orbiting as satellites — shown before vs after your switch date. The "
-        "cost-per-task figures normalize for how much work each side carried. "
-        "👉 On the command line: `prompt-analytics by-task` per range, or "
-        f"`prompt-analytics impact --pivot {pivot}`."
+        "cost-per-task figures normalize for how much work each side carried."
     )
 
 
@@ -857,9 +985,9 @@ def main() -> None:
 
     theme.section(
         "Input — what you asked for",
-        "The spend split of your prompts, by category (full detail on the Prompts tab).",
+        "The spend split of your prompts, by category and by length.",
     )
-    _render_input_section(ds, primary)
+    _render_input_section(ds, primary, prompts)
 
     theme.section(
         "Output — what Claude produced",

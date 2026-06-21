@@ -59,8 +59,14 @@ XF_CATEGORIES = "xf_categories"
 # sidebar twin (it is an *aggregate* of prompts, not a prompt column), so it is a
 # drill-only dimension applied by :func:`apply_filters` after the row masks.
 XF_PROMPT_COUNT = "xf_prompt_count"
+# Prompt-length drill: clicking a bar on the Composition / Input char-count
+# histogram narrows the dashboard to prompts whose ``char_count`` falls in that
+# bucket. Like ``XF_PROMPT_COUNT`` it has no sidebar twin, but it is a *row*
+# dimension (a column of ``prompts``), so it is applied as a plain mask. Stored
+# as a ``[lo, hi]`` pair (``hi`` may be ``None`` for the open-ended top bucket).
+XF_CHAR_BUCKET = "xf_char_bucket"
 
-_XF_KEYS = (XF_DATE_RANGE, XF_MODELS, XF_PROJECTS, XF_CATEGORIES, XF_PROMPT_COUNT)
+_XF_KEYS = (XF_DATE_RANGE, XF_MODELS, XF_PROJECTS, XF_CATEGORIES, XF_PROMPT_COUNT, XF_CHAR_BUCKET)
 
 # The Explorer's local day / session focus, also cleared by Reset (a treemap /
 # top-10 tile click sets ``drill_session``; ``_xf_treemap_applied`` is the
@@ -195,6 +201,7 @@ def get_filter_state() -> dict[str, Any]:
         "xf_projects": st.session_state.get(XF_PROJECTS),
         "xf_categories": st.session_state.get(XF_CATEGORIES),
         "xf_prompt_count": st.session_state.get(XF_PROMPT_COUNT),
+        "xf_char_bucket": st.session_state.get(XF_CHAR_BUCKET),
     }
 
 
@@ -313,6 +320,16 @@ def apply_filters(
         if xf_categories and "category" in prompts.columns:
             mask &= prompts["category"].isin(xf_categories)
         mask &= _date_mask(prompts, state.get("xf_date_range"))
+
+        # Prompt-length drill (a row dimension): keep prompts whose char_count
+        # falls in the clicked histogram bucket ``[lo, hi)`` (``hi`` None = open).
+        xf_char = state.get("xf_char_bucket")
+        if xf_char and "char_count" in prompts.columns:
+            lo, hi = xf_char[0], xf_char[1]
+            cc = pd.to_numeric(prompts["char_count"], errors="coerce")
+            mask &= cc >= lo
+            if hi is not None:
+                mask &= cc < hi
 
         prompts = prompts[mask]
 
@@ -581,6 +598,11 @@ def _xf_parts() -> list[str]:
         parts.append(str(c))
     for n in state.get("xf_prompt_count") or []:
         parts.append(f"{n} prompt/session" if n == 1 else f"{n} prompts/session")
+
+    char = state.get("xf_char_bucket")
+    if char:
+        lo, hi = char[0], char[1]
+        parts.append(f"≥{lo:,} chars" if hi is None else f"{lo:,}–{hi:,} chars")
 
     xf_date = state.get("xf_date_range")
     if xf_date:
