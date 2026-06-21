@@ -4,9 +4,9 @@ The dashboard has a backbone -- **input** (what you asked), **output** (what
 Claude produced), **context** (what fills the cache it re-reads). This page is
 the narrated home of that spine, read as one whole: three sections in cost order
 (input -> output -> context), each with the same shape (a KPI row, a headline
-chart, a drill), and finally the **Tasks** graph that lifts the spine to the unit
-of work. The per-file footprint (edits crossed with reads + context cost) lives
-on its own **File Explorer** page now (with a drill), not here.
+chart, a drill), and finally the **Files** graph that lifts the spine to what the
+work actually touched. The per-file search + drill lives on its own **File
+Explorer** page (a table); this page is the overview constellation.
 
 * **Input** (categories) -- the cost-by-category breakdown of what you asked, so
   the spine starts here too (DASH1; this absorbed the old Prompts tab).
@@ -16,14 +16,15 @@ on its own **File Explorer** page now (with a drill), not here.
 * **Context** (Axe D) -- what fills the cached, re-read context, split into the
   one-off **loading** and the **rent** paid every turn it lingers; the attributed
   total reconciles to the billed cache cost to the dollar.
-* **Tasks** (Axe B2 / DASH5) -- the cost graph: tasks as centres of gravity
-  (size = cost, hue = dominant category) with their prompts orbiting as
-  satellites, drillable per task via an ECharts force layout. The unit of work,
-  the most telling level of the spine.
+* **Files** (Axe C+D / DASH5) -- the cost graph: files as centres of gravity
+  (size = context cost, hue = language) with the prompts that edited them orbiting
+  as satellites, drillable per file via an ECharts force layout. A real, named,
+  every-user identity -- it replaced the task constellation, whose inferred task
+  names read as noise once measured on real data.
 
 Every section is a *view* over the same analytics the CLI prints
 (:func:`analytics.by_category` / :func:`output_composition` / :func:`context_cost`
-/ :func:`task_graph`), narrowed to the global sidebar / chart-click selection
+/ :func:`file_footprint`), narrowed to the global sidebar / chart-click selection
 via :func:`analytics.filter_prompt_ids` so it honours the same filter as every
 other tab. Read-only: language is not a global filter dimension, so the charts
 emit no cross-filter. Metrics only -- no source code is ever read here.
@@ -604,22 +605,35 @@ def _render_context_section(comp: analytics.ContextCost) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tasks section (Axe B2 / DASH5) -- the cost graph: tasks as centres, prompts
-# as satellites, the most telling level of the "cost by content" spine.
+# Files section (Axe C+D / DASH5) -- the cost graph: files as centres of gravity
+# (real, named, every-user identity), the prompts that edited them orbiting as
+# satellites. The most telling, never-random level of the "cost by content" spine
+# (the task constellation was retired: inferred task names read as noise).
 # ---------------------------------------------------------------------------
 
-# How many task centres the headline graph shows before the long tail is hidden
+# How many file centres the headline graph shows before the long tail is hidden
 # (a force layout stays legible at a few dozen nodes, not hundreds).
-_TASK_TOP = 40
-# Task-node radius band (px), mapped from cost by a sqrt scale so area ~ cost.
-_TASK_MIN_SIZE, _TASK_MAX_SIZE = 16.0, 56.0
-# Prompt-satellite radius band (px), much smaller so centres read as centres.
+_FILE_TOP = 40
+# File-node radius band (px), mapped from cost by a sqrt scale so area ~ cost.
+_FILE_MIN_SIZE, _FILE_MAX_SIZE = 16.0, 56.0
+# Edit-satellite radius band (px), much smaller so centres read as centres.
 _SAT_MIN_SIZE, _SAT_MAX_SIZE = 6.0, 16.0
 
 
-def _task_color(category: str) -> str:
-    """Category colour for a task/prompt node (shared across category charts)."""
-    return theme.CATEGORY_COLORS.get(category, theme.CATEGORY_COLORS["(uncategorized)"])
+def _project_options(prompts: pd.DataFrame) -> list[str]:
+    """Projects present in range, busiest first (the file-graph scope choices).
+
+    A constellation mixing several projects is just noise (unrelated trees,
+    colliding file names); the page shows **one project at a time**. Order by
+    prompt volume so the default lands on the busiest project.
+    """
+    if "project" not in prompts.columns:
+        return []
+    values = prompts["project"].dropna().astype(str)
+    values = values[values != ""]
+    if values.empty:
+        return []
+    return [str(p) for p in values.value_counts().index.tolist()]
 
 
 def _cat_label(category: str) -> str:
@@ -627,86 +641,100 @@ def _cat_label(category: str) -> str:
     return category if category.startswith("(") else category.title()
 
 
+def _lang_label(language: str) -> str:
+    """Human label for a language (the no-language bucket reads as a dash)."""
+    return "—" if language == NO_LANGUAGE else language
+
+
 def _scaled_size(value: float, vmax: float, lo: float, hi: float) -> float:
-    """Map a cost to a radius on a sqrt scale (area ~ cost), clamped to [lo, hi]."""
+    """Map a magnitude to a radius on a sqrt scale (area ~ value), clamped to [lo, hi]."""
     if vmax <= 0:
         return lo
     return float(round(lo + (hi - lo) * (max(value, 0.0) / vmax) ** 0.5, 1))
 
 
-def _task_graph_option(
-    graph: analytics.TaskGraph, focus: str | None = None
+def _file_graph_option(
+    graph: analytics.FileGraph, focus: str | None = None
 ) -> dict[str, Any] | None:
-    """ECharts force-layout graph: task centres (size = cost, hue = category) with
-    their prompt satellites; ``focus`` narrows it to a single task and its prompts.
+    """ECharts force-layout graph: file centres (size = context cost, hue = language)
+    with the prompts that edited them as satellites; ``focus`` narrows it to one file.
 
-    Colour is driven by ``categories`` (the legend), so toggling a category in the
-    legend dims every task and prompt of that intent at once. Tasks carry a label
-    and a rich tooltip; satellites stay quiet (colour + hover only).
+    Colour is driven by ``language`` (the legend), so toggling a language in the
+    legend dims every file of that language and its edits at once. Files carry a
+    label and a rich tooltip; edit-satellites stay quiet (colour + hover only). A
+    file with no satellite is read-only -- pure context rent.
     """
-    tasks = [t for t in graph.tasks if focus is None or t.task_id == focus]
-    if not tasks:
+    files = [f for f in graph.files if focus is None or f.path == focus]
+    if not files:
         return None
-    kept = {t.task_id for t in tasks}
-    sats = [s for s in graph.satellites if s.task_id in kept]
+    kept = {f.path for f in files}
+    sats = [s for s in graph.satellites if s.path in kept]
 
-    # Stable category -> legend index, in cost order so the legend reads top-down.
-    cats: list[str] = []
-    for cat in [t.category for t in tasks] + [s.category for s in sats]:
-        if cat not in cats:
-            cats.append(cat)
-    cat_index = {cat: i for i, cat in enumerate(cats)}
+    # Stable language -> legend index, in cost order so the legend reads top-down.
+    langs: list[str] = []
+    for lang in [f.language for f in files]:
+        if lang not in langs:
+            langs.append(lang)
+    lang_index = {lang: i for i, lang in enumerate(langs)}
+    color_of = theme.language_color_map(langs)
+    lang_of_path = {f.path: f.language for f in files}
 
-    cost_max = max((t.cost for t in tasks), default=0.0)
-    sat_max = max((s.cost for s in sats), default=0.0)
-    # Focusing one task zooms in: give its centre and prompts more room.
-    task_lo, task_hi = (_TASK_MIN_SIZE, _TASK_MAX_SIZE) if focus is None else (40.0, 90.0)
+    cost_max = max((f.cost for f in files), default=0.0)
+    churn_max = max((float(s.churn) for s in sats), default=0.0)
+    # Focusing one file zooms in: give its centre and edits more room.
+    file_lo, file_hi = (_FILE_MIN_SIZE, _FILE_MAX_SIZE) if focus is None else (40.0, 90.0)
     sat_lo, sat_hi = (_SAT_MIN_SIZE, _SAT_MAX_SIZE) if focus is None else (12.0, 30.0)
 
     nodes: list[dict[str, Any]] = []
-    for t in tasks:
-        label = t.name if len(t.name) <= 28 else t.name[:27] + "…"
+    for f in files:
+        short = f.path.rsplit("/", 1)[-1]
+        label = short if len(short) <= 26 else short[:25] + "…"
         nodes.append(
             {
-                "id": t.task_id,
-                "name": t.name,
-                "kind": "task",
-                "category": cat_index[t.category],
-                "symbolSize": _scaled_size(t.cost, cost_max, task_lo, task_hi),
-                "value": round(t.cost, 2),
-                "cost": round(t.cost, 2),
-                "prompts": t.prompts,
-                "origin": t.origin,
-                "ctx": t.context_pct,
-                "itemStyle": {"color": _task_color(t.category), "borderColor": "#0B1220"},
+                "id": f.path,
+                "name": f.path,
+                "kind": "file",
+                "category": lang_index[f.language],
+                "symbolSize": _scaled_size(f.cost, cost_max, file_lo, file_hi),
+                "value": round(f.cost, 2),
+                "cost": round(f.cost, 2),
+                "lang": _lang_label(f.language),
+                "fkind": f.kind,
+                "edits": f.edits,
+                "added": f.lines_added,
+                "deleted": f.lines_deleted,
+                "reads": f.reads,
+                "edited": f.edited,
+                "itemStyle": {"color": color_of[f.language], "borderColor": "#0B1220"},
                 "label": {"show": True, "formatter": label},
             }
         )
     for s in sats:
+        lang = lang_of_path.get(s.path, NO_LANGUAGE)
         nodes.append(
             {
-                "id": s.prompt_id,
-                "name": s.category,
-                "kind": "prompt",
-                "category": cat_index[s.category],
-                "symbolSize": _scaled_size(s.cost, sat_max, sat_lo, sat_hi),
-                "value": round(s.cost, 2),
-                "cost": round(s.cost, 2),
-                "itemStyle": {"color": _task_color(s.category), "opacity": 0.85},
+                "id": f"{s.prompt_id}::{s.path}",
+                "name": "edit",
+                "kind": "edit",
+                "category": lang_index.get(lang, 0),
+                "symbolSize": _scaled_size(float(s.churn), churn_max, sat_lo, sat_hi),
+                "cat": _cat_label(s.category),
+                "churn": s.churn,
+                "itemStyle": {"color": color_of[lang], "opacity": 0.8},
                 "label": {"show": False},
             }
         )
-    links = [{"source": s.task_id, "target": s.prompt_id} for s in sats]
+    links = [{"source": s.path, "target": f"{s.prompt_id}::{s.path}"} for s in sats]
 
     c = echarts.colors()
     option = echarts.base_option()
     option["title"] = {
-        "text": "Cost by task — centres of gravity",
+        "text": "Cost by file — what the work touched",
         "left": 0,
         "textStyle": {"color": c["text"], "fontSize": 16, "fontWeight": 600},
     }
     option["legend"] = {
-        "data": [_cat_label(cat) for cat in cats],
+        "data": [_lang_label(lang) for lang in langs],
         "bottom": 0,
         "textStyle": {"color": c["text"]},
         "icon": "circle",
@@ -717,10 +745,11 @@ def _task_graph_option(
         "trigger": "item",
         "formatter": echarts.js(
             "function(p){if(p.dataType==='edge'){return '';}var d=p.data;"
-            "if(d.kind==='task'){return '<b>'+d.name+'</b><br/>'+d.origin+' task"
-            " · '+d.prompts+' prompts<br/>$'+Number(d.cost).toFixed(2)+' · '"
-            "+Number(d.ctx).toFixed(0)+'% context';}"
-            "return 'prompt · $'+Number(d.cost).toFixed(2);}"
+            "if(d.kind==='file'){var ro=d.edited?'':' · read-only';"
+            "return '<b>'+d.name+'</b><br/>'+d.lang+' · '+d.fkind+ro+'<br/>$'"
+            "+Number(d.cost).toFixed(2)+' context · '+d.edits+' edits (+'+d.added"
+            "+'/-'+d.deleted+') · '+d.reads+' reads';}"
+            "return 'edit · '+d.cat+' · '+d.churn+' lines';}"
         ),
     }
     option["series"] = [
@@ -730,7 +759,8 @@ def _task_graph_option(
             "roam": True,
             "draggable": True,
             "categories": [
-                {"name": _cat_label(cat), "itemStyle": {"color": _task_color(cat)}} for cat in cats
+                {"name": _lang_label(lang), "itemStyle": {"color": color_of[lang]}}
+                for lang in langs
             ],
             "force": {
                 "repulsion": 140 if focus is None else 320,
@@ -747,109 +777,127 @@ def _task_graph_option(
     return option
 
 
-def _render_tasks_section(graph: analytics.TaskGraph) -> None:
-    """The Axe-B2 task graph: KPI row, a focus picker, then the force-layout graph."""
-    shown = graph.tasks
-    top_task = shown[0] if shown else None
+def _render_files_section(graph: analytics.FileGraph, project: str | None) -> None:
+    """The file cost-graph: KPI row, a focus picker, then the force-layout graph."""
+    shown = graph.files
 
     cols = st.columns(4)
-    cols[0].metric("Tasks", f"{graph.total_tasks:,}")
-    cols[1].metric(
-        "From the TodoWrite spine",
-        f"{graph.todo_tasks:,}",
-        delta=f"{graph.total_tasks - graph.todo_tasks:,} inferred",
-        delta_color="off",
-    )
+    cols[0].metric("Files touched", f"{graph.total_files:,}")
+    cols[1].metric("Edited", f"{graph.edited_files:,}", delta="written to", delta_color="off")
     cols[2].metric(
-        "Most expensive task",
-        f"${top_task.cost:,.2f}" if top_task else "—",
-        delta=(top_task.name[:22] if top_task else None),
+        "Read-only",
+        f"{graph.readonly_files:,}",
+        delta="pure context rent",
         delta_color="off",
     )
-    cols[3].metric(
-        f"Task cost ({graph.provider})",
-        f"${graph.grand_total:,.2f}",
-        delta=(
-            f"{round(100 * graph.context_total / graph.grand_total):.0f}% context"
-            if graph.grand_total
-            else None
-        ),
-        delta_color="off",
-    )
+    cols[3].metric(f"Context cost ({graph.provider})", f"${graph.context_total:,.2f}")
 
-    # Drill by task: the headline shows the top centres, the picker zooms one in.
-    labels = {f"{t.name[:48]}  ·  ${t.cost:,.2f}": t.task_id for t in shown}
+    # Drill by file: the headline shows the top centres, the picker zooms one in.
+    labels = {f"{f.path[:52]}  ·  ${f.cost:,.2f}": f.path for f in shown}
     choice = st.selectbox(
-        "Focus on a task",
-        ["All tasks (top centres)", *labels.keys()],
-        key="comp_task_focus",
+        "Focus on a file",
+        ["All files (top centres)", *labels.keys()],
+        key="comp_file_focus",
         label_visibility="collapsed",
     )
     focus = labels.get(choice)
 
-    option = _task_graph_option(graph, focus)
+    option = _file_graph_option(graph, focus)
     if option is not None:
-        echarts.render(option, key="comp_task_graph", height="560px")
+        echarts.render(option, key="comp_file_graph", height="560px")
 
     if focus is None:
+        scope = f"**{project}** · " if project else ""
         st.caption(
-            f"Each **task** is a centre of gravity (its size is its cost, its colour the "
-            f"dominant category); the **prompts** that served it orbit around it. Top "
-            f"{min(len(shown), _TASK_TOP)} of {graph.total_tasks:,} tasks shown — pick one above "
-            f"to zoom into its prompts. Drag nodes, scroll to zoom, toggle a category in the "
-            f"legend."
+            f"{scope}{graph.total_files:,} files, **${graph.context_total:,.2f}** in context "
+            f"cost (reconciled — the one-off load + the rent each file paid while cached). Each "
+            f"**file** is a centre sized by that cost and coloured by language; the **prompts "
+            f"that edited it** orbit as satellites (hover for intent + lines). A lone centre "
+            f"with no satellite is **read-only** — pure rent, the first thing to keep out of "
+            f"context. Top {min(len(shown), _FILE_TOP)} shown — pick one above to zoom in, drag "
+            f"nodes, scroll to zoom, toggle a language in the legend."
         )
     else:
-        focused = next(t for t in shown if t.task_id == focus)
+        f0 = next(f for f in shown if f.path == focus)
+        churn = (
+            f"{f0.edits:,} edits (+{f0.lines_added:,}/−{f0.lines_deleted:,})"
+            if f0.edited
+            else "read-only"
+        )
         st.caption(
-            f"**{focused.name}** — {focused.origin} task, {focused.prompts:,} prompts, "
-            f"**${focused.cost:,.2f}** ({focused.context_pct:.0f}% context), dominant category "
-            f"_{focused.category}_. Each satellite is one prompt, coloured by its own intent."
+            f"**{f0.path}** — {_lang_label(f0.language)} · {f0.kind}, **${f0.cost:,.2f}** "
+            f"context, {churn}, {f0.reads:,} reads. Each satellite is a prompt that edited it, "
+            f"sized by the lines it changed."
         )
 
 
-def _render_task_side(graph: analytics.TaskGraph, *, side: str, pivot: str, key: str) -> None:
-    """One side (before / after) of the task graph in compare mode: KPI + force graph."""
+def _render_file_side(graph: analytics.FileGraph, *, side: str, pivot: str, key: str) -> None:
+    """One side (before / after) of the file graph in compare mode: KPI + force graph."""
     when = f"before {pivot}" if side == "Before" else f"from {pivot}"
     st.markdown(f"**{side}** · _{when}_")
     if not graph.has_data:
-        st.info("No task data on this side of the pivot.")
+        st.info("No file data on this side of the pivot.")
         return
     cols = st.columns(2)
-    cols[0].metric("Tasks", f"{graph.total_tasks:,}")
-    cols[1].metric(
-        f"Task cost ({graph.provider})",
-        f"${graph.grand_total:,.2f}",
-        delta=(
-            f"${graph.grand_total / graph.total_tasks:,.2f}/task" if graph.total_tasks else None
-        ),
-        delta_color="off",
-    )
-    option = _task_graph_option(graph)
+    cols[0].metric("Files touched", f"{graph.total_files:,}")
+    cols[1].metric(f"Context cost ({graph.provider})", f"${graph.context_total:,.2f}")
+    option = _file_graph_option(graph)
     if option is not None:
         echarts.render(option, key=key, height="460px")
 
 
-def _render_tasks_comparison(ds: analytics.Dataset, provider: str, pivot: str) -> None:
-    """Before/after of the B2 task graph (DASH2): the constellation on each side.
+def _render_files(
+    ds: analytics.Dataset, provider: str, prompts: pd.DataFrame, pivot: str | None
+) -> None:
+    """Files section: scope to a single project, then draw the graph (or compare).
 
-    The cost-per-task headline above the graphs is the workload-normalized lens;
-    the two force layouts show how the constellation of work itself shifted across
-    the switch date.
+    The **project filter** sits above the per-file focus: a constellation mixing
+    several project trees is noise, so one project at a time keeps it legible. The
+    chosen project narrows the dataset (sessions, edits *and* the session-grained
+    context cost via :func:`analytics.filter_project`), so the KPIs, the reconciled
+    context cost and the graph all describe that project only.
+    """
+    project: str | None = None
+    scoped = ds
+    options = _project_options(prompts)
+    if options:
+        project = st.selectbox(
+            "Project",
+            options,
+            key="comp_file_project",
+            help="Files are scoped per project — the graph shows one project at a time.",
+        )
+        scoped = analytics.filter_project(ds, project)
+
+    if pivot is not None:
+        _render_files_comparison(scoped, provider, pivot)
+        return
+    graph = analytics.file_graph(scoped, provider, top=_FILE_TOP)
+    if graph.has_data:
+        _render_files_section(graph, project)
+    else:
+        st.info("No file data for this project in the current range.")
+
+
+def _render_files_comparison(ds: analytics.Dataset, provider: str, pivot: str) -> None:
+    """Before/after of the file cost-graph (DASH2): the constellation on each side.
+
+    The context-cost headline above each graph is the lens; the two force layouts
+    show how the files the work touched shifted across the switch date.
     """
     before_ds, after_ds = analytics.split_on_pivot(ds, pivot)
-    before = analytics.task_graph(before_ds, provider, top=_TASK_TOP)
-    after = analytics.task_graph(after_ds, provider, top=_TASK_TOP)
+    before = analytics.file_graph(before_ds, provider, top=_FILE_TOP)
+    after = analytics.file_graph(after_ds, provider, top=_FILE_TOP)
 
     left, right = st.columns(2)
     with left:
-        _render_task_side(before, side="Before", pivot=pivot, key="comp_task_graph_before")
+        _render_file_side(before, side="Before", pivot=pivot, key="comp_file_graph_before")
     with right:
-        _render_task_side(after, side="After", pivot=pivot, key="comp_task_graph_after")
+        _render_file_side(after, side="After", pivot=pivot, key="comp_file_graph_after")
     st.caption(
-        "Each **task** is a centre of gravity (size = cost, colour = dominant category), its "
-        "**prompts** orbiting as satellites — shown before vs after your switch date. The "
-        "cost-per-task figures normalize for how much work each side carried."
+        "Each **file** is a centre sized by its context cost and coloured by language, the "
+        "**prompts that edited it** orbiting as satellites — shown before vs after your switch "
+        "date."
     )
 
 
@@ -859,13 +907,13 @@ def _render_tasks_comparison(ds: analytics.Dataset, provider: str, pivot: str) -
 
 
 def main() -> None:
-    """Render the Composition page: input -> output -> context, then Tasks."""
+    """Render the Composition page: input -> output -> context, then Files."""
     st.title("Composition")
     st.caption(
         "Where your cost goes, **by content** — read as one spine: **input** (what you "
         "ask) → **output** (what Claude produces) → **context** (what fills the cache it "
-        "re-reads), then **tasks** (the unit of work). Per-file detail lives on the "
-        "**File Explorer** page."
+        "re-reads), then **files** (what the work touched). Per-file search + drill lives "
+        "on the **File Explorer** page."
     )
 
     frames_all = data.load_all()
@@ -934,22 +982,18 @@ def main() -> None:
         st.info("No context-composition data in range.")
 
     theme.section(
-        "Tasks — the cost graph",
-        "The unit of work, not the prompt: tasks as centres of gravity (size = cost, "
-        "colour = dominant category), the prompts that served each one orbiting around it.",
+        "Files — the cost graph",
+        "What the work touched: files as centres of gravity (size = context cost, "
+        "colour = language), the prompts that edited each one orbiting around it.",
     )
-    if pivot is not None:
-        # Compare mode: the constellation before vs after the switch date.
-        _render_tasks_comparison(ds, primary, pivot)
+    if not ds.output_files and not ds.context_cost:
+        st.info(
+            "No file data yet. The per-file footprint (edits crossed with context cost) ships "
+            "with the latest extractor — re-run `prompt-analytics extract`, then revisit this "
+            "page."
+        )
     else:
-        graph = analytics.task_graph(ds, primary, top=_TASK_TOP)
-        if graph.has_data:
-            _render_tasks_section(graph)
-        else:
-            st.info(
-                "No task data yet. Task attribution (the TodoWrite spine + inference) ships with "
-                "the latest extractor — re-run `prompt-analytics extract`, then revisit this page."
-            )
+        _render_files(ds, primary, prompts, pivot)
 
 
 # Render only under a real Streamlit server: streamlit-echarts cannot register

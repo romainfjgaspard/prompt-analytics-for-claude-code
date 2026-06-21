@@ -867,6 +867,54 @@ def test_file_footprint_empty_dataset_hints_to_extract():
 
 
 # ---------------------------------------------------------------------------
+# file_graph: the file cost-graph (Axe C+D / DASH5), centres + edit satellites.
+# ---------------------------------------------------------------------------
+
+
+def test_file_graph_centres_satellites_and_totals():
+    graph = analytics.file_graph(_footprint_ds(), "anthropic")
+
+    # Two file centres, sorted by context cost (app.py's rent puts it first).
+    assert [f.path for f in graph.files] == ["src/app.py", "config.json"]
+    app = graph.files[0]
+    assert app.language == "Python" and app.kind == "code"
+    assert app.edited and app.edits == 3 and app.lines_added == 120 and app.reads == 4
+    assert app.cost == pytest.approx(app.cost, abs=1e-9) and app.cost > 0
+    # The read-only manifest is a lone centre -- pure rent, no edit satellite.
+    cfg = graph.files[1]
+    assert not cfg.edited and cfg.reads == 2
+
+    # Only the edited file has a satellite (its editing prompt), churn = +added/-deleted.
+    assert [(s.prompt_id, s.path) for s in graph.satellites] == [("p1", "src/app.py")]
+    assert graph.satellites[0].churn == 160  # 120 + 40
+    assert graph.satellites[0].category == "(uncategorized)"  # no categories in fixture
+
+    # Population counts + reconciled context total.
+    assert graph.total_files == 2
+    assert graph.edited_files == 1
+    assert graph.readonly_files == 1
+    assert graph.context_total == pytest.approx(app.cost + cfg.cost, abs=1e-6)
+    assert graph.has_data
+
+
+def test_file_graph_top_limits_centres_and_their_satellites():
+    graph = analytics.file_graph(_footprint_ds(), "anthropic", top=1)
+    assert [f.path for f in graph.files] == ["src/app.py"]
+    # Only the kept file's edits orbit; the dropped file would not anyway (read-only).
+    assert {s.path for s in graph.satellites} == {"src/app.py"}
+    # The population count still reflects every file, not just the shown slice.
+    assert graph.total_files == 2
+
+
+def test_file_graph_empty_dataset_has_no_data():
+    empty = Dataset(sessions=[], prompts=[], tokens=[], categories={}, source="test data")
+    graph = analytics.file_graph(empty, "anthropic")
+    assert graph.files == []
+    assert graph.satellites == []
+    assert not graph.has_data
+
+
+# ---------------------------------------------------------------------------
 # by_context: context cost over time (Axe D, D2).
 # ---------------------------------------------------------------------------
 
@@ -1086,6 +1134,15 @@ def _task_ds() -> Dataset:
     )
 
 
+def test_filter_prompt_ids_narrows_the_task_dimension():
+    """A task whose every prompt is filtered out drops from the dimension, so the
+    task count / averages describe the surviving scope (not the whole corpus)."""
+    kept = analytics.filter_prompt_ids(_task_ds(), {"p3"})
+    assert {t["task_id"] for t in kept.tasks} == {"s1:i01"}
+    assert {row["prompt_id"] for row in kept.task_prompts} == {"p3"}
+    assert analytics.task_graph(kept, "anthropic").total_tasks == 1
+
+
 def test_by_task_cost_split_context_and_dominant_category():
     rows = {r["task"]: r for r in analytics.by_task(_task_ds(), "anthropic").rows}
 
@@ -1196,6 +1253,47 @@ def test_task_graph_uncategorized_without_categories():
     graph = analytics.task_graph(ds, "anthropic")
     assert all(t.category == "(uncategorized)" for t in graph.tasks)
     assert all(s.category == "(uncategorized)" for s in graph.satellites)
+
+
+def test_task_graph_dominant_category_is_cost_weighted_not_counted():
+    """The centre's colour follows the *cost*, so cheap trailers can't outvote the
+    one expensive prompt where the real work (and money) actually went."""
+    tokens = [
+        _token("s1", "p1", OPUS, "output", 400_000),  # $10.00 implementation
+        _token("s1", "p2", OPUS, "input", 1_000),  # ~$0.005 ops
+        _token("s1", "p3", OPUS, "input", 1_000),  # ~$0.005 ops
+        _token("s1", "p4", OPUS, "input", 1_000),  # ~$0.005 ops
+    ]
+    tasks = [
+        {
+            "task_id": "s1:t01",
+            "session_id": "s1",
+            "name": "build it",
+            "origin": "todo",
+            "prompts": 4,
+            "first_timestamp": "2026-06-01T08:00:00.000Z",
+            "last_timestamp": "2026-06-01T09:00:00.000Z",
+        }
+    ]
+    task_prompts = [{"task_id": "s1:t01", "prompt_id": pid} for pid in ("p1", "p2", "p3", "p4")]
+    categories = {
+        "p1": {"category": "implementation"},
+        "p2": {"category": "ops"},
+        "p3": {"category": "ops"},
+        "p4": {"category": "ops"},
+    }
+    ds = Dataset(
+        sessions=[{"session_id": "s1", "project": "alpha"}],
+        prompts=[{"session_id": "s1", "prompt_id": pid} for pid in ("p1", "p2", "p3", "p4")],
+        tokens=tokens,
+        categories=categories,
+        source="test data",
+        tasks=tasks,
+        task_prompts=task_prompts,
+    )
+    # Count would say "ops" (3 vs 1); cost says "implementation" (the $10 prompt).
+    assert analytics.task_graph(ds, "anthropic").tasks[0].category == "implementation"
+    assert analytics.by_task(ds, "anthropic").rows[0]["category"] == "implementation"
 
 
 def test_task_graph_empty_dataset_has_no_data():

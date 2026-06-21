@@ -70,6 +70,10 @@ __all__ = [
     "context_cost",
     "ContextCost",
     "ContextElementCost",
+    "file_graph",
+    "FileGraph",
+    "FileNode",
+    "FileSatellite",
     "by_task",
     "task_graph",
     "TaskGraph",
@@ -500,6 +504,11 @@ def filter_prompt_ids(ds: Dataset, prompt_ids: set[str] | frozenset[str]) -> Dat
     along unnarrowed (cheaper, and they are not consulted).
     """
     kept = set(prompt_ids)
+    task_prompts = [row for row in ds.task_prompts if row.get("prompt_id") in kept]
+    # The task dimension honours the selection too: keep only tasks that retain at
+    # least one member prompt, so the task count / averages describe the scope (a
+    # task with all its prompts filtered out is no longer "in range").
+    kept_task_ids = {row["task_id"] for row in task_prompts}
     return Dataset(
         sessions=ds.sessions,
         prompts=[row for row in ds.prompts if row.get("prompt_id") in kept],
@@ -513,9 +522,8 @@ def filter_prompt_ids(ds: Dataset, prompt_ids: set[str] | frozenset[str]) -> Dat
         # Session-grain context rows ride along unnarrowed, like sessions.
         context_sources=ds.context_sources,
         context_cost=ds.context_cost,
-        # The task dimension rides along; membership edges honour the selection.
-        tasks=ds.tasks,
-        task_prompts=[row for row in ds.task_prompts if row.get("prompt_id") in kept],
+        tasks=[row for row in ds.tasks if row["task_id"] in kept_task_ids],
+        task_prompts=task_prompts,
     )
 
 
@@ -1663,6 +1671,134 @@ def file_footprint(ds: Dataset, provider: str) -> TableResult:
     )
 
 
+@dataclass(frozen=True)
+class FileNode:
+    """One file as a graph centre (Axe C+D): a node sized by its context cost.
+
+    ``cost`` is the file's reconciled context spend (the one-off **load** plus the
+    **rent** it paid every turn it lingered in cache, Axe D); ``language`` drives
+    the node colour. ``edited`` distinguishes a file the work *wrote* to (Axe C)
+    from one only *read* into context -- a read-only file with cost but no edit is
+    pure rent, the first thing to keep out of context. ``path`` is the
+    project-relative path, never a byte of content.
+    """
+
+    path: str
+    language: str
+    kind: str
+    cost: float
+    edits: int
+    lines_added: int
+    lines_deleted: int
+    reads: int
+    edited: bool
+
+
+@dataclass(frozen=True)
+class FileSatellite:
+    """One prompt that *edited* a file (Axe C): a small node linked to the centre.
+
+    Coloured by the file's language (the graph's single legend dimension) but
+    carrying its own ``category`` and ``churn`` (lines added + deleted on *this*
+    file) in the tooltip, so a centre shows who touched it and how much.
+    """
+
+    prompt_id: str
+    path: str
+    category: str
+    churn: int
+
+
+@dataclass(frozen=True)
+class FileGraph:
+    """Structured file cost-graph data (Axe C+D), shared shape for the dashboard.
+
+    ``files`` are the top ``top`` file centres by context cost; ``satellites`` the
+    prompts that edited *those* files (so the graph stays legible). ``total_files``
+    / ``edited_files`` / ``readonly_files`` describe the whole population behind the
+    shown slice; ``context_total`` is the reconciled file context spend. The pure
+    numbers mirror :func:`file_footprint` so the graph and the CLI table never
+    drift.
+    """
+
+    provider: str
+    files: list[FileNode]
+    satellites: list[FileSatellite]
+    total_files: int
+    edited_files: int
+    readonly_files: int
+    context_total: float
+
+    @property
+    def has_data(self) -> bool:
+        """True when there is at least one file centre to draw."""
+        return bool(self.files)
+
+
+def file_graph(ds: Dataset, provider: str, *, top: int = 40) -> FileGraph:
+    """Assemble the file cost-graph: file centres + their edit-prompt satellites.
+
+    Centres are files sized by their reconciled context cost (load + rent, Axe D);
+    satellites are the prompts that *edited* each file (Axe C), so a centre shows
+    who touched it. Reuses :func:`file_footprint` for the per-file metrics, so the
+    graph and the CLI table never drift, then keeps the top ``top`` files by
+    context cost (0 = all) and gathers the edits of *those* files as satellites.
+    A read-only file (cost but no edit) stays a lone centre -- pure context rent.
+    """
+    footprint = file_footprint(ds, provider)
+    rows = footprint.rows  # already sorted by context $ then line churn
+    total_files = len(rows)
+    edited_files = sum(1 for r in rows if r["edits"])
+    readonly_files = sum(1 for r in rows if not r["edits"] and r["reads"])
+    context_total = sum(r["context_usd"] for r in rows)
+
+    shown = rows[:top] if top else rows
+    kept_paths = {r["path"] for r in shown}
+    nodes = [
+        FileNode(
+            path=r["path"],
+            language=r["language"],
+            kind=r["kind"],
+            cost=round(r["context_usd"], 4),
+            edits=r["edits"],
+            lines_added=r["lines_added"],
+            lines_deleted=r["lines_deleted"],
+            reads=r["reads"],
+            edited=bool(r["edits"]),
+        )
+        for r in shown
+    ]
+
+    churn: defaultdict[tuple[str, str], int] = defaultdict(int)
+    for row in ds.output_files:
+        path = row.get("path") or ""
+        if path not in kept_paths:
+            continue
+        churn[(row.get("prompt_id") or "", path)] += int(row.get("lines_added") or 0) + int(
+            row.get("lines_deleted") or 0
+        )
+    satellites = [
+        FileSatellite(
+            prompt_id=pid,
+            path=path,
+            category=(ds.categories.get(pid) or {}).get("category") or "(uncategorized)",
+            churn=c,
+        )
+        for (pid, path), c in churn.items()
+        if pid
+    ]
+
+    return FileGraph(
+        provider=provider,
+        files=nodes,
+        satellites=satellites,
+        total_files=total_files,
+        edited_files=edited_files,
+        readonly_files=readonly_files,
+        context_total=round(context_total, 4),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Axe B2: cost by task -- the task, not the prompt, is the unit of work.
 # ---------------------------------------------------------------------------
@@ -1700,6 +1836,40 @@ def _format_duration(seconds: float) -> str:
     return " ".join(parts)
 
 
+def _dominant_categories(
+    task_of: dict[str, str],
+    categories: dict[str, dict[str, str]],
+    weight: dict[str, float],
+) -> dict[str, str]:
+    """Pick each task's defining category by *cost*, not prompt count.
+
+    A task collects a launching prompt plus cheap trailers ("commit", "ok go");
+    counting prompts lets those trailers outvote the real work, so the task node's
+    colour looked random. Weighting each prompt's category by its cost lets the
+    category where the money actually went win -- the expensive core defines the
+    task. Falls back to a plain count when a task has no priced prompt.
+    """
+    cost_weighted: defaultdict[str, defaultdict[str, float]] = defaultdict(
+        lambda: defaultdict(float)
+    )
+    count_weighted: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    for pid, tid in task_of.items():
+        category = (categories.get(pid) or {}).get("category") or ""
+        if not category:
+            continue
+        count_weighted[tid][category] += 1
+        cost_weighted[tid][category] += weight.get(pid, 0.0)
+    dominant: dict[str, str] = {}
+    for tid, counts in count_weighted.items():
+        priced = cost_weighted[tid]
+        if sum(priced.values()) > 0:
+            # Cost wins; break ties on the category name so it stays deterministic.
+            dominant[tid] = max(priced, key=lambda cat: (priced[cat], cat))
+        else:
+            dominant[tid] = counts.most_common(1)[0][0]
+    return dominant
+
+
 def by_task(ds: Dataset, provider: str, *, top: int = 20) -> TableResult:
     """Cost by task (Axe B2): the task is the unit of work, not the prompt.
 
@@ -1721,9 +1891,11 @@ def by_task(ds: Dataset, provider: str, *, top: int = 20) -> TableResult:
 
     total_cost: defaultdict[str, float] = defaultdict(float)
     context_cost_by_task: defaultdict[str, float] = defaultdict(float)
+    prompt_cost: defaultdict[str, float] = defaultdict(float)
     overhead = 0.0
     for row in ds.tokens:
         c = engine.cost(row.get("model") or "", row["token_type"], row["token_count"])
+        prompt_cost[row["prompt_id"]] += c
         tid = task_of.get(row["prompt_id"])
         if tid is None:
             overhead += c
@@ -1732,12 +1904,7 @@ def by_task(ds: Dataset, provider: str, *, top: int = 20) -> TableResult:
         if row["token_type"] in _CONTEXT_TOKEN_TYPES:
             context_cost_by_task[tid] += c
 
-    dominant: dict[str, Counter[str]] = defaultdict(Counter)
-    for row in ds.task_prompts:
-        info = ds.categories.get(row["prompt_id"])
-        category = (info or {}).get("category") or ""
-        if category:
-            dominant[row["task_id"]][category] += 1
+    dominant = _dominant_categories(task_of, ds.categories, prompt_cost)
 
     grand_total = sum(total_cost.values())
     context_total = sum(context_cost_by_task.values())
@@ -1746,7 +1913,6 @@ def by_task(ds: Dataset, provider: str, *, top: int = 20) -> TableResult:
         tid = task["task_id"]
         cost = total_cost.get(tid, 0.0)
         ctx = context_cost_by_task.get(tid, 0.0)
-        counter = dominant.get(tid)
         first = _parse_iso(task.get("first_timestamp", ""))
         last = _parse_iso(task.get("last_timestamp", ""))
         span = _format_duration((last - first).total_seconds()) if first and last else ""
@@ -1756,7 +1922,7 @@ def by_task(ds: Dataset, provider: str, *, top: int = 20) -> TableResult:
                 "origin": task.get("origin", ""),
                 "prompts": int(task.get("prompts") or 0),
                 "duration": span,
-                "category": counter.most_common(1)[0][0] if counter else "(uncategorized)",
+                "category": dominant.get(tid, "(uncategorized)"),
                 "context_pct": round(100 * ctx / cost, 1) if cost else 0.0,
                 "cost_usd": round(cost, 4),
                 "cost_share_pct": round(100 * cost / grand_total, 1) if grand_total else 0.0,
@@ -1907,11 +2073,7 @@ def task_graph(ds: Dataset, provider: str, *, top: int = 40) -> TaskGraph:
         task_cost[tid] += c
         task_ctx[tid] += prompt_ctx.get(pid, 0.0)
 
-    dominant: dict[str, Counter[str]] = defaultdict(Counter)
-    for row in ds.task_prompts:
-        category = (ds.categories.get(row["prompt_id"]) or {}).get("category") or ""
-        if category:
-            dominant[row["task_id"]][category] += 1
+    dominant = _dominant_categories(task_of, ds.categories, prompt_cost)
 
     grand_total = sum(task_cost.values())
     context_total = sum(task_ctx.values())
@@ -1921,13 +2083,12 @@ def task_graph(ds: Dataset, provider: str, *, top: int = 40) -> TaskGraph:
         tid = task["task_id"]
         cost = task_cost.get(tid, 0.0)
         ctx = task_ctx.get(tid, 0.0)
-        counter = dominant.get(tid)
         nodes.append(
             TaskNode(
                 task_id=tid,
                 name=task.get("name") or tid,
                 origin=task.get("origin", ""),
-                category=counter.most_common(1)[0][0] if counter else "(uncategorized)",
+                category=dominant.get(tid, "(uncategorized)"),
                 prompts=int(task.get("prompts") or 0),
                 cost=round(cost, 4),
                 context_pct=round(100 * ctx / cost, 1) if cost else 0.0,
