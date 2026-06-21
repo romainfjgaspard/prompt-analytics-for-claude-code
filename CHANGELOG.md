@@ -9,6 +9,21 @@ in patch/minor bumps.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-06-22
+
+### Fixed
+- `dashboard`: the board now renders in the branded dark theme on installed
+  launches (`uv tool` / `pip`), not only from a repo checkout or the hosted demo.
+  Streamlit reads `.streamlit/config.toml` only from the launch directory — which
+  an installed tool never has — so the board previously followed the visitor's OS
+  theme (often light) while the ECharts chrome stayed dark. `dashboard` now forces
+  the theme via `STREAMLIT_THEME_*` env vars so it matches the demo everywhere
+  (an explicit user `STREAMLIT_THEME_*` override still wins).
+
+### Changed
+- README quick start now leads with the dashboard (the primary surface); the CLI
+  follows as a "prefer the terminal?" alternative.
+
 ## [0.4.0] — 2026-06-22 — Cost by content
 
 Where your cost goes, **by content** — the same reconciled bill attributed across

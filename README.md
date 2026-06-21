@@ -34,20 +34,26 @@ And a live Streamlit demo runs on a synthetic dataset (no real prompts), so you 
 
 ## Quick start
 
-Zero install, straight from PyPI with [uv](https://docs.astral.sh/uv/) — this reads your real `~/.claude/projects` and prints a summary in the terminal:
+The richest way in is the **dashboard** — install with the `dashboard` extra and point it at your own data:
+
+```bash
+uv tool install "prompt-analytics-for-claude-code[dashboard]"
+prompt-analytics dashboard          # refresh your data, then launch Streamlit on http://localhost:8501
+```
+
+`dashboard` refreshes the data first (extract + snapshot + local categorize, no API key) and then opens the board — so a fresh launch never shows stale numbers. Pass `--no-refresh` to skip that and open on the existing CSVs. (Plain pip: `pip install "prompt-analytics-for-claude-code[dashboard]"`.)
+
+No data yet, or just curious? The [**live demo**](https://prompt-analytics-demo.streamlit.app) runs the same dashboard on synthetic data — a tour of every page is in the wiki ([Dashboard](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Dashboard)).
+
+### Prefer the terminal? The same data as a CLI
+
+Every analysis is also a single line over your local logs — zero install with [uv](https://docs.astral.sh/uv/):
 
 ```bash
 uvx --from prompt-analytics-for-claude-code prompt-analytics summary
 ```
 
-Use it often? Install the `prompt-analytics` command on your PATH:
-
-```bash
-uv tool install prompt-analytics-for-claude-code
-prompt-analytics summary
-```
-
-Or with pip: `pip install prompt-analytics-for-claude-code`, then `prompt-analytics summary`.
+Use it often? `uv tool install prompt-analytics-for-claude-code` (or `pip install prompt-analytics-for-claude-code`), then `prompt-analytics summary`.
 
 The summary is a live parse of your logs — no `extract` step required (that one is just an export, see below). Running on the bundled demo dataset, the output looks like this; on your machine the source line reads `live parse of ~/.claude/projects`:
 
@@ -75,19 +81,6 @@ Usage summary
 ```
 
 **Prerequisites:** Python 3.10+ and Claude Code with at least one recorded session under `~/.claude/projects/`. No organization or Admin API key required (unlike the official Claude Code Analytics API, which needs both).
-
-### Dashboard
-
-Prefer a UI? Install with the `dashboard` extra and point it at your own data:
-
-```bash
-uv tool install "prompt-analytics-for-claude-code[dashboard]"
-prompt-analytics dashboard          # refresh your data, then launch Streamlit on http://localhost:8501
-```
-
-`dashboard` refreshes the data first (extract + snapshot + local categorize, no API key) and then opens the board — so a fresh launch never shows stale numbers. Pass `--no-refresh` to skip that and open on the existing CSVs.
-
-No data yet, or just curious? The [**live demo**](https://prompt-analytics-demo.streamlit.app) runs the same dashboard on synthetic data. Install, data-dir resolution, and a tour of every page are in the wiki ([Dashboard](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Dashboard)).
 
 ## What it can tell you
 
