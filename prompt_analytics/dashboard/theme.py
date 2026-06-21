@@ -27,8 +27,8 @@ any chart on any page says which axis you are reading, with no legend relearning
 
 Mappings are constant across every page and identical in both themes (only the
 UI chrome flips light/dark). Prompt categories (:data:`CATEGORY_COLORS`) are a
-secondary axis confined to the Prompts page, grouped by intent (critical ops /
-reflection / support).
+secondary axis on the Composition page (Input + Tasks), grouped by intent
+(critical ops / reflection / support).
 * **Projects** get a stable hue (:func:`project_color_map`) so a project keeps
   the same color across the pareto, treemap and scatter, and even when a filter
   changes which other projects are present -- provided the caller builds the map
@@ -123,9 +123,10 @@ MIX_COLORS = {
     "Output": "#06B6D4",
 }
 
-# Prompt categories (Prompts page only): grouped by intent so the legend keeps a
-# mental logic instead of reading as a rainbow -- critical ops, reflection work,
-# support. Confined to one page, so echoing a model/token hue here is harmless.
+# Prompt categories (Composition page: Input + Tasks): grouped by intent so the
+# legend keeps a mental logic instead of reading as a rainbow -- critical ops,
+# reflection work, support. Confined there, so echoing a model/token hue here is
+# harmless.
 CATEGORY_COLORS = {
     # Critical ops
     "debug": "#DC2626",

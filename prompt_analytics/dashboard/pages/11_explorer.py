@@ -1,4 +1,4 @@
-"""Explorer: drill from day -> session -> prompt with detailed tables.
+"""Prompt Explorer: drill from day -> session -> prompt with detailed tables.
 
 The single place to inspect raw detail, so the analytical pages can stay light.
 It respects the **global cross-filters** (a project / model / date / category
@@ -27,6 +27,25 @@ from prompt_analytics.dashboard import data, echarts, filters, theme
 
 DRILL_DATE = "drill_date"
 DRILL_SESSION = "drill_session"
+# The File Explorer reads this to preselect a file's drill (kept as a literal so
+# this page need not import the numbered page module, which renders on import).
+DRILL_FILE = "drill_file"
+_FILE_EXPLORER_PAGE = "pages/12_file_explorer.py"
+
+
+def _files_edited_by(prompt_id: str) -> list[str]:
+    """Project-relative paths the given prompt edited (for the deep-link out)."""
+    if not prompt_id:
+        return []
+    ds = data.load_dataset()
+    seen: dict[str, None] = {}
+    for row in ds.output_files:
+        if str(row.get("prompt_id") or "") != prompt_id:
+            continue
+        path = str(row.get("path") or "")
+        if path and path != "-":
+            seen.setdefault(path, None)
+    return list(seen)
 
 
 def _title(text: str) -> dict[str, Any]:
@@ -209,8 +228,8 @@ def _by_session(
 
 
 def main() -> None:
-    """Render the Explorer page."""
-    st.title("Explorer")
+    """Render the Prompt Explorer page."""
+    st.title("Prompt Explorer")
 
     frames_all = data.load_all()
     filters.render_sidebar(frames_all)
@@ -397,6 +416,16 @@ def main() -> None:
                 st.markdown(f"> {full}".replace("\n", "\n> "))
             else:
                 st.info("No prompt text available (extracted with --no-text, or text disabled).")
+
+        # Deep-link out: the files this prompt edited, each jumping to the File
+        # Explorer with that file's drill preselected (same principle as Explore →).
+        edited_files = _files_edited_by(str(row.get("prompt_id", "")))
+        if edited_files:
+            st.caption("Files this prompt edited — open one in the **File Explorer**:")
+            for i, path in enumerate(edited_files):
+                if st.button(f"📄 {path} →", key=f"explore_file_{i}", width="stretch"):
+                    st.session_state[DRILL_FILE] = path
+                    st.switch_page(_FILE_EXPLORER_PAGE)
 
 
 # Render only under a real Streamlit server: the timeline is ECharts, which can't

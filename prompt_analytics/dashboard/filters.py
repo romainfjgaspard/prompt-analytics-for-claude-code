@@ -686,8 +686,8 @@ def render_active_filter_badge(
     it were the whole dataset (the audit's "phantom filters" risk). Because it
     appears exactly when the user has narrowed the dashboard (by clicking charts),
     it is also where the **drill-through** lives: an *Explore →* button jumps to
-    the Explorer page, which inspects the same selection as day → session → prompt
-    detail. ``explore_link=False`` on the Explorer page itself (no self-link).
+    the Prompt Explorer page, which inspects the same selection as day → session →
+    prompt detail. ``explore_link=False`` on the Prompt Explorer itself (no self-link).
 
     Only the chart-click drill raises the badge; the persistent sidebar filters
     never do (they are changed only in the sidebar). ``frames`` is kept for the
@@ -700,7 +700,7 @@ def render_active_filter_badge(
         summary, explore, button = st.columns([4, 1, 1])
         if explore.button(
             "Explore →",
-            help="Open the matching day / session / prompt detail in Explorer",
+            help="Open the matching day / session / prompt detail in the Prompt Explorer",
             width="stretch",
         ):
             st.switch_page("pages/11_explorer.py")

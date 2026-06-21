@@ -483,8 +483,9 @@ def test_available_date_bounds_mixed_tz_does_not_crash() -> None:
 @pytest.mark.parametrize(
     "script",
     [
-        # app.py and pages 1_overview / 2_models / 3_prompts / 4_session_depth /
-        # 5_sessions / 6_optimize / 7_quotas / 11_explorer are intentionally
+        # app.py and pages 1_overview / 2_models / 4_session_depth / 5_sessions /
+        # 6_optimize / 7_quotas / 8_composition / 11_explorer (Prompt Explorer) /
+        # 12_file_explorer (File Explorer) are intentionally
         # absent: they now render ECharts in main() after the data guards, and
         # streamlit-echarts cannot register under AppTest (empty component
         # registry) -- only under a real `streamlit run`. Their calculations are

@@ -11,7 +11,7 @@ trend, because it is the riskiest mechanism and every other page reuses it:
   the click path already proven on the home page and the spike.
 
 Both share ``KEY_DATE_RANGE`` and are disambiguated by type (str = click, list =
-brush). Per-session / per-prompt detail tables moved to the Explorer page (no
+brush). Per-session / per-prompt detail tables moved to the Prompt Explorer (no
 tables on the analytical pages); apply a filter here, then use the *Explore →*
 button in the filter badge. Everything is ECharts. Zero Plotly remains.
 """
@@ -486,7 +486,7 @@ def main() -> None:
             "= more spend. Hover for the exact amount."
         )
 
-    # Per-session / per-prompt detail lives on the Explorer page now (no tables
+    # Per-session / per-prompt detail lives on the Prompt Explorer now (no tables
     # on the analytical pages): apply a filter here, then use the "Explore →"
     # button in the filter badge to inspect the matching day/session/prompt rows.
 

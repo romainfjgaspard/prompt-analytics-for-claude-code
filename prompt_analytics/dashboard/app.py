@@ -357,15 +357,18 @@ def _run() -> None:
         st.Page("pages/2_models.py", title="Models", icon="🧠"),
         st.Page("pages/5_sessions.py", title="Sessions", icon="🗂️"),
         st.Page("pages/4_session_depth.py", title="Session depth", icon="📐"),
-        st.Page("pages/3_prompts.py", title="Prompts", icon="💬"),
-        # Composition narrates the "where the cost goes, by content" spine; it
-        # respects the global filters, so it sits in the filter-driven block next
-        # to Prompts (the input side of the same story).
+        # Composition narrates the "where the cost goes, by content" spine (the
+        # per-category / per-prompt breakdown that the old Prompts tab carried now
+        # lives in its Input section); it respects the global filters, so it sits
+        # in the filter-driven block.
         st.Page("pages/8_composition.py", title="Composition", icon="🧩"),
-        # Explorer respects the global filters, so it closes the filter-driven
-        # analytics block; the pages that ignore the sidebar filters (Optimize is
-        # request-grain, Quotas and How it works have none) come after.
-        st.Page("pages/11_explorer.py", title="Explorer", icon="🔎"),
+        # The two explorers respect the global filters, so they close the
+        # filter-driven analytics block: the Prompt Explorer for day → session →
+        # prompt detail, the File Explorer for the per-file footprint + drill. The
+        # pages that ignore the sidebar filters (Optimize is request-grain, Quotas
+        # and How it works have none) come after.
+        st.Page("pages/11_explorer.py", title="Prompt Explorer", icon="🔎"),
+        st.Page("pages/12_file_explorer.py", title="File Explorer", icon="📄"),
         st.Page("pages/6_optimize.py", title="Optimize", icon="✨"),
         st.Page("pages/7_quotas.py", title="Quotas", icon="📏"),
         st.Page("pages/10_how_it_works.py", title="How it works", icon="❓"),

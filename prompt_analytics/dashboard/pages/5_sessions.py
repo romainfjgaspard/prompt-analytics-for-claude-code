@@ -5,14 +5,14 @@ Migrated to Apache ECharts (``docs/MIGRATION-ECHARTS.md``). Emitters (§4):
 * the **project pareto** is a cross-filter emitter -- clicking a bar narrows the
   whole dashboard to that project (``filters.KEY_PROJECTS``);
 * the **treemap** is a *drill* trigger, not a filter -- clicking a session tile
-  opens that session in the Explorer (``st.session_state['drill_session']``);
+  opens that session in the Prompt Explorer (``st.session_state['drill_session']``);
 * the **per-session cost box plot** emits the model dimension
   (``filters.KEY_MODELS``), consistent with the Models page;
 * the **prompts-per-session bar** emits a *new* global dimension
   (``filters.XF_PROMPT_COUNT``) -- clicking the "1" bar narrows the whole
   dashboard to one-prompt sessions, and so on.
 
-Per-session / per-prompt detail lives on the Explorer page.
+Per-session / per-prompt detail lives on the Prompt Explorer page.
 
 ⚠️ Color stability: one ``project_color_map`` is built **once** from the
 *unfiltered* project universe (``frames_all``) and shared by the pareto and
@@ -211,11 +211,11 @@ def _project_treemap_option(
 
 
 def _apply_treemap_drill(value: Any, session_ids: set[str]) -> None:
-    """Clicked session tile -> open that session in the Explorer (sticky-guarded).
+    """Clicked session tile -> open that session in the Prompt Explorer (sticky-guarded).
 
-    The on-page drill-down moved to the Explorer page; a tile click now deep-links
+    The on-page drill-down moved to the Prompt Explorer; a tile click now deep-links
     there with the session pre-selected. The "applied" marker keeps the sticky
-    component value from bouncing back to Explorer every time you return here.
+    component value from bouncing back to the Prompt Explorer every time you return.
     """
     if not isinstance(value, str) or value not in session_ids:
         return
@@ -417,8 +417,8 @@ def main() -> None:
 
     st.caption(
         "👆 Click a treemap session tile to open that session's day → session → "
-        "prompt detail in the **Explorer**. Apply a filter on any chart, then use "
-        "the **Explore →** button in the filter badge to inspect the selection."
+        "prompt detail in the **Prompt Explorer**. Apply a filter on any chart, then "
+        "use the **Explore →** button in the filter badge to inspect the selection."
     )
 
 

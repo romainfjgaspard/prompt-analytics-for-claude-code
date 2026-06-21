@@ -4,20 +4,18 @@ The dashboard has a backbone -- **input** (what you asked), **output** (what
 Claude produced), **context** (what fills the cache it re-reads). This page is
 the narrated home of that spine, read as one whole: three sections in cost order
 (input -> output -> context), each with the same shape (a KPI row, a headline
-chart, a drill), then a unified **Files** table that crosses output and context
-per file, and finally the **Tasks** graph that lifts the spine to the unit of
-work.
+chart, a drill), and finally the **Tasks** graph that lifts the spine to the unit
+of work. The per-file footprint (edits crossed with reads + context cost) lives
+on its own **File Explorer** page now (with a drill), not here.
 
-* **Input** (categories) -- a cost-by-category recap of the Prompts page, so the
-  spine starts here too (DASH1).
+* **Input** (categories) -- the cost-by-category breakdown of what you asked, so
+  the spine starts here too (DASH1; this absorbed the old Prompts tab).
 * **Output** (Axe C) -- the prose-vs-code split of the generated spend and the
   language mix (code side) of what was written: the differentiator cc-lens never
   filled in (its ``languages`` field stays empty) and never priced.
 * **Context** (Axe D) -- what fills the cached, re-read context, split into the
   one-off **loading** and the **rent** paid every turn it lingers; the attributed
   total reconciles to the billed cache cost to the dollar.
-* **Files** (DASH4) -- one row per file crossing edits + line diff (output) with
-  reads + context cost (loading + rent): a file's whole cost of ownership.
 * **Tasks** (Axe B2 / DASH5) -- the cost graph: tasks as centres of gravity
   (size = cost, hue = dominant category) with their prompts orbiting as
   satellites, drillable per task via an ECharts force layout. The unit of work,
@@ -25,11 +23,10 @@ work.
 
 Every section is a *view* over the same analytics the CLI prints
 (:func:`analytics.by_category` / :func:`output_composition` / :func:`context_cost`
-/ :func:`file_footprint` / :func:`task_graph`), narrowed to the global sidebar /
-chart-click selection
+/ :func:`task_graph`), narrowed to the global sidebar / chart-click selection
 via :func:`analytics.filter_prompt_ids` so it honours the same filter as every
-other tab. Read-only: language/file are not global filter dimensions, so the
-charts emit no cross-filter. Metrics only -- no source code is ever read here.
+other tab. Read-only: language is not a global filter dimension, so the charts
+emit no cross-filter. Metrics only -- no source code is ever read here.
 """
 
 from __future__ import annotations
@@ -124,13 +121,21 @@ def _hbar(
 # range; the top bucket is open-ended (``hi`` is ``None``). The label is the
 # bridge between the chart (axis text) and the cross-filter (the clicked range).
 _CHAR_BINS: list[tuple[int, int | None, str]] = [
-    (0, 100, "0–100"),
-    (100, 250, "100–250"),
-    (250, 500, "250–500"),
-    (500, 1000, "500–1k"),
-    (1000, 2000, "1k–2k"),
-    (2000, 5000, "2k–5k"),
-    (5000, None, "5k+"),
+    (0, 50, "0–50"),
+    (50, 100, "50–100"),
+    (100, 150, "100–150"),
+    (150, 200, "150–200"),
+    (200, 300, "200–300"),
+    (300, 400, "300–400"),
+    (400, 500, "400–500"),
+    (500, 750, "500–750"),
+    (750, 1000, "750–1k"),
+    (1000, 1500, "1k–1.5k"),
+    (1500, 2000, "1.5k–2k"),
+    (2000, 3000, "2k–3k"),
+    (3000, 5000, "3k–5k"),
+    (5000, 7500, "5k–7.5k"),
+    (7500, None, "7.5k+"),
 ]
 _CHAR_RANGE_BY_LABEL = {label: (lo, hi) for lo, hi, label in _CHAR_BINS}
 
@@ -178,12 +183,15 @@ def _char_distribution_option(prompts: pd.DataFrame) -> dict[str, Any] | None:
         "left": 0,
         "textStyle": {"color": c["text"], "fontSize": 16, "fontWeight": 600},
     }
-    option["grid"] = {"left": 64, "right": 24, "top": 64, "bottom": 56, "containLabel": True}
+    option["grid"] = {"left": 64, "right": 24, "top": 64, "bottom": 72, "containLabel": True}
     option["tooltip"].update({"trigger": "axis", "axisPointer": {"type": "shadow"}})
     option["xAxis"] = echarts.category_axis(labels)
     option["xAxis"]["name"] = "Characters"
     option["xAxis"]["nameLocation"] = "middle"
-    option["xAxis"]["nameGap"] = 32
+    option["xAxis"]["nameGap"] = 52
+    # Many fine-grained bins -> rotate the tick labels so they read as a real
+    # distribution without overlapping.
+    option["xAxis"]["axisLabel"] = {"color": c["text"], "rotate": 45, "fontSize": 10}
     option["yAxis"] = echarts.value_axis(name="Prompts")
     option["yAxis"]["nameLocation"] = "middle"
     option["yAxis"]["nameGap"] = 46
@@ -191,8 +199,8 @@ def _char_distribution_option(prompts: pd.DataFrame) -> dict[str, Any] | None:
         {
             "type": "bar",
             "data": counts,
-            "itemStyle": {"color": theme.PALETTE[1], "borderRadius": [4, 4, 0, 0]},
-            "label": {"show": True, "position": "top", "color": c["text"]},
+            "itemStyle": {"color": theme.PALETTE[1], "borderRadius": [3, 3, 0, 0]},
+            "label": {"show": True, "position": "top", "color": c["text"], "fontSize": 10},
         }
     ]
     return option
@@ -216,7 +224,7 @@ def _apply_char_click(value: Any) -> None:
 
 
 def _render_input_section(ds: analytics.Dataset, provider: str, prompts: pd.DataFrame) -> None:
-    """Cost-by-category recap of the Prompts page (the input half of the spine)."""
+    """Cost-by-category breakdown of the input half of the spine (ex-Prompts tab)."""
     table = analytics.by_category(ds, provider)
     rows = [r for r in table.rows if str(r.get("category")) != "TOTAL"]
     categorized = [r for r in rows if str(r.get("category")) != "(uncategorized)"]
@@ -596,89 +604,6 @@ def _render_context_section(comp: analytics.ContextCost) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Files section (DASH4) -- one row per file, output edits crossed with reads.
-# ---------------------------------------------------------------------------
-
-_FILE_HEADERS = {
-    "path": "File",
-    "language": "Language",
-    "kind": "Kind",
-    "edits": "Edits",
-    "lines_added": "Lines +",
-    "lines_deleted": "Lines −",
-    "reads": "Reads",
-    "load_usd": "Load $",
-    "rent_usd": "Rent $",
-    "context_usd": "Context $",
-}
-
-
-def _render_files_section(ds: analytics.Dataset, provider: str) -> None:
-    """The unified per-file footprint: a sortable/filterable Explorer-style table."""
-    table = analytics.file_footprint(ds, provider)
-    if not table.rows:
-        st.info(
-            "No per-file data yet. The file identity (relative path) ships with the latest "
-            "extractor — re-run `prompt-analytics extract`, then revisit this page."
-        )
-        return
-
-    df = pd.DataFrame(table.rows).rename(columns=_FILE_HEADERS)
-
-    controls = st.columns([3, 2])
-    query = controls[0].text_input(
-        "Filter files",
-        key="comp_file_filter",
-        placeholder="path or language…",
-        label_visibility="collapsed",
-    )
-    scope = controls[1].selectbox(
-        "Footprint",
-        ["All files", "Edited", "Read but never edited"],
-        key="comp_file_scope",
-        label_visibility="collapsed",
-    )
-
-    view = df
-    if query:
-        q = query.strip().lower()
-        view = view[
-            view["File"].str.lower().str.contains(q, regex=False)
-            | view["Language"].str.lower().str.contains(q, regex=False)
-        ]
-    if scope == "Edited":
-        view = view[view["Edits"] > 0]
-    elif scope == "Read but never edited":
-        view = view[(view["Edits"] == 0) & (view["Reads"] > 0)]
-
-    st.dataframe(
-        view,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "File": st.column_config.TextColumn("File", width="large"),
-            "Edits": st.column_config.NumberColumn("Edits", format="%d"),
-            "Lines +": st.column_config.NumberColumn("Lines +", format="%d"),
-            "Lines −": st.column_config.NumberColumn("Lines −", format="%d"),
-            "Reads": st.column_config.NumberColumn("Reads", format="%d"),
-            "Load $": st.column_config.NumberColumn("Load $", format="$%.2f"),
-            "Rent $": st.column_config.NumberColumn("Rent $", format="$%.2f"),
-            "Context $": st.column_config.NumberColumn("Context $", format="$%.2f"),
-        },
-    )
-
-    edited = int((df["Edits"] > 0).sum())
-    read_only = int(((df["Edits"] == 0) & (df["Reads"] > 0)).sum())
-    st.caption(
-        f"One row per file: **edits** + line diff (output) crossed with **reads** + the "
-        f"**context cost** they drove (loading + rent). {len(df):,} files — {edited:,} edited, "
-        f"**{read_only:,} read but never edited** (pure context cost, the first candidates to "
-        f"keep out of context). Sort by any column; metrics only — relative paths, never "
-        f"content."
-    )
-
-
-# ---------------------------------------------------------------------------
 # Tasks section (Axe B2 / DASH5) -- the cost graph: tasks as centres, prompts
 # as satellites, the most telling level of the "cost by content" spine.
 # ---------------------------------------------------------------------------
@@ -693,7 +618,7 @@ _SAT_MIN_SIZE, _SAT_MAX_SIZE = 6.0, 16.0
 
 
 def _task_color(category: str) -> str:
-    """Category colour for a task/prompt node (shared with the Prompts page)."""
+    """Category colour for a task/prompt node (shared across category charts)."""
     return theme.CATEGORY_COLORS.get(category, theme.CATEGORY_COLORS["(uncategorized)"])
 
 
@@ -934,12 +859,13 @@ def _render_tasks_comparison(ds: analytics.Dataset, provider: str, pivot: str) -
 
 
 def main() -> None:
-    """Render the Composition page: input -> output -> context, then Files."""
+    """Render the Composition page: input -> output -> context, then Tasks."""
     st.title("Composition")
     st.caption(
         "Where your cost goes, **by content** — read as one spine: **input** (what you "
         "ask) → **output** (what Claude produces) → **context** (what fills the cache it "
-        "re-reads), then a per-file footprint that crosses output and context."
+        "re-reads), then **tasks** (the unit of work). Per-file detail lives on the "
+        "**File Explorer** page."
     )
 
     frames_all = data.load_all()
@@ -1006,13 +932,6 @@ def main() -> None:
         _render_context_section(ctx)
     else:
         st.info("No context-composition data in range.")
-
-    theme.section(
-        "Files — every file's total footprint",
-        "One row per file: its edits and line diff (output) crossed with its reads and "
-        "context cost (loading + rent) — the file's whole cost of ownership.",
-    )
-    _render_files_section(ds, primary)
 
     theme.section(
         "Tasks — the cost graph",
