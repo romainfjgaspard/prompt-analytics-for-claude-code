@@ -9,6 +9,28 @@ in patch/minor bumps.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-06-28
+
+### Added
+- **Compare** tab — a **comparison window** (1 week / 1 month / full history):
+  the windowed modes keep N days symmetrically on each side of the pivot for a
+  fair like-for-like read; full history still matches the CLI `impact` table.
+- **Compare** tab — a **Composition shift** section: the code / test /
+  context-rent shares plus the **per-line efficiency** (tokens and cost to write
+  a line of code) as five Before/After cards, with **prose-vs-code** and
+  **loading-vs-rent** donuts before vs after.
+
+### Changed
+- **Compare** tab — denser, aligned layout: the top controls (config-change
+  suggestion, switch date, comparison window) sit on one row, and the
+  Before/After metrics render as two horizontal bands instead of one tall row per
+  metric (fixing the After-delta misalignment).
+- **Compare** tab — the second average chart is now the **output language mix**
+  (% of code lines), a normalized share; the prompt-category mix was dropped as
+  not robust enough for a before/after read.
+- README: "See it without installing" leads with the dashboard (a single home
+  screenshot), the CLI follows.
+
 ## [0.4.1] — 2026-06-22
 
 ### Fixed
