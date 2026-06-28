@@ -942,17 +942,19 @@ def test_token_cost_per_prompt_empty_side_is_empty() -> None:
     assert impact.token_cost_per_prompt(empty, "anthropic") == {}
 
 
-def test_category_share_is_a_mix_summing_to_100() -> None:
+def test_language_share_is_a_mix_summing_to_100() -> None:
+    """The output language mix is a share of code lines, summing to 100 on real data."""
     from prompt_analytics.dashboard import impact
 
-    share = impact.category_share(_compare_side())
+    share = impact.language_share(analytics.dataset_from_csvs(DEMO_DIR), "anthropic")
 
-    assert share["implementation"] == pytest.approx(200 / 3)  # 2 of 3 prompts
-    assert share["debug"] == pytest.approx(100 / 3)  # 1 of 3 prompts
+    assert share  # the demo set wrote code in several languages
     assert sum(share.values()) == pytest.approx(100.0)
+    assert all(0.0 <= v <= 100.0 for v in share.values())
 
 
-def test_category_share_uncategorized_when_no_label() -> None:
+def test_language_share_empty_side_is_empty() -> None:
+    """A side that wrote no code lines yields an empty mix (not a divide-by-zero)."""
     from prompt_analytics.dashboard import impact
 
     ds = analytics.Dataset(
@@ -962,7 +964,110 @@ def test_category_share_uncategorized_when_no_label() -> None:
         categories={},
         source="test data",
     )
-    assert impact.category_share(ds) == {"(uncategorized)": pytest.approx(100.0)}
+    assert impact.language_share(ds, "anthropic") == {}
+
+
+# ---------------------------------------------------------------------------
+# Compare page: the comparison-window restriction and the composition-shift shares.
+# ---------------------------------------------------------------------------
+
+
+def _dated_dataset() -> analytics.Dataset:
+    """One prompt per day over 2026-03-01..2026-03-20 (20 prompts, sortable by date)."""
+    prompts = [
+        {
+            "session_id": "s",
+            "prompt_id": f"p{d:02d}",
+            "timestamp": f"2026-03-{d:02d}T12:00:00Z",
+        }
+        for d in range(1, 21)
+    ]
+    return analytics.Dataset(
+        sessions=[{"session_id": "s"}],
+        prompts=prompts,
+        tokens=[],
+        categories={},
+        source="test data",
+    )
+
+
+def test_window_dataset_none_returns_full_history() -> None:
+    """A ``None`` window keeps the whole dataset (the CLI-matching default)."""
+    from prompt_analytics.dashboard import impact
+
+    ds = _dated_dataset()
+    assert impact.window_dataset(ds, "2026-03-14", None) is ds
+
+
+def test_window_dataset_keeps_equal_length_sides() -> None:
+    """A 7-day window keeps the 7 days before the pivot and the 7 from the pivot on."""
+    from prompt_analytics.dashboard import impact
+
+    scoped = impact.window_dataset(_dated_dataset(), "2026-03-14", 7)
+    days = sorted(row["prompt_id"] for row in scoped.prompts)
+    # before = 03-07..03-13 (7 days), after = 03-14..03-20 (7 days), split at the pivot.
+    assert days == [f"p{d:02d}" for d in range(7, 21)]
+    before, after = analytics.split_on_pivot(scoped, "2026-03-14")
+    assert len(before.prompts) == 7 and len(after.prompts) == 7
+
+
+def _out_comp(
+    prose_cost: float, code_cost: float, added: int, test: int, code_tokens: int = 0
+) -> analytics.OutputComposition:
+    return analytics.OutputComposition(
+        provider="anthropic",
+        languages=[],
+        total_files=0,
+        total_added=added,
+        total_deleted=0,
+        total_test=test,
+        prose_tokens=0,
+        code_tokens=code_tokens,
+        prose_cost=prose_cost,
+        code_cost=code_cost,
+        tooling_cost=0.0,
+    )
+
+
+def _ctx_cost(load_cost: float, rent_cost: float) -> analytics.ContextCost:
+    return analytics.ContextCost(
+        provider="anthropic",
+        elements=[],
+        load_cost=load_cost,
+        rent_cost=rent_cost,
+        unattributed_cost=0.0,
+        rent_read_tokens=0,
+        load_write_5m_tokens=0,
+        load_write_1h_tokens=0,
+    )
+
+
+def test_composition_shift_shares() -> None:
+    """The composition-shift shares are ratios in %, ``None`` when undefined."""
+    from prompt_analytics.dashboard import impact
+
+    comp = _out_comp(prose_cost=6.0, code_cost=4.0, added=100, test=20)
+    assert impact.output_code_share(comp) == pytest.approx(40.0)  # 4 / (6+4)
+    assert impact.output_test_share(comp) == pytest.approx(20.0)  # 20 / 100
+    assert impact.context_rent_share(_ctx_cost(load_cost=2.0, rent_cost=8.0)) == pytest.approx(80.0)
+
+    empty = _out_comp(prose_cost=0.0, code_cost=0.0, added=0, test=0)
+    assert impact.output_code_share(empty) is None
+    assert impact.output_test_share(empty) is None
+    assert impact.context_rent_share(_ctx_cost(0.0, 0.0)) is None
+
+
+def test_composition_shift_per_line_efficiency() -> None:
+    """Cost / tokens per code line are code spend (or tokens) over lines added."""
+    from prompt_analytics.dashboard import impact
+
+    comp = _out_comp(prose_cost=6.0, code_cost=4.0, added=100, test=20, code_tokens=8000)
+    assert impact.output_cost_per_line(comp) == pytest.approx(0.04)  # $4 / 100 lines
+    assert impact.output_tokens_per_line(comp) == pytest.approx(80.0)  # 8000 / 100 lines
+
+    empty = _out_comp(prose_cost=1.0, code_cost=1.0, added=0, test=0, code_tokens=10)
+    assert impact.output_cost_per_line(empty) is None
+    assert impact.output_tokens_per_line(empty) is None
 
 
 # ---------------------------------------------------------------------------
