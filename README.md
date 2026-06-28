@@ -20,17 +20,21 @@ It validates its token totals against [ccusage](https://github.com/ryoppippi/ccu
 
 ## See it without installing anything
 
-**Two surfaces on the same data — a terminal CLI and a Streamlit dashboard.**
+**Two surfaces on the same data — a Streamlit dashboard and a terminal CLI.**
 
-Every CLI command is a single line over your local logs. For example, `by-category` auto-labels each prompt and scores its *observed* complexity 1–5 — a local heuristic, no LLM required:
-
-![`prompt-analytics by-category` in the terminal](https://raw.githubusercontent.com/romainfjgaspard/prompt-analytics-for-claude-code/main/docs/screenshots/cli-by-category.png)
-
-And a live Streamlit demo runs on a synthetic dataset (no real prompts), so you can explore the dashboard before installing — **the image below links to the live demo:**
+The richest way in is the **dashboard**, and a live demo runs it on a synthetic dataset (no real prompts), so you can explore every page before installing — **the images below link to the live demo:**
 
 **▶ Live demo: [prompt-analytics-demo.streamlit.app](https://prompt-analytics-demo.streamlit.app)**
 
 [![The prompt-analytics Streamlit dashboard — KPI cards, cost by token type, and daily cost by model](https://raw.githubusercontent.com/romainfjgaspard/prompt-analytics-for-claude-code/main/docs/screenshots/dashboard-home.png)](https://prompt-analytics-demo.streamlit.app)
+
+The **Composition** page reads your spend *by content* — prose vs code, the language mix and the code/test split of what Claude wrote, then what fills the context it re-reads every turn (the one-off loading vs the rent):
+
+[![The Composition page — output prose vs code, language mix, and context loading vs rent](https://raw.githubusercontent.com/romainfjgaspard/prompt-analytics-for-claude-code/main/docs/screenshots/dashboard-composition.png)](https://prompt-analytics-demo.streamlit.app)
+
+The same numbers are one line away in the **terminal**. For example, `by-category` auto-labels each prompt and scores its *observed* complexity 1–5 — a local heuristic, no LLM required:
+
+![`prompt-analytics by-category` in the terminal](https://raw.githubusercontent.com/romainfjgaspard/prompt-analytics-for-claude-code/main/docs/screenshots/cli-by-category.png)
 
 ## Quick start
 

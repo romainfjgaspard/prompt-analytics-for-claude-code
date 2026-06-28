@@ -23,7 +23,7 @@ unit-testable without a Streamlit runtime.
 from __future__ import annotations
 
 import datetime as _dt
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -50,6 +50,18 @@ _PICK_KEY = "cmp_pivot_suggest"
 # the same one (every rerun) never clobbers a date the user typed afterwards.
 _PICK_APPLIED = "_cmp_pivot_suggest_applied"
 
+# Comparison windows: how much of each side of the pivot to keep. ``1 week`` /
+# ``1 month`` keep N calendar days *immediately* on each side (a like-for-like
+# window for measuring the effect of something installed on the pivot day); ``Full
+# history`` (None) keeps everything -- the only mode whose ratios match the CLI
+# ``impact`` table, which always runs on the whole history.
+KEY_WINDOW = "cmp_window"
+WINDOW_DAYS: dict[str, int | None] = {
+    "1 week": 7,
+    "1 month": 30,
+    "Full history": None,
+}
+
 
 def _to_iso(value: object) -> str | None:
     """Best-effort ``YYYY-MM-DD`` from a date / datetime / string (else ``None``)."""
@@ -70,22 +82,23 @@ def _suggested_pivots(data_dir_str: str, cache_key: str) -> list[tuple[str, str]
     return analytics.suggest_pivots(ds)
 
 
-def render_pivot_picker(frames: dict[str, pd.DataFrame]) -> str | None:
-    """Switch-date picker for the Compare page; returns the chosen pivot (``YYYY-MM-DD``).
+def render_pivot_picker(frames: dict[str, pd.DataFrame]) -> tuple[str | None, int | None]:
+    """The Compare page's top controls, on a single row; returns ``(pivot, window_days)``.
 
-    A date input bounded to the data range, plus a selectbox of the config-change
-    dates detected by :func:`analytics.suggest_pivots` (mtime of CLAUDE.md /
-    settings.json) as a typing aid -- picking one fills the date, but the analysis
-    never depends on it. Returns ``None`` only when there are no dates to split on.
+    Three controls side by side -- the detected-config-change selectbox (a typing
+    aid: picking one fills the date, but the analysis never depends on it), the
+    switch date bounded to the data range, and the comparison window. ``pivot`` is
+    ``YYYY-MM-DD`` (``None`` only when there are no dates to split on); ``window_days``
+    is the per-side window in days, or ``None`` for the full history.
     """
     from prompt_analytics.dashboard import filters
 
     bounds = filters.available_date_bounds(frames)
     if bounds is None:
-        return None
+        return None, None
     min_d, max_d = bounds
 
-    pick_col, date_col = st.columns([3, 2])
+    pick_col, date_col, win_col = st.columns([4, 3, 3])
 
     # Auto-suggestions: a picked one drives the date input; "pick a date" leaves
     # the user's manual choice untouched.
@@ -100,7 +113,7 @@ def render_pivot_picker(frames: dict[str, pd.DataFrame]) -> str | None:
                 key=_PICK_KEY,
                 help="Dates a CLAUDE.md / settings.json was last modified — a likely "
                 "'I changed my setup here'. Only a typing aid; the split is whatever "
-                "date you set on the right.",
+                "date you set next to it.",
             )
         picked = labels.get(choice)
         # Apply a suggestion only when it *changes* (a sticky guard), so a date the
@@ -127,7 +140,77 @@ def render_pivot_picker(frames: dict[str, pd.DataFrame]) -> str | None:
             key=KEY_PIVOT_DATE,
             help="The pivot day is counted in the AFTER side (before = up to the day before it).",
         )
-    return _to_iso(st.session_state.get(KEY_PIVOT_DATE))
+    with win_col:
+        window_label = st.radio(
+            "Comparison window",
+            list(WINDOW_DAYS),
+            index=len(WINDOW_DAYS) - 1,  # default: Full history (matches the CLI)
+            horizontal=True,
+            key=KEY_WINDOW,
+            help="Restrict each side to N days right around the pivot for a fair like-for-like "
+            "read (1 week = the 7 days before vs the 7 after), or keep the whole history.",
+        )
+
+    return _to_iso(st.session_state.get(KEY_PIVOT_DATE)), WINDOW_DAYS[window_label]
+
+
+def window_dataset(ds: analytics.Dataset, pivot: str, window_days: int | None) -> analytics.Dataset:
+    """Restrict ``ds`` to ``window_days`` on each side of ``pivot`` (else the whole set).
+
+    For ``window_days=N`` the kept range is ``[pivot - N, pivot + N - 1]`` so that,
+    once :func:`analytics.split_on_pivot` cuts it on the pivot, *before* covers the
+    N days up to the day before the pivot and *after* covers the pivot day plus the
+    next N-1 -- two equal-length windows for a fair like-for-like comparison. A
+    ``None`` window returns ``ds`` unchanged (the full history, matching the CLI).
+    """
+    if window_days is None:
+        return ds
+    day = _dt.date.fromisoformat(pivot)
+    since = (day - _dt.timedelta(days=window_days)).isoformat()
+    until = (day + _dt.timedelta(days=window_days - 1)).isoformat()
+    return analytics.filter_dates(ds, since, until)
+
+
+# ---------------------------------------------------------------------------
+# Composition shift: prose/code and context load/rent shares, before vs after.
+# Pure (no Streamlit) so they are unit-testable; ``None`` when a side is empty.
+# ---------------------------------------------------------------------------
+
+
+def output_code_share(comp: analytics.OutputComposition) -> float | None:
+    """Code's share (%) of the generated output spend, or ``None`` with no output."""
+    total = comp.prose_cost + comp.code_cost
+    return 100 * comp.code_cost / total if total else None
+
+
+def output_test_share(comp: analytics.OutputComposition) -> float | None:
+    """Tests' share (%) of the code lines written, or ``None`` with no lines added."""
+    return 100 * comp.total_test / comp.total_added if comp.total_added else None
+
+
+def context_rent_share(ctx: analytics.ContextCost) -> float | None:
+    """Rent's share (%) of the context cost, or ``None`` with no context cost."""
+    return 100 * ctx.rent_cost / ctx.total_cost if ctx.total_cost else None
+
+
+def output_cost_per_line(comp: analytics.OutputComposition) -> float | None:
+    """Code generation cost ($) per line of code written, or ``None`` with no lines.
+
+    The dollars spent on the *code* half of the output, per line actually added --
+    an efficiency ratio that drops when the same code costs less to generate (e.g.
+    a cheaper model), independently of how much was written.
+    """
+    return comp.code_cost / comp.total_added if comp.total_added else None
+
+
+def output_tokens_per_line(comp: analytics.OutputComposition) -> float | None:
+    """Generated code tokens per line of code written, or ``None`` with no lines.
+
+    The token cost of a line of code regardless of model pricing -- the twin of
+    :func:`output_cost_per_line` that isolates *verbosity* from the price per token,
+    so a model switch and a terser-output change read apart.
+    """
+    return comp.code_tokens / comp.total_added if comp.total_added else None
 
 
 def render_summary_caption(report: analytics.ImpactReport, pivot: str) -> None:
@@ -147,26 +230,44 @@ def render_summary_caption(report: analytics.ImpactReport, pivot: str) -> None:
 
 
 def _render_metric_columns(metrics: list[analytics.ImpactMetric]) -> None:
-    """Two columns -- Before (left) / After (right) -- one row per metric.
+    """Before then After, each as one horizontal band of metric cards.
 
-    The left column shows the BEFORE value; the right shows the AFTER value with
-    the change as a grey delta (the same string the CLI prints). Colour is always
-    ``off`` (grey): up isn't universally "good" here (cost per prompt up is bad,
-    output share up is neutral), so we never imply a verdict -- the honesty ADN of
-    the whole product.
+    A **Before** row of cards over an **After** row of the same cards: each metric
+    sits in the same column on both rows, so the pair reads top-to-bottom and the
+    grid stays dense (two bands, not one tall row per metric). The After card
+    carries the change as a grey delta (the same string the CLI prints). Colour is
+    always ``off`` (grey): up isn't universally "good" here (cost per prompt up is
+    bad, output share up is neutral), so we never imply a verdict -- the honesty ADN
+    of the whole product.
     """
-    before_col, after_col = st.columns(2)
-    before_col.markdown("**◀ Before**")
-    after_col.markdown("**After ▶**")
-    for metric in metrics:
-        before_col.metric(metric.label, impact_fmt_value(metric.before, metric.fmt))
+    if not metrics:
+        return
+    st.markdown("**◀ Before**")
+    for col, metric in zip(st.columns(len(metrics)), metrics, strict=True):
+        col.metric(metric.label, impact_fmt_value(metric.before, metric.fmt))
+    st.markdown("**After ▶**")
+    for col, metric in zip(st.columns(len(metrics)), metrics, strict=True):
         change = impact_fmt_change(metric.before, metric.after, metric.fmt)
-        after_col.metric(
+        col.metric(
             metric.label,
             impact_fmt_value(metric.after, metric.fmt),
             delta=None if change == "-" else change,
             delta_color="off",
         )
+
+
+def render_share_columns(rows: list[tuple[str, float | None, float | None, str]]) -> None:
+    """Aligned Before/After cards for a list of ``(label, before, after, fmt)`` rows.
+
+    A thin wrapper over :func:`_render_metric_columns` for the composition-shift
+    cards (shares plus the per-line efficiency metrics): each row carries its own
+    ``fmt`` (``pct`` / ``money`` / ``ratio``), so the delta reads in the right unit
+    -- the same honest, verdict-free badge as the headline ratios.
+    """
+    metrics = [
+        analytics.ImpactMetric(label, before, after, fmt) for label, before, after, fmt in rows
+    ]
+    _render_metric_columns(metrics)
 
 
 def render_ratio_columns(report: analytics.ImpactReport) -> None:
@@ -218,23 +319,21 @@ def token_cost_per_prompt(side: analytics.Dataset, provider: str) -> dict[str, f
     return {tt: totals[tt] / prompts for tt in TOKEN_TYPES if totals.get(tt)}
 
 
-def category_share(side: analytics.Dataset) -> dict[str, float]:
-    """Share (% of prompts) per category for one side of the split.
+def language_share(side: analytics.Dataset, provider: str) -> dict[str, float]:
+    """Share (% of code lines written) per language for one side of the split.
 
-    A mix (shares summing to 100), never counts: the two sides are compared by
-    *composition*, so a bigger side does not dominate by volume. Returns ``{}``
-    when the side has no prompts.
+    A mix (shares summing to 100), never counts: the two sides are compared by the
+    *composition* of the output, so a side that simply wrote more code does not
+    dominate by volume. Reads :func:`analytics.output_composition` (the same source
+    the Composition tab charts), so the language split here matches that tab.
+    Returns ``{}`` when no code lines were written on the side.
     """
-    counts: Counter[str] = Counter()
-    for row in side.prompts:
-        category = (side.categories.get(row["prompt_id"]) or {}).get(
-            "category"
-        ) or "(uncategorized)"
-        counts[category] += 1
-    total = sum(counts.values())
+    comp = analytics.output_composition(side, provider)
+    lines = {lng.language: lng.lines_added for lng in comp.languages if lng.lines_added > 0}
+    total = sum(lines.values())
     if not total:
         return {}
-    return {category: 100 * n / total for category, n in counts.items()}
+    return {language: 100 * n / total for language, n in lines.items()}
 
 
 # The per-page before/after panel and the sidebar toggle were removed: the
