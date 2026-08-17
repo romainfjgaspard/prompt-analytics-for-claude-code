@@ -1,0 +1,3 @@
+  NEW model claude-opus-4-8-(fast-mode)-(preview): not in embedded copilot grid
+  NEW model claude-opus-5: not in embedded copilot grid
+  NEW model claude-sonnet-5: not in embedded copilot grid
