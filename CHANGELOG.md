@@ -9,6 +9,26 @@ in patch/minor bumps.
 
 ## [Unreleased]
 
+### Fixed
+- **A session is attributed to its project, not to whatever folder it ran in.**
+  Claude Code records only the working directory, and the project was taken as
+  that path's last component — so every subdirectory you happened to `cd` into
+  became a project of its own and scattered one repository's cost across the
+  board (`docparser` also appeared as `triton-profiling-1b`, `nuit-2026-08-20`
+  and `triton_server`). A cwd now rolls up to the shallowest directory above it
+  that is itself a session directory inside a git repository. On real history:
+  39 projects collapse to 11, with the totals unchanged.
+
+### Added
+- `projects.split` in `config.yml` — path prefixes whose immediate
+  subdirectories stay separate projects. "One repository, one project" is right
+  for code and wrong for a document tree: an Obsidian vault is a single git
+  repository whose top-level folders are the real units of work, and nothing in
+  the data distinguishes the two cases, so it is a declaration rather than a
+  guess. An unparsable `config.yml` now fails loudly instead of degrading to the
+  default silently — a `split` that is quietly ignored looks exactly like a rule
+  that does not work.
+
 ## [0.5.1] — 2026-08-26
 
 ### Fixed

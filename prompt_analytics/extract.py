@@ -44,9 +44,10 @@ import contextlib
 import hashlib
 import json
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone, tzinfo
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
@@ -63,6 +64,7 @@ from .context import (
     result_text,
 )
 from .pricing import get_model_pricing
+from .projects import ProjectResolver
 from .schema import (
     CONTEXT_COST_COLS,
     CONTEXT_SOURCES_COLS,
@@ -179,39 +181,6 @@ def is_human_message(event: dict[str, Any]) -> bool:
         isinstance(b, dict) and b.get("type") == "text" and bool(str(b.get("text", "")).strip())
         for b in content
     )
-
-
-def project_name(cwd: str) -> str:
-    """Return the project folder name for ``cwd``.
-
-    Normally the final path component. The exception is a **git worktree**:
-    Claude Code checks those out under ``<repo>/.claude/worktrees/<name>``, so
-    the naive final component turned every worktree into its own phantom
-    project (``triton-profiling`` instead of ``docparser``) and split one
-    repository's cost across the board. The repo directory -- the component
-    before ``.claude`` -- is the honest answer; the worktree name is not lost,
-    it stays in the ``cwd`` column.
-
-    Windows paths are recognized by their backslashes so that logs written on
-    Windows parse correctly when read from Linux/WSL (and vice versa).
-    """
-    if not cwd:
-        return ""
-    path = PureWindowsPath(cwd) if "\\" in cwd else PurePosixPath(cwd)
-    parts = path.parts
-    # Anchor on the `.claude/worktrees` pair rather than a fixed depth: the
-    # session may sit in a subdirectory of the worktree. Requiring both parts
-    # keeps an ordinary `<repo>/.claude/<something>` cwd out of it.
-    # Scanned left to right, so a worktree entered from inside another still
-    # bills to the outermost repository.
-    for index in range(2, len(parts)):
-        if parts[index] == "worktrees" and parts[index - 1] == ".claude":
-            repo = parts[index - 2]
-            # Guard the degenerate `/.claude/worktrees/x`, where the candidate
-            # is the path anchor (``/`` or ``C:\``) rather than a directory.
-            if repo != path.anchor:
-                return repo
-    return path.name
 
 
 def prompt_skip_reason(event: dict[str, Any], text: str) -> str | None:
@@ -902,6 +871,7 @@ def collect(
     timezone_name: str | None = None,
     use_cache: bool = True,
     claude_dir: Path | None = None,
+    split_projects: Sequence[str] = (),
 ) -> ExtractResult:
     """Parse and aggregate the full local history into in-memory rows.
 
@@ -917,6 +887,10 @@ def collect(
             session dates (default: the local timezone).
         use_cache: Serve unchanged files from the parse cache.
         claude_dir: Override of ``~/.claude/projects`` (mainly for tests).
+        split_projects: Path prefixes whose immediate subdirectories stay
+            separate projects instead of rolling up to their repository
+            (``projects.split`` in ``config.yml``); see
+            :class:`~prompt_analytics.projects.ProjectResolver`.
 
     Returns:
         An :class:`ExtractResult` with the report and all output rows.
@@ -963,6 +937,9 @@ def collect(
     # walk knows when each turn of dialogue entered context (the snapshot above
     # only needs the per-session total). (session_id, prompt_id) -> tokens.
     conv_by_prompt: Counter[tuple[str, str]] = Counter()
+    # Every cwd seen inside a git repository, at session and prompt grain:
+    # attribution needs the whole corpus, not one row (see projects.py).
+    repo_cwds: set[str] = set()
 
     def _in_window(ts: datetime | None) -> bool:
         if ts is None:
@@ -989,11 +966,16 @@ def collect(
         versions.update(parsed["versions"])
 
         session_id = _subagent_parent_session(filepath) or parsed["session_id"]
+        if parsed["cwd"] and parsed["git_branch"]:
+            # Candidate project roots for the resolver built below: a cwd is
+            # only a candidate when it sits inside a git repository, or a plain
+            # container directory would swallow every repo under it.
+            repo_cwds.add(parsed["cwd"])
         if session_id not in sessions and parsed["cwd"]:
             sessions[session_id] = SessionRow(
                 session_id=session_id,
                 start_date="",
-                project=project_name(parsed["cwd"]),
+                project="",  # filled once every cwd is known (see resolve_projects)
                 cwd=parsed["cwd"],
                 git_branch=parsed["git_branch"],
             )
@@ -1011,6 +993,8 @@ def collect(
                 continue
             prompt_aggs[pid] = _PromptAgg(session_id=session_id, parsed=prompt)
             prompt_order.append(pid)
+            if prompt["cwd"] and prompt["git_branch"]:
+                repo_cwds.add(prompt["cwd"])
             # Axe D: the prompt text is the user's contribution to conversation.
             conv_tokens[session_id] += prompt["text_tokens"]
             conv_items[session_id] += 1
@@ -1132,6 +1116,11 @@ def collect(
     for pid, tool_ids in tool_ids_by_prompt.items():
         prompt_aggs[pid].tool_call_count = len(tool_ids)
 
+    # --- Project attribution (needs every cwd, so not before this point). ---
+    resolve_project = ProjectResolver(repo_cwds, split=split_projects)
+    for session_row in sessions.values():
+        session_row["project"] = resolve_project(session_row["cwd"])
+
     # --- Build rows (date filter applies at prompt grain, 3.9). -------------
     prompts_by_session: dict[str, list[str]] = defaultdict(list)
     for pid in prompt_order:
@@ -1177,7 +1166,7 @@ def collect(
                     prompt_id=pid,
                     prompt_index=index,
                     timestamp=prompt["timestamp"],
-                    project=project_name(prompt["cwd"]),
+                    project=resolve_project(prompt["cwd"]),
                     cwd=prompt["cwd"],
                     git_branch=prompt["git_branch"],
                     mode=prompt["mode"],
@@ -1452,6 +1441,27 @@ def collect(
     )
 
 
+def _split_projects(output_dir: Path) -> Sequence[str]:
+    """``projects.split`` from ``config.yml``, or ``()``.
+
+    Read here rather than in :func:`collect` so the aggregation stays a pure
+    function of its arguments (tests pass the list directly).
+
+    An unparsable ``config.yml`` raises :exc:`~prompt_analytics.config.ConfigError`
+    rather than degrading quietly to the default roll-up: a silently ignored
+    ``split`` looks exactly like a rule that does not work. The trap is a Windows
+    path in double quotes -- ``"C:\\Users\\..."`` makes YAML read ``\\U`` as an
+    escape -- so single-quote them.
+    """
+    from .config import load_config
+
+    section = load_config(output_dir).get("projects") or {}
+    split = section.get("split") if isinstance(section, dict) else None
+    if not isinstance(split, list):
+        return ()
+    return [str(entry) for entry in split if str(entry).strip()]
+
+
 def run_extract(
     output_dir: Path,
     *,
@@ -1495,6 +1505,7 @@ def run_extract(
         timezone_name=timezone_name,
         use_cache=use_cache,
         claude_dir=claude_dir,
+        split_projects=_split_projects(output_dir),
     )
 
     # --- Atomic writes (3.14). ----------------------------------------------

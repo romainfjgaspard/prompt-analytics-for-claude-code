@@ -8,7 +8,8 @@ import os
 import pytest
 
 from prompt_analytics.compose import analyze_assistant_content
-from prompt_analytics.extract import project_name, run_extract
+from prompt_analytics.extract import run_extract
+from prompt_analytics.projects import project_name
 from prompt_analytics.tokenizer import count_tokens
 
 
@@ -1184,3 +1185,40 @@ def test_worktree_sessions_land_in_the_parent_project(fake_claude):
     assert {row["project"] for row in rows} == {"docparser"}
     # The worktree name is not lost -- it stays in the cwd column.
     assert {row["cwd"] for row in rows} == {worktree}
+
+
+def test_subdirectory_sessions_roll_up_to_the_repository(fake_claude):
+    """A `cd` into a subfolder must not invent a project (the `nuit-…` bug)."""
+    repo = "/home/u/docparser"
+    for name, cwd in (("root.jsonl", repo), ("sub.jsonl", f"{repo}/chantier-psp/nuit-2026-08-20")):
+        fake_claude.write(
+            name,
+            [
+                _user(f"p-{name}", "2026-08-01T10:00:00Z", "hi", sid=f"s-{name}", cwd=cwd),
+                _assistant(f"r-{name}", "2026-08-01T10:00:01Z", sid=f"s-{name}", inp=10, cwd=cwd),
+            ],
+            project=name.replace(".jsonl", ""),
+        )
+    run_extract(fake_claude.out)
+    assert {row["project"] for row in _read_csv(fake_claude.out / "sessions.csv")} == {"docparser"}
+
+
+def test_config_split_keeps_a_document_tree_granular(fake_claude):
+    """`projects.split` opts a tree out of the roll-up, folder by folder."""
+    vault = "/home/u/vault"
+    for name, cwd in (("a.jsonl", vault), ("b.jsonl", f"{vault}/Pilotage/notes")):
+        fake_claude.write(
+            name,
+            [
+                _user(f"p-{name}", "2026-08-01T10:00:00Z", "hi", sid=f"s-{name}", cwd=cwd),
+                _assistant(f"r-{name}", "2026-08-01T10:00:01Z", sid=f"s-{name}", inp=10, cwd=cwd),
+            ],
+            project=name.replace(".jsonl", ""),
+        )
+    fake_claude.out.mkdir(parents=True, exist_ok=True)
+    (fake_claude.out / "config.yml").write_text(
+        f"projects:\n  split:\n    - {vault}\n", encoding="utf-8"
+    )
+    run_extract(fake_claude.out)
+    projects = {row["project"] for row in _read_csv(fake_claude.out / "sessions.csv")}
+    assert projects == {"vault", "Pilotage"}

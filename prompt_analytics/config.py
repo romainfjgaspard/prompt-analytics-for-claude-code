@@ -17,6 +17,11 @@ __all__ = ["DEFAULT_CONFIG", "ConfigError", "load_config", "write_default_config
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "features": {"categorization": True, "prompt_text": True, "quota_snapshot": True},
+    # `split` lists path prefixes whose immediate subdirectories stay separate
+    # projects instead of rolling up to their git repository -- a document tree
+    # (an Obsidian vault) is one repository whose top-level folders are the real
+    # units of work. See prompt_analytics/projects.py.
+    "projects": {"split": []},
 }
 
 CONFIG_FILENAME = "config.yml"

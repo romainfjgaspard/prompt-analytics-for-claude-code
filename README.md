@@ -279,6 +279,21 @@ The parser counts each response exactly once: for a given `message.id + requestI
 
 On top of dedup, the extractor filters fake prompts (`isMeta`, `<command-*>` blocks, interruptions, the post-compaction notice — kept out of `prompts.csv` but still counted against the session), rolls **sub-agent** (`isSidechain`) cost into the parent prompt, and splits cache writes by TTL (`cache_write_5m` 1.25× vs `cache_write_1h` 2×).
 
+### Which project a session belongs to
+
+Claude Code records a session's working directory and nothing else about the workspace, so the project has to be inferred from it. Taking the last folder of that path turns every subdirectory you happen to `cd` into — a worktree, `tests/`, a dated scratch folder — into a separate project, scattering one repository's cost across the board. A cwd is therefore rolled up to the **shallowest directory above it that is itself a session directory inside a git repository**, which stands in for the repository root (the real one cannot be probed: the logs may come from another machine or another OS, and the same CSVs must attribute identically wherever they are read).
+
+One repository, one project is right for code and wrong for a document tree: an Obsidian vault is a single repository whose top-level folders are the real units of work. Opt such a tree out in `config.yml` and its immediate subdirectories stay separate projects:
+
+```yaml
+projects:
+  split:
+    - '~/notes/vault'
+    # Windows paths need SINGLE quotes: in double quotes YAML reads the
+    # backslash of \Users as an escape sequence and rejects the file.
+    - 'C:\Users\you\Documents\Vault'
+```
+
 These totals reconcile **bucket-for-bucket with `bunx ccusage --json`** (day × model) on real history — the reconciliation is scripted in `scripts/reconcile_ccusage.py`. Each command prints its data source, and `extract` ends with a loud report so a silent format break surfaces immediately.
 
 - 📖 Full detail: [**Accuracy and Pricing**](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Accuracy-and-Pricing) — [why the counts are right](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Accuracy-and-Pricing#why-the-token-counts-are-right), [ccusage reconciliation](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Accuracy-and-Pricing#reconciliation-against-ccusage), and the [V7 invariant](https://github.com/romainfjgaspard/prompt-analytics-for-claude-code/wiki/Accuracy-and-Pricing#the-v7-invariant).
