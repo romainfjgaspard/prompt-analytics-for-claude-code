@@ -8,7 +8,7 @@ import os
 import pytest
 
 from prompt_analytics.compose import analyze_assistant_content
-from prompt_analytics.extract import run_extract
+from prompt_analytics.extract import project_name, run_extract
 from prompt_analytics.tokenizer import count_tokens
 
 
@@ -1135,3 +1135,52 @@ def test_context_cost_respects_date_window(fake_claude):
     fake_claude.write("session_cost.jsonl", _cost_events(), project="cost")
     run_extract(fake_claude.out, since="2026-07-01", timezone_name="UTC")
     assert _context_cost_rows(fake_claude.out) == []
+
+
+# ---------------------------------------------------------------------------
+# Project attribution.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("cwd", "expected"),
+    [
+        # Plain checkouts: the final component, on both path flavours.
+        ("/home/u/docparser", "docparser"),
+        (r"C:\Users\u\Code\lettrage-databricks", "lettrage-databricks"),
+        # Worktrees bill to the repository, not to the worktree name: Claude
+        # Code puts them under `<repo>/.claude/worktrees/<name>`, and the naive
+        # final component turned each one into a phantom project.
+        ("/home/u/docparser/.claude/worktrees/triton-profiling-1b", "docparser"),
+        (r"C:\Users\u\Code\lettrage\.claude\worktrees\wt1", "lettrage"),
+        # ... including from a subdirectory of the worktree,
+        ("/home/u/docparser/.claude/worktrees/triton/src/pkg", "docparser"),
+        # ... and from a worktree entered inside another (outermost wins).
+        ("/home/u/a/.claude/worktrees/x/.claude/worktrees/y", "a"),
+        # `.claude` alone is not a worktree marker.
+        ("/home/u/repo/.claude/settings", "settings"),
+        # Degenerate: the marker at the root leaves no repo component.
+        ("/.claude/worktrees/x", "x"),
+        ("", ""),
+    ],
+)
+def test_project_name_attributes_worktrees_to_the_repo(cwd, expected):
+    assert project_name(cwd) == expected
+
+
+def test_worktree_sessions_land_in_the_parent_project(fake_claude):
+    """End to end: a worktree session must not create its own project row."""
+    worktree = "/home/u/docparser/.claude/worktrees/triton-profiling"
+    fake_claude.write(
+        "wt.jsonl",
+        [
+            _user("p1", "2026-08-01T10:00:00Z", "hello", sid="s-wt", cwd=worktree),
+            _assistant("rA", "2026-08-01T10:00:01Z", sid="s-wt", inp=10, out=5, cwd=worktree),
+        ],
+        project="-home-u-docparser--claude-worktrees-triton-profiling",
+    )
+    run_extract(fake_claude.out)
+    rows = _read_csv(fake_claude.out / "sessions.csv")
+    assert {row["project"] for row in rows} == {"docparser"}
+    # The worktree name is not lost -- it stays in the cwd column.
+    assert {row["cwd"] for row in rows} == {worktree}

@@ -182,16 +182,36 @@ def is_human_message(event: dict[str, Any]) -> bool:
 
 
 def project_name(cwd: str) -> str:
-    """Return the final path component of ``cwd`` (the project folder name).
+    """Return the project folder name for ``cwd``.
+
+    Normally the final path component. The exception is a **git worktree**:
+    Claude Code checks those out under ``<repo>/.claude/worktrees/<name>``, so
+    the naive final component turned every worktree into its own phantom
+    project (``triton-profiling`` instead of ``docparser``) and split one
+    repository's cost across the board. The repo directory -- the component
+    before ``.claude`` -- is the honest answer; the worktree name is not lost,
+    it stays in the ``cwd`` column.
 
     Windows paths are recognized by their backslashes so that logs written on
     Windows parse correctly when read from Linux/WSL (and vice versa).
     """
     if not cwd:
         return ""
-    if "\\" in cwd:
-        return PureWindowsPath(cwd).name
-    return PurePosixPath(cwd).name
+    path = PureWindowsPath(cwd) if "\\" in cwd else PurePosixPath(cwd)
+    parts = path.parts
+    # Anchor on the `.claude/worktrees` pair rather than a fixed depth: the
+    # session may sit in a subdirectory of the worktree. Requiring both parts
+    # keeps an ordinary `<repo>/.claude/<something>` cwd out of it.
+    # Scanned left to right, so a worktree entered from inside another still
+    # bills to the outermost repository.
+    for index in range(2, len(parts)):
+        if parts[index] == "worktrees" and parts[index - 1] == ".claude":
+            repo = parts[index - 2]
+            # Guard the degenerate `/.claude/worktrees/x`, where the candidate
+            # is the path anchor (``/`` or ``C:\``) rather than a directory.
+            if repo != path.anchor:
+                return repo
+    return path.name
 
 
 def prompt_skip_reason(event: dict[str, Any], text: str) -> str | None:

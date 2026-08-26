@@ -19,6 +19,12 @@ in patch/minor bumps.
   parsed `prompts.csv` / `prompts_text.csv`. The package now lifts that cap
   process-wide on import (portable across 32/64-bit). Thanks @vincentreboul
   (#16).
+- **Git worktrees no longer become phantom projects.** Claude Code checks a
+  worktree out under `<repo>/.claude/worktrees/<name>`, and the project name was
+  taken as the final path component — so one repository's cost was scattered
+  across as many projects as it had worktrees (`triton-profiling`,
+  `triton-mode-cible`… instead of `docparser`). Sessions now bill to the
+  repository; the worktree name stays visible in the `cwd` column.
 - **Pricing grid refreshed** (`data/pricing.yml`, verified 2026-08-26): the
   Claude 5 generation was missing entirely. `claude-sonnet-5` fell through the
   `claude-sonnet` prefix fallback and was billed at the 4.x rate
