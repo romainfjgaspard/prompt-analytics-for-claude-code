@@ -9,7 +9,16 @@ in patch/minor bumps.
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-08-26
+
 ### Fixed
+- CSV readers no longer crash on long prompt/response text. Some Claude Code
+  prompts and responses (pasted logs, large diffs, whole files) exceed the
+  stdlib `csv` 128 KiB per-field cap, which raised
+  `_csv.Error: field larger than field limit` when the CLI / analytics readers
+  parsed `prompts.csv` / `prompts_text.csv`. The package now lifts that cap
+  process-wide on import (portable across 32/64-bit). Thanks @vincentreboul
+  (#16).
 - **Pricing grid refreshed** (`data/pricing.yml`, verified 2026-08-26): the
   Claude 5 generation was missing entirely. `claude-sonnet-5` fell through the
   `claude-sonnet` prefix fallback and was billed at the 4.x rate
@@ -25,6 +34,18 @@ in patch/minor bumps.
 - Generation-level **fallback prefixes** `claude-opus-5` and `claude-sonnet-5`,
   so a future point release (`claude-sonnet-5-1`, …) inherits the Sonnet 5 rate
   rather than silently dropping back to the Sonnet 4 grid.
+- The retired **Opus 4 / 4.1** generation as explicit entries ($15/$75 per Mtok).
+  They had no entry of their own, so the `claude-opus` fallback priced them at
+  the 4.5+ rate — a 3× undercount on any history old enough to contain them.
+
+### Changed
+- The weekly **pricing-drift** job now rewrites a single PR in place instead of
+  opening a new dated one every Monday (eight had piled up), closes it by itself
+  once the grid matches, and no longer commits a `drift_litellm.txt` into the
+  branch. It also gained the check that would have caught this bug: a model with
+  no entry of its own whose prefix fallback resolves to the wrong price. The
+  new-model listing is filtered down to ids Claude Code actually writes — the
+  naive version produced 57 lines of noise, and a noisy check is an ignored one.
 
 ## [0.5.0] — 2026-06-28
 

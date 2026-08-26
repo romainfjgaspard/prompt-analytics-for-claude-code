@@ -1,5 +1,12 @@
 name: Pricing drift check
 
+# Compares the embedded pricing grid against the upstream sources once a week.
+# The report is a NOTIFICATION, not a patch: the job never edits pricing.yml, so
+# there is nothing to merge. It therefore keeps a single long-lived branch
+# (`pricing-drift`) and a single PR that is rewritten in place on each run,
+# instead of opening a fresh dated PR every Monday (which had piled up eight of
+# them). A run that finds no drift closes the open PR on its own.
+
 on:
   schedule:
     # Every Monday at 08:00 UTC
@@ -10,12 +17,17 @@ permissions:
   contents: write
   pull-requests: write
 
+env:
+  DRIFT_BRANCH: pricing-drift
+
 jobs:
   drift:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -26,10 +38,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyyaml requests
 
+      # The drift report is written OUTSIDE the workspace, so git never sees it
+      # and the drift branch stays a bare marker commit.
       - name: Fetch LiteLLM model prices
         run: |
           python - << 'EOF'
-          import json, urllib.request, sys, yaml, pathlib
+          import json, re, urllib.request, os, yaml, pathlib
 
           LITELLM_URL = (
               "https://raw.githubusercontent.com/BerriAI/litellm/main/"
@@ -38,8 +52,8 @@ jobs:
           with urllib.request.urlopen(LITELLM_URL, timeout=30) as r:
               litellm: dict = json.loads(r.read().decode())
 
-          # Claude model keys in LiteLLM use the form "claude/claude-opus-4-8" or
-          # just "claude-opus-4-8"; we normalise to the bare model ID.
+          # Claude model keys in LiteLLM use the form "claude/claude-opus-5" or
+          # just "claude-opus-5"; we normalise to the bare model ID.
           def price_per_mtok(v, key):
               val = v.get(key)
               return round(float(val) * 1_000_000, 6) if val is not None else None
@@ -66,6 +80,7 @@ jobs:
                   ("output",         "output_cost_per_token"),
                   ("cache_read",     "cache_read_input_token_cost"),
                   ("cache_write_5m", "cache_creation_input_token_cost"),
+                  ("cache_write_1h", "cache_creation_input_token_cost_above_1hr"),
               ]
               for our_key, ll_key in checks:
                   ll_val = price_per_mtok(litellm_entry, ll_key)
@@ -80,35 +95,82 @@ jobs:
                           f"  {model_id}/{our_key}: ours={our_val}, LiteLLM={ll_val}"
                       )
 
+          # Second class of drift, and the one that let Sonnet 5 be billed at the
+          # Sonnet 4 rate for two months: a model with no entry of its own, whose
+          # prefix fallback silently resolves to the WRONG price. Only models the
+          # fallbacks actually resolve are reported -- one with no match at all is
+          # already loud, `extract` warns on it. Listing every Claude id upstream
+          # knows would be 57 lines of noise, and a noisy check is an ignored one.
+          fallbacks = data["providers"]["anthropic"].get("fallbacks", {})
+
+          def resolved(model_id):
+              best = max((p for p in fallbacks if model_id.startswith(p)), key=len, default=None)
+              return fallbacks[best] if best else None
+
+          seen = set()
+          for model_id in sorted(litellm):
+              bare = model_id.split("/")[-1]
+              # Skip ids Claude Code never writes: provider-tagged aliases
+              # (Bedrock `-v1:0`, Vertex `@date`) and LiteLLM's dotted-version
+              # aliases (`claude-opus-4.1` for `claude-opus-4-1`).
+              if any(c in bare for c in "@:") or not bare.startswith("claude-"):
+                  continue
+              if re.search(r"\d\.\d", bare):
+                  continue
+              if bare in embedded or bare in seen or not isinstance(litellm[model_id], dict):
+                  continue
+              ours = resolved(bare)
+              if ours is None:
+                  continue
+              for our_key, ll_key in (("input", "input_cost_per_token"),
+                                      ("output", "output_cost_per_token")):
+                  ll_val = price_per_mtok(litellm[model_id], ll_key)
+                  our_val = ours.get(our_key)
+                  if not ll_val or our_val is None:
+                      continue
+                  if abs(ll_val - our_val) / max(abs(ll_val), 1e-9) > 0.01:
+                      seen.add(bare)
+                      drift.append(
+                          f"  {bare}/{our_key}: no entry of its own, the prefix fallback "
+                          f"gives {our_val}, LiteLLM says {ll_val}"
+                      )
+                      break
+
+          report = pathlib.Path(os.environ["RUNNER_TEMP"]) / "drift.txt"
           if drift:
               print("DRIFT DETECTED (Anthropic vs LiteLLM):", flush=True)
               for line in drift:
                   print(line, flush=True)
-              pathlib.Path("drift_litellm.txt").write_text("\n".join(drift) + "\n", encoding="utf-8")
+              report.write_text("\n".join(drift) + "\n", encoding="utf-8")
           else:
               print("No drift vs LiteLLM.", flush=True)
           EOF
 
       - name: Fetch Copilot pricing
-        run: |
-          pip install pyyaml  # already installed but be explicit
-          python scripts/fetch_copilot_pricing.py --output /tmp/copilot_fresh.yml
+        run: python scripts/fetch_copilot_pricing.py --output "$RUNNER_TEMP/copilot_fresh.yml"
 
       - name: Compare Copilot pricing
         run: |
           python - << 'EOF'
-          import yaml, pathlib, sys
+          import yaml, pathlib, os
 
-          fresh = yaml.safe_load(
-              pathlib.Path("/tmp/copilot_fresh.yml").read_text(encoding="utf-8")
-          )
+          tmp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          fresh = yaml.safe_load((tmp / "copilot_fresh.yml").read_text(encoding="utf-8"))
           pricing_yml = pathlib.Path("prompt_analytics/data/pricing.yml")
           data = yaml.safe_load(pricing_yml.read_text(encoding="utf-8"))
           embedded = data.get("providers", {}).get("copilot", {}).get("models", {})
           fresh_claude = fresh.get("vendors", {}).get("anthropic", {})
 
+          # The fast-mode row is a speed tier, not a model: Claude Code records it
+          # as `speed: "fast"` alongside the ordinary model id, and the extractor
+          # does not read that field yet, so there is nothing here to price.
+          # Tracked separately; skipped so the weekly check does not sit red.
+          FAST_MODE = "(fast-mode)"
+
           drift = []
           for model_id, fresh_entry in fresh_claude.items():
+              if FAST_MODE in model_id:
+                  continue
               our_entry = embedded.get(model_id)
               if our_entry is None:
                   drift.append(f"  NEW model {model_id}: not in embedded copilot grid")
@@ -120,7 +182,7 @@ jobs:
                       continue
                   if abs(fv - ov) / max(abs(fv), 1e-9) > 0.01:
                       drift.append(f"  {model_id}/{key}: ours={ov}, Copilot page={fv}")
-              # cache_write in fresh → compare against cache_write_5m
+              # cache_write in fresh -> compare against cache_write_5m
               fw = fresh_entry.get("cache_write")
               ow = our_entry.get("cache_write_5m")
               if fw is not None and ow is not None:
@@ -131,27 +193,45 @@ jobs:
               print("DRIFT DETECTED (Copilot):", flush=True)
               for line in drift:
                   print(line, flush=True)
-              with open("drift_litellm.txt", "a", encoding="utf-8") as f:
+              with (tmp / "drift.txt").open("a", encoding="utf-8") as f:
                   f.write("\n".join(drift) + "\n")
           else:
               print("No drift vs Copilot page.", flush=True)
           EOF
 
-      - name: Open PR if drift detected
-        if: ${{ hashFiles('drift_litellm.txt') != '' }}
+      - name: Open, update or close the drift PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BRANCH="pricing-drift-$(date +%Y%m%d)"
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/drift.txt"
+          EXISTING=$(gh pr list --head "$DRIFT_BRANCH" --state open --json number --jq '.[0].number // empty')
+
+          if [ ! -s "$REPORT" ]; then
+            echo "No drift."
+            if [ -n "$EXISTING" ]; then
+              gh pr comment "$EXISTING" --body "The grid now matches both upstream sources; closing."
+              gh pr close "$EXISTING" --delete-branch
+            fi
+            exit 0
+          fi
+
+          TODAY=$(date +%Y-%m-%d)
+          BODY=$(printf '## Pricing drift\n\nThe weekly check found these differences between `pricing.yml` and the upstream sources (LiteLLM / GitHub Copilot page), as of %s.\n\n```\n%s\n```\n\nEdit `prompt_analytics/data/pricing.yml` to match, or close this PR if the divergence is deliberate. This PR is rewritten in place by every run: it is a notification, not a patch.' "$TODAY" "$(cat "$REPORT")")
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
-          git add -A
-          git commit -m "chore: pricing drift detected $(date +%Y-%m-%d)" --allow-empty
-          git push origin "$BRANCH"
-          DRIFT=$(cat drift_litellm.txt)
-          gh pr create \
-            --title "Pricing drift detected $(date +%Y-%m-%d)" \
-            --body "$(printf '## Pricing drift\n\nThe weekly pricing check found the following differences between \`pricing.yml\` and the upstream sources (LiteLLM / Copilot page).\n\n```\n%s\n```\n\nPlease update \`prompt_analytics/data/pricing.yml\` accordingly.' "$DRIFT")" \
-            --base main \
-            --head "$BRANCH"
+          git checkout -B "$DRIFT_BRANCH" origin/main
+          git commit --allow-empty -m "chore: pricing drift detected $TODAY"
+          git push --force origin "$DRIFT_BRANCH"
+
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --title "Pricing drift detected $TODAY" --body "$BODY"
+            echo "Updated PR #$EXISTING."
+          else
+            gh pr create \
+              --title "Pricing drift detected $TODAY" \
+              --body "$BODY" \
+              --base main \
+              --head "$DRIFT_BRANCH"
+          fi
