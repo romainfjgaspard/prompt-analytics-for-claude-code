@@ -8,6 +8,7 @@ import os
 import pytest
 
 from prompt_analytics.compose import analyze_assistant_content
+from prompt_analytics.config import ConfigError
 from prompt_analytics.extract import run_extract
 from prompt_analytics.projects import project_name
 from prompt_analytics.tokenizer import count_tokens
@@ -1222,3 +1223,18 @@ def test_config_split_keeps_a_document_tree_granular(fake_claude):
     run_extract(fake_claude.out)
     projects = {row["project"] for row in _read_csv(fake_claude.out / "sessions.csv")}
     assert projects == {"vault", "Pilotage"}
+
+
+def test_unparsable_config_fails_loudly(fake_claude):
+    """A silently ignored `split` looks exactly like a rule that does not work.
+
+    The classic trap is a Windows path in double quotes, where YAML reads the
+    backslash of ``\\Users`` as an escape sequence.
+    """
+    fake_claude.add("session_alpha.jsonl", project="alpha")
+    fake_claude.out.mkdir(parents=True, exist_ok=True)
+    (fake_claude.out / "config.yml").write_text(
+        'projects:\n  split:\n    - "C:\\Users\\me\\Vault"\n', encoding="utf-8"
+    )
+    with pytest.raises(ConfigError):
+        run_extract(fake_claude.out)
