@@ -5,9 +5,11 @@
 #
 # Sources:
 #   anthropic : https://docs.anthropic.com/en/docs/about-claude/pricing
-#               verified 2026-06-11
+#               verified 2026-08-26, cross-checked against the LiteLLM grid
+#               (model_prices_and_context_window.json) used by the weekly
+#               drift job
 #   copilot   : scripts/fetch_copilot_pricing.py (scrapes GitHub docs)
-#               seeded 2026-06-11 from
+#               refreshed 2026-08-26 from
 #               https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing
 #
 # Cache keys:
@@ -19,7 +21,7 @@
 # It is mapped to both cache_write_5m and cache_write_1h with the same value;
 # no 1-hour distinction is published on the Copilot pricing page.
 
-updated_at: "2026-06-11"
+updated_at: "2026-08-26"
 
 # Flat-rate subscription plans (3.1), for the `break-even` analysis:
 # "your usage is worth $X of API for $Y/month of subscription". These are
@@ -86,6 +88,18 @@ providers:
         cache_read: 1.00
         cache_write_5m: 12.50
         cache_write_1h: 20.00
+      claude-mythos-5:
+        input: 10.00
+        output: 50.00
+        cache_read: 1.00
+        cache_write_5m: 12.50
+        cache_write_1h: 20.00
+      claude-opus-5:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 10.00
       claude-opus-4-8:
         input: 5.00
         output: 25.00
@@ -110,6 +124,43 @@ providers:
         cache_read: 0.50
         cache_write_5m: 6.25
         cache_write_1h: 10.00
+      # Retired Opus 4 generation, kept as EXACT entries only: the
+      # `claude-opus` prefix fallback would otherwise price them at the 4.5+
+      # rate ($5/$25) instead of their real $15/$75 -- a silent 3x undercount
+      # on any history old enough to contain them. Deliberately not prefixes:
+      # a `claude-opus-4` fallback would swallow claude-opus-4-5-20251101 and
+      # friends. The GitHub Copilot page no longer lists this generation, so it
+      # stays on the anthropic grid only.
+      claude-opus-4-1:
+        input: 15.00
+        output: 75.00
+        cache_read: 1.50
+        cache_write_5m: 18.75
+        cache_write_1h: 30.00
+      claude-opus-4-1-20250805:
+        input: 15.00
+        output: 75.00
+        cache_read: 1.50
+        cache_write_5m: 18.75
+        cache_write_1h: 30.00
+      claude-opus-4:
+        input: 15.00
+        output: 75.00
+        cache_read: 1.50
+        cache_write_5m: 18.75
+        cache_write_1h: 30.00
+      claude-opus-4-20250514:
+        input: 15.00
+        output: 75.00
+        cache_read: 1.50
+        cache_write_5m: 18.75
+        cache_write_1h: 30.00
+      claude-sonnet-5:
+        input: 2.00
+        output: 10.00
+        cache_read: 0.20
+        cache_write_5m: 2.50
+        cache_write_1h: 4.00
       claude-sonnet-4-6:
         input: 3.00
         output: 15.00
@@ -153,12 +204,24 @@ providers:
         cache_read: 1.00
         cache_write_5m: 12.50
         cache_write_1h: 20.00
+      claude-opus-5:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 10.00
       claude-opus:
         input: 5.00
         output: 25.00
         cache_read: 0.50
         cache_write_5m: 6.25
         cache_write_1h: 10.00
+      claude-sonnet-5:
+        input: 2.00
+        output: 10.00
+        cache_read: 0.20
+        cache_write_5m: 2.50
+        cache_write_1h: 4.00
       claude-sonnet:
         input: 3.00
         output: 15.00
@@ -183,6 +246,18 @@ providers:
         cache_read: 1.00
         cache_write_5m: 12.50
         cache_write_1h: 12.50
+      claude-mythos-5:
+        input: 10.00
+        output: 50.00
+        cache_read: 1.00
+        cache_write_5m: 12.50
+        cache_write_1h: 12.50
+      claude-opus-5:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 6.25
       claude-opus-4-8:
         input: 5.00
         output: 25.00
@@ -207,6 +282,12 @@ providers:
         cache_read: 0.50
         cache_write_5m: 6.25
         cache_write_1h: 6.25
+      claude-sonnet-5:
+        input: 2.00
+        output: 10.00
+        cache_read: 0.20
+        cache_write_5m: 2.50
+        cache_write_1h: 2.50
       claude-sonnet-4-6:
         input: 3.00
         output: 15.00
@@ -250,12 +331,24 @@ providers:
         cache_read: 1.00
         cache_write_5m: 12.50
         cache_write_1h: 12.50
+      claude-opus-5:
+        input: 5.00
+        output: 25.00
+        cache_read: 0.50
+        cache_write_5m: 6.25
+        cache_write_1h: 6.25
       claude-opus:
         input: 5.00
         output: 25.00
         cache_read: 0.50
         cache_write_5m: 6.25
         cache_write_1h: 6.25
+      claude-sonnet-5:
+        input: 2.00
+        output: 10.00
+        cache_read: 0.20
+        cache_write_5m: 2.50
+        cache_write_1h: 2.50
       claude-sonnet:
         input: 3.00
         output: 15.00
