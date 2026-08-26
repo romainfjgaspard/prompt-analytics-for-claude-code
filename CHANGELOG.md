@@ -9,6 +9,23 @@ in patch/minor bumps.
 
 ## [Unreleased]
 
+### Fixed
+- **Pricing grid refreshed** (`data/pricing.yml`, verified 2026-08-26): the
+  Claude 5 generation was missing entirely. `claude-sonnet-5` fell through the
+  `claude-sonnet` prefix fallback and was billed at the 4.x rate
+  ($3/$15 per Mtok) instead of its own ($2/$10) — a silent **+50 % overestimate**
+  on every Sonnet 5 turn. `claude-opus-5` and `claude-mythos-5` are now explicit
+  entries too (their fallback happened to land on the right rate, but only by
+  luck).
+
+### Added
+- `claude-opus-5`, `claude-sonnet-5` and `claude-mythos-5` on both the
+  `anthropic` and `copilot` grids, with the 1-hour cache-write tier
+  ($10.00 / $4.00 / $20.00 per Mtok on Anthropic).
+- Generation-level **fallback prefixes** `claude-opus-5` and `claude-sonnet-5`,
+  so a future point release (`claude-sonnet-5-1`, …) inherits the Sonnet 5 rate
+  rather than silently dropping back to the Sonnet 4 grid.
+
 ## [0.5.0] — 2026-06-28
 
 ### Added
